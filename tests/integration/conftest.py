@@ -61,7 +61,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Readiness polling bounds (Risk R13). Generous so a cold container pull/boot never
 # races the first assertion; the loop exits early the moment readiness is observed.
-_READY_TIMEOUT_SECONDS = 90.0
+_READY_TIMEOUT_SECONDS = 180.0
 _READY_INTERVAL_SECONDS = 1.0
 
 # The Phase-8 anti-rot floor: an integration run must collect at least this many
@@ -325,12 +325,24 @@ def grafana(
     from testcontainers.core.container import DockerContainer
 
     generated_dir = tmp_path_factory.mktemp("grafana-provisioning")
+    # The host temp dir is owner-only (0700) by default; make it world-readable so the
+    # in-container grafana user (uid 472) can read the bind-mounted provisioning on
+    # Linux (Docker Desktop's macOS file-sharing is permissive and hides this).
+    generated_dir.chmod(0o755)
     _sync_dashboards_to(generated_dir, victoriametrics.base_url)
 
-    provisioning_dir = "/var/lib/grafana/dashboards"
+    # Mount the provisioned dashboards OUTSIDE Grafana's data dir. A read-only bind
+    # mount inside `/var/lib/grafana` (GF_PATHS_DATA, owned by uid 472) is fragile on
+    # Linux — it interferes with Grafana initializing its data path and the container
+    # never opens its port (works on macOS Docker Desktop, hangs on the Linux CI
+    # runner). A neutral path keeps the file provider happy without touching the data dir.
+    provisioning_dir = "/etc/panoptes/dashboards"
     container = (
         DockerContainer(_GRAFANA_IMAGE)
         .with_exposed_ports(_GRAFANA_PORT)
+        # host.docker.internal does not resolve inside a Linux container by default;
+        # map it to the host gateway so the datasource URL is resolvable on the runner.
+        .with_kwargs(extra_hosts={"host.docker.internal": "host-gateway"})
         # Anonymous Admin so the test's /api/search needs no credentials (read-only
         # test surface — synthetic data only).
         .with_env("GF_AUTH_ANONYMOUS_ENABLED", "true")
