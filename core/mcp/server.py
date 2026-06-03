@@ -31,7 +31,10 @@ generation for the nested-`TypedDict` returns the registered tools expose.
 import functools
 import importlib
 import importlib.util
+import inspect
 import os
+import types
+import typing
 from collections.abc import Callable, Mapping
 from typing import Protocol
 
@@ -386,12 +389,100 @@ def _str_dict_kwarg(kwargs: dict[str, object], key: str) -> dict[str, str] | Non
     return coerced
 
 
+# A single param-coercer: pulls one tool argument out of the invoker kwargs, narrowed to the
+# concrete type its annotation declares. The three coercers above all share this shape.
+_ParamCoercer = Callable[[dict[str, object], str], object]
+
+
+def _coercer_for_annotation(annotation: object) -> _ParamCoercer:
+    """Pick the kwarg coercer matching a tool-fn parameter's LIVE annotation.
+
+    Dispatches on the raw `inspect.Parameter.annotation` (a real type object, because this
+    module bans `from __future__ import annotations` — the PEP-563 guard test pins that):
+
+    - `str` → `_str_kwarg` (a required string);
+    - `str | None` (a `types.UnionType` over `str` + `NoneType`) → `_opt_str_kwarg`;
+    - `dict[str, str] | None` (a `UnionType` whose non-`None` member is a `dict[...]` generic)
+      → `_str_dict_kwarg`;
+    - anything else → `_str_kwarg` (the dominant tool-param shape; a wrong fallback surfaces a
+      clear `TypeError` from the coercer rather than silently dropping the argument).
+
+    Never calls `typing.get_type_hints()` — that would re-resolve deferred string annotations
+    and break on a PEP-563 module. Only `typing.get_args` / `typing.get_origin` on the already-
+    live annotation are used (pure structural introspection, no re-resolution).
+    """
+    if annotation is str:
+        return _str_kwarg
+    # `X | None` is a `types.UnionType`; inspect its members structurally (no re-resolution).
+    if isinstance(annotation, types.UnionType):
+        members = typing.get_args(annotation)
+        non_none = tuple(member for member in members if member is not type(None))
+        if len(non_none) == 1:
+            (inner,) = non_none
+            if inner is str:
+                return _opt_str_kwarg
+            # `dict[str, str]` is a generic alias whose origin is the builtin `dict`.
+            if typing.get_origin(inner) is dict:
+                return _str_dict_kwarg
+    # Unrecognized annotation → coerce as a required str (the dominant param shape).
+    return _str_kwarg
+
+
+def _make_invoker[**ToolParams](tool_fn: Callable[ToolParams, object]) -> _ToolCallable:
+    """Derive a uniform `_ToolCallable` invoker from a tool function's OWN signature.
+
+    Replaces the 11 hand-mirrored `invoker(*_args, **kwargs)` closures. For each of `tool_fn`'s
+    parameters it picks the coercer matching the parameter's LIVE annotation (via
+    `_coercer_for_annotation`), pulls that argument out of the invoker kwargs narrowed to its
+    concrete type, then calls `tool_fn(**extracted)`. Because each tool fn ALREADY encapsulates
+    its tool→core rename internally (e.g. `query_metric_tool(env, metric, window)` calls
+    `query_metric(context, name=metric, ...)`), the derivation needs ONLY the tool fn — no
+    core function and no renames mapping.
+
+    A `ParamSpec` (`ToolParams`) types the input so ANY concrete-signature tool wrapper is
+    accepted without an explicit `Any` (the same `[**ToolParams]` form `_register_tool` uses —
+    `Callable[..., object]` would trip `disallow_any_explicit`).
+
+    The parameter coercers are resolved ONCE at registration time (the `tool_fn` signature is
+    stable), so each invocation just applies them — no per-call `inspect` cost.
+
+    Args:
+        tool_fn: The introspectable, typed tool wrapper (the `*_tool` closure each `_register_*`
+            builds). Its parameter ANNOTATIONS must be live type objects — guaranteed because
+            this module bans `from __future__ import annotations` (see the module docstring +
+            the PEP-563 guard test).
+
+    Returns:
+        A `_ToolCallable` (`(*args, **kwargs) -> object`) that narrows each kwarg and calls
+        `tool_fn`; it ignores positional args (the uniform invoker is keyword-driven).
+    """
+    # Resolve (param_name, coercer) pairs once — the signature does not change after build.
+    coercers: list[tuple[str, _ParamCoercer]] = [
+        (parameter.name, _coercer_for_annotation(parameter.annotation))
+        for parameter in inspect.signature(tool_fn).parameters.values()
+    ]
+    # The invoker calls `tool_fn` with a dynamically-built kwargs dict, which the static
+    # `ParamSpec` signature cannot express. Bind a uniform-shape view of the SAME callable: a
+    # single honest cast to the real `_ToolCallable` Protocol (the tool fn IS callable with the
+    # extracted kwargs — its concrete signature is a subset of `(*args, **kwargs)`), not an
+    # `Any`-launder. The coercers reproduce exactly the args each tool fn declares.
+    uniform_tool_fn = typing.cast(_ToolCallable, tool_fn)
+
+    def invoker(*_args: object, **kwargs: object) -> object:
+        extracted = {name: coerce(kwargs, name) for name, coerce in coercers}
+        return uniform_tool_fn(**extracted)
+
+    return invoker
+
+
 # --- Module-level core tool registrars (one per tool) --------------------------------
 #
-# Each registrar binds the `QueryContext` into TWO handles for its tool: the introspectable
-# `*_tool` wrapper (FastMCP schema generation) and a uniform `_ToolCallable` invoker (the
-# synchronous unit-test seam). Both close over the same core function, so the invoker is a
-# faithful, transport-free stand-in for the registered tool (F3f).
+# Each registrar binds the `QueryContext` into the introspectable `*_tool` wrapper (FastMCP
+# schema generation) and DERIVES the uniform `_ToolCallable` invoker from that wrapper's own
+# signature via `_make_invoker` — the invoker is a faithful, transport-free stand-in for the
+# registered tool (F3f). The derivation replaced 11 hand-mirrored invoker closures: because
+# each `*_tool` wrapper already encapsulates the tool→core rename internally, `_make_invoker`
+# needs only the wrapper to reproduce the call (no core_fn, no renames dict).
 #
 # These were lifted OUT of `_core_registrars` (where they were nested closures) to module
 # scope so `_core_registrars` stays a flat, trivial dispatch dict — the v0.3 `get_cost`
@@ -407,10 +498,9 @@ def _register_describe_signal_catalog(
         """List environments, configured sources + capabilities, metrics, dashboards."""
         return describe_signal_catalog(context)
 
-    def invoker(*_args: object, **_kwargs: object) -> object:
-        return describe_signal_catalog(context)
-
-    server._register_tool(name, describe_signal_catalog_tool, invoker)
+    server._register_tool(
+        name, describe_signal_catalog_tool, _make_invoker(describe_signal_catalog_tool)
+    )
 
 
 def _register_list_dashboards(
@@ -420,10 +510,7 @@ def _register_list_dashboards(
         """Return the dashboard catalog (core + injected consumer packs)."""
         return list_dashboards(context.dashboard_packs)
 
-    def invoker(*_args: object, **_kwargs: object) -> object:
-        return list_dashboards(context.dashboard_packs)
-
-    server._register_tool(name, list_dashboards_tool, invoker)
+    server._register_tool(name, list_dashboards_tool, _make_invoker(list_dashboards_tool))
 
 
 def _register_get_dashboard_data(
@@ -433,12 +520,7 @@ def _register_get_dashboard_data(
         """Execute one dashboard's panels for `env`: title + PromQL + series."""
         return get_dashboard_data(dashboard_id, env, context)
 
-    def invoker(*_args: object, **kwargs: object) -> object:
-        return get_dashboard_data(
-            _str_kwarg(kwargs, "dashboard_id"), _str_kwarg(kwargs, "env"), context
-        )
-
-    server._register_tool(name, get_dashboard_data_tool, invoker)
+    server._register_tool(name, get_dashboard_data_tool, _make_invoker(get_dashboard_data_tool))
 
 
 def _register_query_metric(context: QueryContext, server: "PanoptesMcpServer", name: str) -> None:
@@ -448,16 +530,7 @@ def _register_query_metric(context: QueryContext, server: "PanoptesMcpServer", n
         """Run a PromQL passthrough query for a metric against the store."""
         return query_metric(context, env=env, name=metric, window=window, filters=filters)
 
-    def invoker(*_args: object, **kwargs: object) -> object:
-        return query_metric(
-            context,
-            env=_str_kwarg(kwargs, "env"),
-            name=_str_kwarg(kwargs, "metric"),
-            window=_str_kwarg(kwargs, "window"),
-            filters=_str_dict_kwarg(kwargs, "filters"),
-        )
-
-    server._register_tool(name, query_metric_tool, invoker)
+    server._register_tool(name, query_metric_tool, _make_invoker(query_metric_tool))
 
 
 def _register_search_incidents(
@@ -469,16 +542,7 @@ def _register_search_incidents(
         """Search incident signals for `env` (or fan out across all enabled envs)."""
         return search_incidents(context, env=env, window=window, tag=tag, level=level)
 
-    def invoker(*_args: object, **kwargs: object) -> object:
-        return search_incidents(
-            context,
-            env=_str_kwarg(kwargs, "env"),
-            window=_str_kwarg(kwargs, "window"),
-            tag=_opt_str_kwarg(kwargs, "tag"),
-            level=_opt_str_kwarg(kwargs, "level"),
-        )
-
-    server._register_tool(name, search_incidents_tool, invoker)
+    server._register_tool(name, search_incidents_tool, _make_invoker(search_incidents_tool))
 
 
 def _register_search_logs(context: QueryContext, server: "PanoptesMcpServer", name: str) -> None:
@@ -488,16 +552,7 @@ def _register_search_logs(context: QueryContext, server: "PanoptesMcpServer", na
         """Search log signals for `env` (or fan out across all enabled envs)."""
         return search_logs(context, env=env, query=query, window=window, level=level)
 
-    def invoker(*_args: object, **kwargs: object) -> object:
-        return search_logs(
-            context,
-            env=_str_kwarg(kwargs, "env"),
-            query=_str_kwarg(kwargs, "query"),
-            window=_str_kwarg(kwargs, "window"),
-            level=_opt_str_kwarg(kwargs, "level"),
-        )
-
-    server._register_tool(name, search_logs_tool, invoker)
+    server._register_tool(name, search_logs_tool, _make_invoker(search_logs_tool))
 
 
 def _register_describe_health(
@@ -507,10 +562,7 @@ def _register_describe_health(
         """Roll up per-source reachability + open-incident count for `env`."""
         return describe_health(context, env=env)
 
-    def invoker(*_args: object, **kwargs: object) -> object:
-        return describe_health(context, env=_str_kwarg(kwargs, "env"))
-
-    server._register_tool(name, describe_health_tool, invoker)
+    server._register_tool(name, describe_health_tool, _make_invoker(describe_health_tool))
 
 
 def _register_get_cluster_state(
@@ -520,10 +572,7 @@ def _register_get_cluster_state(
         """Render `env`'s kubernetes cluster snapshot from the stored k8s gauges."""
         return get_cluster_state(context, env=env)
 
-    def invoker(*_args: object, **kwargs: object) -> object:
-        return get_cluster_state(context, env=_str_kwarg(kwargs, "env"))
-
-    server._register_tool(name, get_cluster_state_tool, invoker)
+    server._register_tool(name, get_cluster_state_tool, _make_invoker(get_cluster_state_tool))
 
 
 def _register_get_slo(context: QueryContext, server: "PanoptesMcpServer", name: str) -> None:
@@ -531,10 +580,7 @@ def _register_get_slo(context: QueryContext, server: "PanoptesMcpServer", name: 
         """Evaluate the named SLO for `env`: objective vs. actual + the error budget."""
         return get_slo(context, env=env, name=slo_name)
 
-    def invoker(*_args: object, **kwargs: object) -> object:
-        return get_slo(context, env=_str_kwarg(kwargs, "env"), name=_str_kwarg(kwargs, "slo_name"))
-
-    server._register_tool(name, get_slo_tool, invoker)
+    server._register_tool(name, get_slo_tool, _make_invoker(get_slo_tool))
 
 
 def _register_compare_envs(context: QueryContext, server: "PanoptesMcpServer", name: str) -> None:
@@ -542,12 +588,7 @@ def _register_compare_envs(context: QueryContext, server: "PanoptesMcpServer", n
         """Compare one metric across every enabled env (per-env series + error markers)."""
         return compare_envs(context, metric=metric, window=window)
 
-    def invoker(*_args: object, **kwargs: object) -> object:
-        return compare_envs(
-            context, metric=_str_kwarg(kwargs, "metric"), window=_str_kwarg(kwargs, "window")
-        )
-
-    server._register_tool(name, compare_envs_tool, invoker)
+    server._register_tool(name, compare_envs_tool, _make_invoker(compare_envs_tool))
 
 
 def _register_get_cost(context: QueryContext, server: "PanoptesMcpServer", name: str) -> None:
@@ -555,10 +596,7 @@ def _register_get_cost(context: QueryContext, server: "PanoptesMcpServer", name:
         """Render `env`'s cost snapshot over `window` from the stored cost gauges."""
         return get_cost(context, env=env, window=window)
 
-    def invoker(*_args: object, **kwargs: object) -> object:
-        return get_cost(context, env=_str_kwarg(kwargs, "env"), window=_str_kwarg(kwargs, "window"))
-
-    server._register_tool(name, get_cost_tool, invoker)
+    server._register_tool(name, get_cost_tool, _make_invoker(get_cost_tool))
 
 
 def _core_registrars(
