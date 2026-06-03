@@ -39,9 +39,10 @@ panoptes:
   store:
     type: victoriametrics
     # The VictoriaMetrics endpoint is local-compose infrastructure (not a secret):
-    # the `vm` service inside the docker-compose network. Inlined like the spec's
-    # reference config (`http://vm:8428`).
-    url: http://vm:8428
+    # the in-network hostname MUST match the docker-compose service name
+    # (`victoriametrics`) — a `vm` alias does not resolve and the collector's writes
+    # fail with "Name or service not known".
+    url: http://victoriametrics:8428
     retention: 15d
   notifiers:
     - type: logging

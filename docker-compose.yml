@@ -7,8 +7,9 @@
 # host will run, so local and deployed stacks are identical.
 #
 # Risk R1/A8 — zero-build local loop: `collector` and `mcp` run the in-repo source
-# mounted into a stock `python:3.12-slim` and `pip install -e .` at start-up. No
-# published image is needed in v0.1 (a GHCR image is v0.2 distribution), and no
+# mounted READ-ONLY into a stock `python:3.12-slim` and `pip install .` (non-editable
+# — an editable install can't write egg-info into a `:ro` source tree) at start-up.
+# No published image is needed in v0.1 (a GHCR image is v0.2 distribution), and no
 # Dockerfile is needed because neither service requires a non-base runtime.
 #
 # Consumer-pack injection (spec § Consumer-pack loading): the consumer's pack dir is
@@ -67,8 +68,15 @@ services:
     depends_on:
       - victoriametrics
     working_dir: /app
-    # A8: mount the repo source + editable-install at start, then run one scheduled
-    # collector. No Dockerfile/build step — the stock slim image is sufficient.
+    # A8: mount the repo source READ-ONLY + install deps at start, then run a
+    # scheduled collector. No Dockerfile/build step — the stock slim image suffices.
+    # The install copies just `core/` + `pyproject.toml` into a WRITABLE /tmp dir and
+    # `pip install`s from there: pip's setuptools backend runs `egg_info` in the build
+    # dir, which CANNOT be the `:ro` /app source tree (that's why a direct
+    # `pip install .`/`-e .` against /app fails with "Cannot update time stamp of
+    # directory 'panoptes.egg-info'"). Deps still resolve from pyproject (no drift).
+    # The service then runs the LIVE mounted source (working_dir=/app puts /app first
+    # on sys.path for `python -m`); the install is only to pull the dependencies.
     volumes:
       - ./:/app:ro
       - ${CONSUMER_PACK_DIR:?Set CONSUMER_PACK_DIR (see .env.example)}:/packs/consumer:ro
@@ -87,7 +95,7 @@ services:
     command:
       - "/bin/sh"
       - "-c"
-      - "pip install --quiet --no-cache-dir -e . && python -m core.collector --config \"$$PANOPTES_CONFIG\""
+      - "mkdir -p /tmp/pkg && cp -r /app/core /app/pyproject.toml /tmp/pkg/ && pip install --quiet --no-cache-dir /tmp/pkg && python -m core.collector --config \"$$PANOPTES_CONFIG\""
     restart: unless-stopped
 
   mcp:
@@ -123,7 +131,7 @@ services:
       # PANOPTES_CONSUMER_PACK from the environment above.
       - "/bin/sh"
       - "-c"
-      - "pip install --quiet --no-cache-dir -e . && python -m core.mcp.server"
+      - "mkdir -p /tmp/pkg && cp -r /app/core /app/pyproject.toml /tmp/pkg/ && pip install --quiet --no-cache-dir /tmp/pkg && python -m core.mcp.server"
     restart: unless-stopped
 
 volumes:
