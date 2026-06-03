@@ -567,7 +567,13 @@ class CloudWatchSource:
         timestamp_millis = raw_event.get("timestamp")
         if not isinstance(message, str) or not isinstance(timestamp_millis, int | float):
             return None
-        timestamp = datetime.fromtimestamp(float(timestamp_millis) / 1000.0, tz=UTC)
+        try:
+            # An out-of-range-but-valid millis value raises OverflowError/OSError (not
+            # ValueError) from `fromtimestamp`; guard it so one bad event is skipped rather than
+            # aborting the page (the same skip-the-bad-line discipline as the message guard).
+            timestamp = datetime.fromtimestamp(float(timestamp_millis) / 1000.0, tz=UTC)
+        except (ValueError, OverflowError, OSError):
+            return None
         return _LogEvent(timestamp=timestamp, message=message)
 
     def _fetch_cost(self, window: TimeWindow) -> list[MetricSignal]:

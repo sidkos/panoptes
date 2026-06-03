@@ -261,25 +261,43 @@ def test_unknown_adapter_type_fails_fast(tmp_path: Path, monkeypatch: pytest.Mon
     assert "does-not-exist" in str(excinfo.value)
 
 
-def test_non_identifier_env_name_fails_fast(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """MINOR-4 root-cause: a non-identifier env name is rejected at config-load.
+def test_broken_env_name_fails_fast(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A genuinely-BROKEN env name (a quote) is rejected at config-load.
 
-    An env name is stamped UNQUOTED as a PromQL label value (`env="<name>"`) and as the `env`
-    label on every emitted signal, so a name with a breakout char (here a hyphen, outside
-    `[A-Za-z0-9_:]`) must fail fast with a clear PanoptesError rather than silently corrupting a
-    downstream selector/label. The valid `dev`/`stage`/`prod` names continue to load.
+    An env name is stamped as a PromQL label value (`env="<name>"`) and as the `env` label on
+    every emitted signal, so a name carrying a breakout char (here a double-quote) must fail fast
+    with a clear PanoptesError rather than silently corrupting a downstream selector/label. The
+    guard rejects ONLY broken names — the relaxed pattern (MINOR-3) accepts hyphen/dot names.
     """
     _set_reference_env(monkeypatch)
-    # Rename the `dev` env to a hyphenated (non-identifier) name; keep its block intact.
-    body = _REFERENCE_YAML.replace("    dev:", "    dev-prod:", 1)
+    # Rename the `dev` env to a quote-bearing (genuinely broken) name via a quoted YAML key.
+    body = _REFERENCE_YAML.replace("    dev:", "    'a\"b':", 1)
     config_path = _write_fixture(tmp_path, body)
     with pytest.raises(PanoptesError) as excinfo:
         load_config(config_path, registries=_registries_with_correct_capabilities())
     message = str(excinfo.value)
-    assert "dev-prod" in message
+    assert 'a"b' in message
     assert "identifier" in message.lower()
+
+
+def test_hyphen_and_dot_env_names_are_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MINOR-3: real-world env names with HYPHEN/DOT (`prod-us`, `us-east-1`, `prod.eu`) load.
+
+    The relaxed `_ENV_NAME_PATTERN` permits `.` and `-` so common region/tier names are not
+    rejected — every env-into-PromQL sink escapes the value, so these need no stricter shape.
+    """
+    _set_reference_env(monkeypatch)
+    # Rename the three reference envs to hyphen/dot names; their blocks are otherwise intact.
+    body = (
+        _REFERENCE_YAML.replace("    dev:", "    prod-us:", 1)
+        .replace("    stage:", "    us-east-1:", 1)
+        .replace("    prod:", "    prod.eu:", 1)
+    )
+    config_path = _write_fixture(tmp_path, body)
+    resolved = load_config(config_path, registries=_registries_with_correct_capabilities())
+    assert set(resolved.environments) == {"prod-us", "us-east-1", "prod.eu"}
 
 
 def test_disabled_env_produces_no_adapters(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

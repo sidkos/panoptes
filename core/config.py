@@ -53,14 +53,15 @@ _CORE_DASHBOARDS_DIR = Path("core/dashboards")
 # underscore), which is the only form the v0.1 config uses.
 _VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
-# Environment-name pattern (MINOR-4 root-cause hardening). An env name is stamped UNQUOTED as
-# a PromQL label value (`env="<name>"`) by the MCP query tools AND as the `env` LABEL on every
-# signal the cloudwatch/prometheus/loki sources emit. A non-identifier name (a quote, brace,
-# backslash, …) could corrupt a selector or a label, so env names are validated to the SAME
-# PromQL-identifier shape metric names + label keys use — rejected at config-load with a clear
-# error rather than silently producing a broken query downstream. `dev`/`stage`/`prod` (and any
-# `[A-Za-z_][A-Za-z0-9_:]*` name) pass; a name with a breakout char fails fast.
-_ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_:]*$")
+# Environment-name pattern (config-load hardening). An env name is stamped as a PromQL label
+# value (`env="<name>"`) by the MCP query tools AND as the `env` LABEL on every signal the
+# cloudwatch/prometheus/loki sources emit. Every env-into-PromQL sink ALSO escapes the value via
+# `escape_promql_value` (defense-in-depth), so this guard's job is narrow: reject only genuinely
+# BROKEN names (quotes/braces/backslash/whitespace) that have no legitimate use, while ALLOWING
+# the common real-world shapes — `prod-us`, `us-east-1`, `prod.eu` (HYPHEN + DOT) — that a
+# stricter `[A-Za-z0-9_:]`-only pattern wrongly rejected (a usability regression with no payoff
+# now that every sink escapes). The character class therefore adds `.` and `-`.
+_ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_:.-]*$")
 
 
 # --- TypedDict schemas (the raw YAML shape, post-interpolation) -------------------

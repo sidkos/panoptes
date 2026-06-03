@@ -1,0 +1,44 @@
+{{- /*
+OPT-IN in-cluster RBAC for the `kubernetes` source (default OFF — `kubernetesRbac.enabled`).
+
+Renders ONLY when `.Values.kubernetesRbac.enabled` is true. It is the minimal read-only
+ClusterRole from docs/IAM.md §"Kubernetes is RBAC, not IAM" — `apiGroups:[""],
+resources:[pods,events,nodes,services], verbs:[get,list,watch]` — bound to the FIXED
+`panoptes-collector` ServiceAccount (the same SA the IRSA trust pins). Off by default so a
+deploy that does NOT observe its own cluster grants zero cluster-read (least privilege); the
+operator enables it deliberately instead of over-granting after an RBAC-forbidden error.
+
+The ClusterRole/Binding NAMES are release-scoped (fullname-prefixed) because they are
+CLUSTER-scoped resources that must not collide across releases; the BOUND subject SA name
+stays the FIXED `panoptes-collector` (it is namespace-scoped + IRSA-pinned).
+*/ -}}
+{{- if .Values.kubernetesRbac.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "panoptes.fullname" . }}-kubernetes-read
+  labels:
+    {{- include "panoptes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kubernetes-rbac
+rules:
+  # Exactly the docs/IAM.md §Kubernetes read-only rule — no write verb, no extra resource.
+  - apiGroups: [""]
+    resources: [pods, events, nodes, services]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "panoptes.fullname" . }}-kubernetes-read
+  labels:
+    {{- include "panoptes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kubernetes-rbac
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "panoptes.fullname" . }}-kubernetes-read
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "panoptes.collectorServiceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

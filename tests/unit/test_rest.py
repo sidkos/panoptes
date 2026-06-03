@@ -26,7 +26,7 @@ import httpx
 import pytest
 import respx
 from core.errors import PanoptesError
-from core.rest import _BODY_TRIM_CHARS, RestClient
+from core.rest import _BODY_TRIM_CHARS, RestClient, redact_url_userinfo
 
 _URL = "http://upstream.internal/api/v1/thing"
 
@@ -351,3 +351,23 @@ def test_injected_client_is_used() -> None:
     client = RestClient(injected)
 
     assert client.http is injected
+
+
+def test_redact_url_userinfo_strips_user_and_password() -> None:
+    """`redact_url_userinfo` removes `user:pass@` while preserving scheme/host/port/path."""
+    redacted = redact_url_userinfo("https://probe-user:secret@prometheus.test:9090/api")
+    assert "secret" not in redacted
+    assert "probe-user" not in redacted
+    assert redacted == "https://prometheus.test:9090/api"
+
+
+def test_redact_url_userinfo_passes_through_a_url_without_userinfo() -> None:
+    """A URL without `user:pass@` is returned unchanged (no spurious rewrite)."""
+    url = "http://loki.test:3100/ready"
+    assert redact_url_userinfo(url) == url
+
+
+def test_redact_url_userinfo_strips_userinfo_without_a_port() -> None:
+    """Userinfo is stripped even when the URL carries no explicit port."""
+    redacted = redact_url_userinfo("https://tok:en@example.invalid/path")
+    assert redacted == "https://example.invalid/path"

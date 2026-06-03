@@ -52,7 +52,7 @@ from core.model import (
     TimeWindow,
 )
 from core.registry import SOURCES, ConfigBlock
-from core.rest import RestClient
+from core.rest import RestClient, redact_url_userinfo
 from core.sources.probe import probe_health
 from core.validation import require_str_field, require_str_list_field
 
@@ -158,7 +158,11 @@ class LokiSource:
         return probe_health(
             "loki endpoint",
             _probe,
-            success_detail_factory=lambda _result: f"loki endpoint reachable ({self._url})",
+            # Strip any `user:pass@` userinfo from the URL before embedding it in the reachable
+            # detail (the one leak path — `describe_health` surfaces this success string).
+            success_detail_factory=lambda _result: (
+                f"loki endpoint reachable ({redact_url_userinfo(self._url)})"
+            ),
         )
 
     def _scrape(self, query: str, window: TimeWindow) -> object:
@@ -264,9 +268,13 @@ class LokiSource:
             return None
         try:
             nanos = int(raw_timestamp)
-        except ValueError:
+            # `fromtimestamp` is INSIDE the guard: an out-of-range-but-valid integer (a year far
+            # outside datetime's range) raises OverflowError/OSError, not ValueError. loki is on
+            # a DIRECT un-backstopped MCP path (search_logs → fetch; the fan-out only catches
+            # PanoptesError), so an unguarded raise would escape — skip the bad line instead.
+            return datetime.fromtimestamp(nanos / 1_000_000_000, tz=UTC)
+        except (ValueError, OverflowError, OSError):
             return None
-        return datetime.fromtimestamp(nanos / 1_000_000_000, tz=UTC)
 
     @staticmethod
     def _structured_level(labels: Mapping[str, object]) -> LogLevel | None:

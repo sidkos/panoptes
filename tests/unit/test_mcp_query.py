@@ -303,6 +303,24 @@ def test_describe_health_surfaces_key_derived_metrics_value() -> None:
     assert metrics_by_name.get("panoptes_health_up") == 1.0
 
 
+def test_describe_health_passthrough_store_swallows_capability_error_empty_metrics() -> None:
+    """A passthrough store's CapabilityError in enrichment is SWALLOWED — the rollup still returns.
+
+    `_health_metrics_for_env` reads the key derived metrics via `read_series`, which PROPAGATES a
+    CapabilityError; the loop swallows it (health stays answerable from reachability alone). The
+    rollup must still return — with an EMPTY metrics list and the per-source reachability intact —
+    rather than raising into the MCP surface.
+    """
+    config = _dev_only_config(store=PassthroughStore({}))
+    rollup = describe_health(QueryContext(config), env="dev")
+
+    assert rollup["env"] == "dev"
+    # Metric enrichment was dropped (the passthrough store cannot answer), but the rollup stands.
+    assert rollup["metrics"] == []
+    # Reachability — the rollup's mandatory promise — is still present for every configured source.
+    assert rollup["sources"], "the rollup must still carry per-source reachability"
+
+
 def test_describe_health_env_all_includes_metrics_field() -> None:
     """The `env="all"` aggregate rollup still carries a coherent `metrics` field (F2g)."""
 
@@ -931,6 +949,38 @@ def test_get_cluster_state_reachable_when_only_restarts_present() -> None:
     assert state["pods_crashloop"] == 0.0
     # The cluster label still resolves (falls back to the restart series' {cluster} label).
     assert state["cluster"] == "c1"
+
+
+def test_get_cluster_state_reachable_when_only_pending_present() -> None:
+    """Reachability OR-term: ONLY a `pods_pending` gauge present → reachable via that term.
+
+    Exercises the `pods_pending is not None` deciding-term in isolation (no node/crashloop/
+    restart data). The other scalars default 0.0; reachable is True.
+    """
+    store = _K8sGaugeStore(
+        {"panoptes_k8s_pods_pending": [_k8s_series("panoptes_k8s_pods_pending", "dev", "c1", 2.0)]}
+    )
+    state = get_cluster_state(QueryContext(_k8s_config(store)), env="dev")
+    assert state["reachable"] is True
+    assert state["pods_pending"] == 2.0
+    assert state["node_count"] == 0.0
+    assert state["pods_crashloop"] == 0.0
+
+
+def test_get_cluster_state_reachable_when_only_crashloop_present() -> None:
+    """Reachability OR-term: ONLY a `pods_crashloop` gauge present → reachable via that term."""
+    store = _K8sGaugeStore(
+        {
+            "panoptes_k8s_pods_crashloop": [
+                _k8s_series("panoptes_k8s_pods_crashloop", "dev", "c1", 1.0)
+            ]
+        }
+    )
+    state = get_cluster_state(QueryContext(_k8s_config(store)), env="dev")
+    assert state["reachable"] is True
+    assert state["pods_crashloop"] == 1.0
+    assert state["node_count"] == 0.0
+    assert state["pods_pending"] == 0.0
 
 
 # --- v0.x stub tools -------------------------------------------------------------

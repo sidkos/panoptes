@@ -82,9 +82,19 @@ def test_window_minutes_parses_a_bare_integer_string_as_minutes() -> None:
     assert _window_minutes("30") == 30
 
 
-def test_window_minutes_zero_falls_back_to_default() -> None:
-    """A bare `'0'` is non-positive → fall back to the default window (not a zero-span window)."""
-    assert _window_minutes("0") == _DEFAULT_WINDOW_MINUTES
+def test_window_minutes_zero_falls_back_to_default_with_non_positive_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A bare `'0'` is non-positive → default fallback + a DISTINCT 'non-positive' warning (NIT-2).
+
+    A recognized-but-non-positive integer gets a precise message, not the generic 'unrecognized'
+    one (which would be misleading — 0 IS a number, it is just out of range).
+    """
+    with caplog.at_level(logging.WARNING):
+        result = _window_minutes("0")
+    assert result == _DEFAULT_WINDOW_MINUTES
+    messages = " ".join(record.getMessage().lower() for record in caplog.records)
+    assert "non-positive" in messages, "a non-positive int must surface the distinct message"
 
 
 def test_window_minutes_negative_falls_back_to_default_with_warning(

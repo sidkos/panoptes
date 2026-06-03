@@ -537,3 +537,91 @@ def test_poll_gate_uses_the_injected_clock_not_wall_time() -> None:
     gate.mark_done()
     # The injected clock never advances, so even a 1s interval is never reached → not due.
     assert gate.is_due() is False
+
+
+# --- cost-path parsers (the malformed-data defensive branches) -------------------
+
+
+def _cost_source() -> CloudWatchSource:
+    """A cost-configured source (no live clients) for exercising its cost-normalizer methods."""
+    return CloudWatchSource(_config(cost_budget_name=_BUDGET_NAME))
+
+
+def test_normalize_cost_results_skips_malformed_groups_keeps_valid_sibling() -> None:
+    """A malformed CE group (empty Keys / missing Metrics / non-numeric Amount) is SKIPPED.
+
+    `_normalize_cost_results` (via `_parse_cost_group`) must skip each broken group while a valid
+    sibling in the SAME period still emits its `panoptes_cost_spend{env,service}` gauge.
+    """
+    source = _cost_source()
+    sample_time = datetime(2026, 1, 1, tzinfo=UTC)
+    results = [
+        {
+            "Groups": [
+                {"Keys": [], "Metrics": {"UnblendedCost": {"Amount": "1.0"}}},  # empty Keys
+                {"Keys": ["AmazonS3"]},  # Metrics missing
+                {
+                    "Keys": ["AmazonEC2"],
+                    "Metrics": {"UnblendedCost": {"Amount": "not-a-number"}},  # bad Amount
+                },
+                {
+                    "Keys": ["AmazonRDS"],
+                    "Metrics": {"UnblendedCost": {"Amount": "42.50"}},  # the one valid group
+                },
+            ]
+        }
+    ]
+    signals = source._normalize_cost_results(results, sample_time)
+    spend = {s.labels["service"]: s.value for s in signals}
+    assert spend == {"AmazonRDS": 42.50}, "only the one valid group emits a spend gauge"
+
+
+def test_parse_cost_group_returns_none_for_each_malformed_shape() -> None:
+    """`_parse_cost_group` collapses each malformed group shape to `(None, None)`."""
+    parse = CloudWatchSource._parse_cost_group
+    assert parse("not-a-dict") == (None, None)
+    assert parse({"Keys": []}) == (None, None)  # empty Keys
+    assert parse({"Keys": [123]}) == (None, None)  # non-str service key
+    assert parse({"Keys": ["EC2"], "Metrics": "nope"}) == (None, None)  # Metrics not a dict
+    assert parse({"Keys": ["EC2"], "Metrics": {}}) == (None, None)  # no UnblendedCost
+    assert parse({"Keys": ["EC2"], "Metrics": {"UnblendedCost": {"Amount": 5}}}) == (None, None)
+    assert parse({"Keys": ["EC2"], "Metrics": {"UnblendedCost": {"Amount": "x"}}}) == (
+        None,
+        None,
+    )  # non-numeric Amount
+    # The well-formed shape parses.
+    assert parse({"Keys": ["EC2"], "Metrics": {"UnblendedCost": {"Amount": "12.5"}}}) == (
+        "EC2",
+        12.5,
+    )
+
+
+def test_compute_budget_burn_returns_none_for_zero_limit() -> None:
+    """A BudgetLimit.Amount of '0.0' yields NO burn (divide-by-zero guard), not a crash."""
+    burn = CloudWatchSource._compute_budget_burn(
+        {
+            "BudgetLimit": {"Amount": "0.0", "Unit": "USD"},
+            "CalculatedSpend": {"ActualSpend": {"Amount": "100.0", "Unit": "USD"}},
+        }
+    )
+    assert burn is None, "a zero budget limit must yield no burn gauge (no divide-by-zero)"
+
+
+def test_compute_budget_burn_none_for_missing_or_non_dict_payloads() -> None:
+    """A non-dict / missing-limit / missing-actual budget payload yields `None` (no gauge)."""
+    assert CloudWatchSource._compute_budget_burn("not-a-dict") is None
+    assert CloudWatchSource._compute_budget_burn({}) is None  # no BudgetLimit
+    assert (
+        CloudWatchSource._compute_budget_burn({"BudgetLimit": {"Amount": "100.0"}}) is None
+    )  # no CalculatedSpend
+
+
+def test_compute_budget_burn_computes_actual_over_limit() -> None:
+    """A well-formed budget payload computes `actual / limit`."""
+    burn = CloudWatchSource._compute_budget_burn(
+        {
+            "BudgetLimit": {"Amount": "1000.0", "Unit": "USD"},
+            "CalculatedSpend": {"ActualSpend": {"Amount": "420.0", "Unit": "USD"}},
+        }
+    )
+    assert burn == pytest.approx(0.42)

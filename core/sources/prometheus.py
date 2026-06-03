@@ -49,7 +49,7 @@ from core.model import (
     TimeWindow,
 )
 from core.registry import SOURCES, ConfigBlock
-from core.rest import RestClient
+from core.rest import RestClient, redact_url_userinfo
 from core.sources.probe import probe_health
 from core.validation import require_str_field, require_str_list_field
 
@@ -133,7 +133,11 @@ class PrometheusSource:
         return probe_health(
             "prometheus endpoint",
             _probe,
-            success_detail_factory=lambda _result: f"prometheus endpoint reachable ({self._url})",
+            # Strip any `user:pass@` userinfo from the URL before embedding it in the reachable
+            # detail (the one leak path — `describe_health` surfaces this success string).
+            success_detail_factory=lambda _result: (
+                f"prometheus endpoint reachable ({redact_url_userinfo(self._url)})"
+            ),
         )
 
     def _scrape(self, query: str, window: TimeWindow) -> object:
@@ -258,9 +262,12 @@ class PrometheusSource:
             return None
         try:
             value = float(raw_value) if isinstance(raw_value, str | int | float) else None
-        except ValueError:
+            if value is None:
+                return None
+            # `fromtimestamp` is INSIDE the guard: an out-of-range-but-valid number raises
+            # OverflowError/OSError (not ValueError), which would otherwise escape `fetch()` —
+            # skip the bad sample instead.
+            timestamp = datetime.fromtimestamp(float(raw_timestamp), tz=UTC)
+        except (ValueError, OverflowError, OSError):
             return None
-        if value is None:
-            return None
-        timestamp = datetime.fromtimestamp(float(raw_timestamp), tz=UTC)
         return timestamp, value

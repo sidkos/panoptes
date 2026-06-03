@@ -224,6 +224,25 @@ def test_health_reachable_when_endpoint_responds() -> None:
 
 
 @respx.mock
+def test_health_success_detail_strips_url_userinfo() -> None:
+    """NIT-3: an embedded `user:pass@` credential is stripped from the reachable health detail.
+
+    The success detail (the one leak path — surfaced via `describe_health`) must not echo a URL
+    credential. A source configured with `http://user:secret@host` reports reachable WITHOUT the
+    `user:secret@` userinfo in the detail.
+    """
+    url = "http://probe-user:supersecret@prometheus.test:9090"
+    respx.get(f"{url}/-/healthy").mock(return_value=httpx.Response(200, text="Healthy"))
+    source = PrometheusSource({"url": url, "queries": [_QUERY], "env": _ENV})
+    health = source.health()
+    assert health.reachable is True
+    assert "supersecret" not in health.detail
+    assert "probe-user" not in health.detail
+    # The host is still present (a useful, non-secret detail).
+    assert "prometheus.test" in health.detail
+
+
+@respx.mock
 def test_multiple_queries_are_each_scraped() -> None:
     """Each configured query is scraped (one request per query)."""
     routes = respx.get(_QUERY_RANGE_URL).mock(
@@ -285,6 +304,35 @@ def test_bad_value_pair_and_unparseable_sample_are_skipped() -> None:
                     "values": [
                         ["not-a-number", "1"],  # non-numeric ts → skipped
                         [1735689660, "not-a-float"],  # non-numeric value → skipped
+                        [1735689720, "0.5"],  # the one good sample
+                    ],
+                }
+            ],
+        },
+    }
+    respx.get(_QUERY_RANGE_URL).mock(return_value=httpx.Response(200, json=payload))
+    metrics = [s for s in _source().fetch(_WINDOW) if isinstance(s, MetricSignal)]
+    assert [m.value for m in metrics] == [0.5]
+
+
+@respx.mock
+def test_out_of_range_unix_timestamp_sample_is_skipped() -> None:
+    """A valid-NUMBER but out-of-range unix timestamp is SKIPPED (OverflowError, not raised).
+
+    `float(raw)` succeeds but `datetime.fromtimestamp` raises OverflowError/OSError for a year
+    far outside datetime's range — that must be caught, skipping only the bad sample while a
+    well-formed sibling sample survives.
+    """
+    payload = {
+        "status": "success",
+        "data": {
+            "resultType": "matrix",
+            "result": [
+                {
+                    "metric": {"__name__": "up", "job": "api"},
+                    "values": [
+                        # A valid number, but billions of years out of range → OverflowError.
+                        [1e19, "9.0"],
                         [1735689720, "0.5"],  # the one good sample
                     ],
                 }

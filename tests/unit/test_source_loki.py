@@ -251,6 +251,19 @@ def test_health_reachable_when_endpoint_responds() -> None:
 
 
 @respx.mock
+def test_health_success_detail_strips_url_userinfo() -> None:
+    """NIT-3: an embedded `user:pass@` credential is stripped from the reachable health detail."""
+    url = "http://probe-user:supersecret@loki.test:3100"
+    respx.get(f"{url}/ready").mock(return_value=httpx.Response(200, text="ready"))
+    source = LokiSource({"url": url, "queries": [_QUERY], "env": _ENV})
+    health = source.health()
+    assert health.reachable is True
+    assert "supersecret" not in health.detail
+    assert "probe-user" not in health.detail
+    assert "loki.test" in health.detail
+
+
+@respx.mock
 def test_multiple_queries_are_each_scraped() -> None:
     """Each configured query is scraped (one request per query)."""
     routes = respx.get(_QUERY_RANGE_URL).mock(
@@ -330,6 +343,36 @@ def test_unparseable_ns_timestamp_line_is_skipped() -> None:
                     "stream": {"job": "api", "level": "info"},
                     "values": [
                         ["not-a-number", "bad ts line"],  # unparseable ns ts → skipped
+                        [_TS_1, "good ts line"],
+                    ],
+                }
+            ],
+        },
+    }
+    respx.get(_QUERY_RANGE_URL).mock(return_value=httpx.Response(200, json=payload))
+    logs = [s for s in _source().fetch(_WINDOW) if isinstance(s, LogSignal)]
+    assert [log.message for log in logs] == ["good ts line"]
+
+
+@respx.mock
+def test_out_of_range_ns_timestamp_line_is_skipped() -> None:
+    """A valid-INTEGER but out-of-range ns timestamp is SKIPPED (OverflowError, not raised).
+
+    `int(raw)` succeeds but `datetime.fromtimestamp` raises OverflowError/OSError for a year far
+    outside datetime's range — that must be caught (loki is on a DIRECT un-backstopped MCP path),
+    skipping only the bad line while a sibling good line in the same stream survives.
+    """
+    payload = {
+        "status": "success",
+        "data": {
+            "resultType": "streams",
+            "result": [
+                {
+                    "stream": {"job": "api", "level": "info"},
+                    "values": [
+                        # A valid integer string, but billions of years in the future (out of
+                        # range for datetime) → OverflowError inside the parse guard → skipped.
+                        ["999999999999999999999999999999", "out-of-range ts line"],
                         [_TS_1, "good ts line"],
                     ],
                 }

@@ -38,10 +38,30 @@ test that wants explicit control) passes one through, and `RestClient` threads i
 
 import re
 from collections.abc import Callable, Mapping
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
 from core.errors import PanoptesError
+
+
+def redact_url_userinfo(url: str) -> str:
+    """Return `url` with any `user:pass@` userinfo stripped (so an embedded credential is hidden).
+
+    A source health-probe SUCCESS detail (`describe_health`) embeds the configured endpoint URL
+    verbatim. If an operator configured `https://user:token@host/...`, the verbatim URL would leak
+    the credential through the MCP-visible rollup. This rebuilds the URL without the userinfo —
+    `https://host/...` — so the success branch carries no secret. A URL with no userinfo is
+    returned unchanged. The failure branch is already class-name-only and never embeds the URL.
+    """
+    split = urlsplit(url)
+    # `hostname` drops userinfo (and lowercases the host); rebuild netloc as host[:port] only.
+    if "@" not in split.netloc:
+        return url
+    host = split.hostname or ""
+    netloc = f"{host}:{split.port}" if split.port is not None else host
+    return urlunsplit((split.scheme, netloc, split.path, split.query, split.fragment))
+
 
 # Trim length for the surfaced upstream response body (~800 chars): enough to carry the
 # rejected-field/token detail without dumping an unbounded error page into logs. This is

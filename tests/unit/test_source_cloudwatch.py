@@ -202,6 +202,43 @@ def test_logs_normalize_with_pagination_and_error_rate() -> None:
     logs_stub.assert_no_pending_responses()
 
 
+def test_out_of_range_event_timestamp_is_skipped_sibling_event_survives() -> None:
+    """A valid-INTEGER but out-of-range millis timestamp is SKIPPED (OverflowError, not raised).
+
+    `float(millis)/1000` succeeds but `datetime.fromtimestamp` raises OverflowError/OSError for a
+    year far outside datetime's range — that must be caught so one bad event is skipped while a
+    well-formed sibling event in the SAME page survives.
+    """
+    cw = _cloudwatch_client()
+    logs = _logs_client()
+    cw_stub = Stubber(cw)
+    logs_stub = Stubber(logs)
+    cw_stub.add_response("get_metric_data", {"MetricDataResults": []})
+
+    good_millis = int(_SAMPLE_TS.timestamp() * 1000)
+    # First group: one out-of-range-millis event (skipped) + one good event (survives).
+    logs_stub.add_response(
+        "filter_log_events",
+        {
+            "events": [
+                {"message": "out-of-range event", "timestamp": 99999999999999999999},
+                {"message": "good event", "timestamp": good_millis},
+            ]
+        },
+    )
+    # Second group: no events.
+    logs_stub.add_response("filter_log_events", {"events": []})
+
+    cw_stub.activate()
+    logs_stub.activate()
+
+    source = CloudWatchSource(_config(), cloudwatch_client=cw, logs_client=logs)
+    log_signals = [s for s in source.fetch(_WINDOW) if isinstance(s, LogSignal)]
+    assert [s.message for s in log_signals] == ["good event"]
+    cw_stub.assert_no_pending_responses()
+    logs_stub.assert_no_pending_responses()
+
+
 def test_assume_role_precedence_over_profile_calls_sts_with_external_id() -> None:
     sts = _sts_client()
     sts_stub = Stubber(sts)

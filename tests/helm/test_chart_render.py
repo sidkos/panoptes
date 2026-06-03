@@ -370,6 +370,77 @@ def test_oauth2_proxy_sets_xauthrequest_so_the_identity_header_is_injected() -> 
     )
 
 
+# --- opt-in kubernetes RBAC (MINOR-4) --------------------------------------------
+
+
+def _render_with(*set_overrides: str) -> str:
+    """`helm template -f ci/test-values.yaml` with extra `--set` overrides (asserts exit 0)."""
+    command: list[str] = ["helm", "template", str(_CHART_DIR), "-f", str(_CI_VALUES)]
+    for override in set_overrides:
+        command.extend(("--set", override))
+    result = _run(tuple(command))
+    assert result.returncode == 0, (
+        f"`helm template {set_overrides}` failed (exit {result.returncode}):\n"
+        f"{result.stdout}\n{result.stderr}"
+    )
+    return result.stdout
+
+
+def test_kubernetes_rbac_is_absent_by_default() -> None:
+    """The DEFAULT render (kubernetesRbac off) emits NO ClusterRole/ClusterRoleBinding.
+
+    Least privilege: a deploy that does not observe its own cluster must grant zero
+    cluster-read. The default CI values do not enable the toggle, so neither RBAC resource is
+    rendered.
+    """
+    documents = _parse_documents(_rendered_manifests())
+    assert _by_kind(documents, "ClusterRole") == [], "default render must emit no ClusterRole"
+    assert _by_kind(documents, "ClusterRoleBinding") == [], (
+        "default render must emit no ClusterRoleBinding"
+    )
+
+
+def test_kubernetes_rbac_renders_the_minimal_read_only_rule_bound_to_the_collector() -> None:
+    """With `kubernetesRbac.enabled=true`, the EXACT docs/IAM.md read-only rule renders + binds.
+
+    The ClusterRole grants ONLY `apiGroups:[""], resources:[pods,events,nodes,services],
+    verbs:[get,list,watch]` (no write verb, no extra resource), and the ClusterRoleBinding binds
+    it to the FIXED `panoptes-collector` ServiceAccount — exactly the least-privilege rule the
+    in-cluster kubernetes source needs.
+    """
+    documents = _parse_documents(_render_with("kubernetesRbac.enabled=true"))
+
+    cluster_roles = _by_kind(documents, "ClusterRole")
+    assert len(cluster_roles) == 1, "enabling the toggle must render exactly one ClusterRole"
+    rules = _as_list(cluster_roles[0].get("rules"))
+    assert len(rules) == 1, "the read-only rule must be the ONLY rule"
+    rule = _as_dict(rules[0])
+    assert _as_list(rule.get("apiGroups")) == [""]
+    assert set(_as_list(rule.get("resources"))) == {"pods", "events", "nodes", "services"}
+    assert set(_as_list(rule.get("verbs"))) == {"get", "list", "watch"}
+
+    bindings = _by_kind(documents, "ClusterRoleBinding")
+    assert len(bindings) == 1, "enabling the toggle must render exactly one ClusterRoleBinding"
+    binding = bindings[0]
+    role_ref = _as_dict(binding.get("roleRef"))
+    assert role_ref.get("kind") == "ClusterRole"
+    assert role_ref.get("name") == _name_of(cluster_roles[0])
+    subjects = _as_list(binding.get("subjects"))
+    assert len(subjects) == 1
+    subject = _as_dict(subjects[0])
+    assert subject.get("kind") == "ServiceAccount"
+    assert subject.get("name") == "panoptes-collector", "the binding must target the collector SA"
+
+
+def test_kubernetes_rbac_render_passes_kubeconform() -> None:
+    """The RBAC-enabled render is also schema-valid (helm + kubeconform-strict clean)."""
+    rendered = _render_with("kubernetesRbac.enabled=true")
+    result = _run(_KUBECONFORM_COMMAND, stdin_text=rendered)
+    assert result.returncode == 0, (
+        f"kubeconform rejected the RBAC-enabled render:\n{result.stdout}\n{result.stderr}"
+    )
+
+
 # --- workload hardening assertions (Fix 3) ---------------------------------------
 
 

@@ -33,6 +33,13 @@
         "className": { "type": "string", "minLength": 1 },
         "clusterIssuer": { "type": "string", "minLength": 1 }
       }
+    },
+    "kubernetesRbac": {
+      "type": "object",
+      "description": "Opt-in in-cluster read-only RBAC for the kubernetes source (default false). When true, renders the minimal docs/IAM.md ClusterRole + binding to the panoptes-collector SA.",
+      "properties": {
+        "enabled": { "type": "boolean" }
+      }
     }
   }
 }

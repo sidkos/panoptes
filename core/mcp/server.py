@@ -352,7 +352,11 @@ def _opt_str_kwarg(kwargs: dict[str, object], key: str) -> str | None:
 
 
 def _str_dict_kwarg(kwargs: dict[str, object], key: str) -> dict[str, str] | None:
-    """Return an optional `dict[str, str]` kwarg `key` (None when absent/empty)."""
+    """Return an optional `dict[str, str]` kwarg `key`.
+
+    An absent key yields `None`; a present empty dict yields `{}` (NOT `None`); a present
+    populated dict is coerced (raising on a non-str key/value).
+    """
     value = kwargs.get(key)
     if value is None:
         return None

@@ -88,6 +88,13 @@ def _window_minutes(window: str) -> int:
         parsed = int(normalized)
         if parsed > 0:
             return parsed
+        # A recognized-but-NON-POSITIVE integer (e.g. "0") — distinct from an unparseable
+        # string. Surface a precise message rather than the generic "unrecognized" one.
+        _LOGGER.warning(
+            f"Non-positive MCP window {window!r}; falling back to the default "
+            f"{_DEFAULT_WINDOW_MINUTES}-minute window."
+        )
+        return _DEFAULT_WINDOW_MINUTES
     # Unrecognized — fall back to the default, but surface the value so the operator knows
     # their window was not honored (explicit, not silent).
     _LOGGER.warning(

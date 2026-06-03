@@ -152,6 +152,10 @@ def test_unrecognized_annotation_falls_back_to_str_coercion() -> None:
     # Falls back to _str_kwarg, which requires a str — a str value forwards fine.
     _make_invoker(odd_tool)(env="dev")
     assert received["env"] == "dev"
+    # And the fallback is the REQUIRED-str coercer: an ABSENT arg raises (proving it did not
+    # silently drop the param or treat it as optional).
+    with pytest.raises(TypeError):
+        _make_invoker(odd_tool)()  # `env` absent → required-str coercer raises
 
 
 # --- coercer wrong-type negative paths (the untrusted-kwargs validation boundary) -----------

@@ -333,6 +333,65 @@ def test_query_wrong_result_type_raises() -> None:
         _store().query(_query())
 
 
+@pytest.mark.parametrize(
+    ("payload", "match"),
+    [
+        # The top-level response is not a JSON object (a list).
+        (["not", "an", "object"], "non-object"),
+        # A `data.result` entry that is not an object (a bare string).
+        (
+            {"status": "success", "data": {"resultType": "matrix", "result": ["not-an-object"]}},
+            "entry",
+        ),
+        # A result entry missing its `metric` object.
+        (
+            {
+                "status": "success",
+                "data": {"resultType": "matrix", "result": [{"values": []}]},
+            },
+            "metric",
+        ),
+        # A metric with a non-string label value.
+        (
+            {
+                "status": "success",
+                "data": {
+                    "resultType": "matrix",
+                    "result": [{"metric": {"__name__": "m", "env": 123}, "values": []}],
+                },
+            },
+            "label",
+        ),
+        # A series whose `values` is not a list.
+        (
+            {
+                "status": "success",
+                "data": {
+                    "resultType": "matrix",
+                    "result": [{"metric": {"__name__": "m", "env": "dev"}, "values": "nope"}],
+                },
+            },
+            "values",
+        ),
+    ],
+)
+@respx.mock
+def test_query_malformed_response_shapes_each_raise_clear_error(
+    payload: object, match: str
+) -> None:
+    """Each remaining F2l malformed-but-200 shape raises a clear `PanoptesError` (no silent miss).
+
+    Covers the parse branches not already pinned: a non-object top-level payload, a non-object
+    result entry, an entry missing `metric`, a non-string label value, and a non-list `values`.
+    Each must surface a clear error rather than be mis-parsed into wrong/empty series.
+    """
+    respx.get(f"{_BASE_URL}/api/v1/query_range").mock(
+        return_value=httpx.Response(200, json=payload)
+    )
+    with pytest.raises(PanoptesError, match=match):
+        _store().query(_query())
+
+
 @respx.mock
 def test_write_only_non_metric_signals_makes_zero_http_calls() -> None:
     """A write of only non-MetricSignals issues ZERO HTTP calls (F2l empty-body skip)."""

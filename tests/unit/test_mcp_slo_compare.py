@@ -253,6 +253,34 @@ def test_get_slo_at_objective_boundary_is_met_with_zero_budget() -> None:
     assert result["error_budget_remaining"] == pytest.approx(0.0)
 
 
+def test_get_slo_degenerate_objective_met_reports_full_budget() -> None:
+    """A degenerate objective=1.0 (zero-width budget) WITH actual==1.0 → met + full budget 1.0.
+
+    `_error_budget_remaining` cannot divide by a zero-width budget (`1 - o == 0`), so it reports
+    `1.0` when the actual meets the objective — the no-division branch.
+    """
+    slo: SloConfig = {"name": "perfect", "objective": 1.0, "query": "panoptes_health_up"}
+    store = _ValueStore({"dev": 1.0})
+    config = _config({"dev": _env("dev")}, store=store, slos=[slo])
+    result = get_slo(QueryContext(config), env="dev", name="perfect")
+    assert result["met"] is True
+    assert result["error_budget_remaining"] == pytest.approx(1.0)
+
+
+def test_get_slo_degenerate_objective_unmet_reports_floor_budget() -> None:
+    """A degenerate objective=1.0 WITH actual==0.99 → unmet + the overspent floor (-1.0).
+
+    The other half of the no-division branch: when a 100%-objective is NOT met, the budget is
+    the overspent floor (`-1.0`), never a divide-by-zero.
+    """
+    slo: SloConfig = {"name": "perfect", "objective": 1.0, "query": "panoptes_health_up"}
+    store = _ValueStore({"dev": 0.99})
+    config = _config({"dev": _env("dev")}, store=store, slos=[slo])
+    result = get_slo(QueryContext(config), env="dev", name="perfect")
+    assert result["met"] is False
+    assert result["error_budget_remaining"] == pytest.approx(-1.0)
+
+
 def test_get_slo_unknown_name_fails_clearly() -> None:
     """An unknown SLO name raises a clear CapabilityError (not a silent-empty result)."""
     slo: SloConfig = {"name": "uptime", "objective": 0.99}
@@ -317,3 +345,34 @@ def test_compare_envs_disabled_env_is_not_queried() -> None:
     # Only the enabled env appears.
     assert set(comparison["per_env"]) == {"dev"}
     assert "stage" not in comparison["errors"]
+
+
+def test_compare_envs_rejects_a_breakout_metric_name() -> None:
+    """MAJOR-2 (F7): a breakout metric name is REJECTED before ANY store query runs.
+
+    `compare_envs` splices the metric name UNQUOTED into each env's selector, so a name
+    carrying PromQL-breaking chars (`"`/`{`/`}`/`\\`) must be rejected by the
+    `_PROMQL_IDENTIFIER_RE` guard with a `CapabilityError` — and crucially BEFORE the store is
+    touched (a breakout token must never reach the store). The recording store proves it was
+    never queried.
+    """
+
+    class _RecordingStore:
+        type = "recording"
+
+        def __init__(self) -> None:
+            self.exprs: list[str] = []
+
+        def write(self, signals: list[CanonicalSignal]) -> None:  # pragma: no cover - unused
+            return None
+
+        def query(self, query: MetricQuery) -> list[MetricSeries]:
+            self.exprs.append(query.expr)
+            return []
+
+    store = _RecordingStore()
+    config = _config({"dev": _env("dev")}, store=store)
+    with pytest.raises(CapabilityError):
+        compare_envs(QueryContext(config), metric='up"} or up{', window="15m")
+    # The breakout name was rejected BEFORE any query — the store was never touched.
+    assert store.exprs == [], "a breakout metric must be rejected before any store query"

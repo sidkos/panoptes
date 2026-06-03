@@ -50,6 +50,17 @@ victoriametrics:
 grafana:
   image: grafana/grafana-oss:11.2.0
 
+# In-cluster Kubernetes RBAC for the `kubernetes` source (OPT-IN, default OFF). When the
+# `kubernetes` source observes the SAME cluster Panoptes runs in, the collector SA needs a
+# read-only ClusterRole; this renders EXACTLY the minimal rule from docs/IAM.md
+# §"Kubernetes is RBAC, not IAM" (`apiGroups:[""], resources:[pods,events,nodes,services],
+# verbs:[get,list,watch]`) bound to the panoptes-collector SA. It is OFF by default so a
+# deploy that does NOT use the in-cluster kubernetes source grants zero cluster-read — enable
+# it deliberately rather than over-granting after hitting an RBAC-forbidden error. (Observing
+# a DIFFERENT cluster uses that cluster's own RBAC + a bound SA token, not this toggle.)
+kubernetesRbac:
+  enabled: false
+
 # Default resource requests/limits applied to the workloads (small — cost discipline).
 resources:
   requests:
