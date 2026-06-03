@@ -1,0 +1,68 @@
+{
+  "title": "Errors (Sentry)",
+  "uid": null,
+  "tags": ["panoptes", "core", "errors"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "templating": {
+    "list": [
+      {
+        "name": "env",
+        "type": "query",
+        "label": "Environment",
+        "datasource": "VictoriaMetrics",
+        "query": "label_values(panoptes_sentry_incident_count, env)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": false,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Incident rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (env) (rate(panoptes_sentry_incident_count{env=~\"$env\"}[5m]))",
+          "legendFormat": "{{env}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Top issues by project",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(10, sum by (project, env) (panoptes_sentry_incident_count{env=~\"$env\"}))",
+          "format": "table",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Level breakdown",
+      "type": "barchart",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (level) (panoptes_sentry_incident_count{env=~\"$env\"})",
+          "legendFormat": "{{level}}"
+        }
+      ]
+    }
+  ]
+}

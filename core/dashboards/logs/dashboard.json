@@ -1,0 +1,53 @@
+{
+  "title": "Logs",
+  "uid": null,
+  "tags": ["panoptes", "core", "logs"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "templating": {
+    "list": [
+      {
+        "name": "env",
+        "type": "query",
+        "label": "Environment",
+        "datasource": "VictoriaMetrics",
+        "query": "label_values(panoptes_log_error_rate, env)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": false,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Error-log rate by log group",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "panoptes_log_error_rate{env=~\"$env\"}",
+          "legendFormat": "{{log_group}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Log error volume (top groups)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(10, sum by (log_group) (panoptes_log_error_rate{env=~\"$env\"}))",
+          "legendFormat": "{{log_group}}"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,67 @@
+{
+  "title": "Overview",
+  "uid": null,
+  "tags": ["panoptes", "core", "overview"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "templating": {
+    "list": [
+      {
+        "name": "env",
+        "type": "query",
+        "label": "Environment",
+        "datasource": "VictoriaMetrics",
+        "query": "label_values(panoptes_health_up, env)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": false,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Per-env health (traffic light)",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 },
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "min by (env) (panoptes_health_up{env=~\"$env\"})",
+          "legendFormat": "{{env}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Open incidents",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 0 },
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (env) (panoptes_sentry_incident_count{env=~\"$env\"})",
+          "legendFormat": "{{env}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Endpoints up",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (env) (panoptes_health_up{env=~\"$env\"})",
+          "legendFormat": "{{env}}"
+        }
+      ]
+    }
+  ]
+}

@@ -316,10 +316,27 @@ def _resolve_dashboard_packs(dashboards: DashboardsConfig) -> list[DashboardPack
                     # The provider (Phase 5) globs dashboard.json under this dir; the
                     # path itself is the injected mount root.
                     json_path=Path(resolved_path),
+                    # The v0.1 resolved-and-provisioned selector (vs. deferred `git`).
+                    selector="path",
                 )
             )
-        # The `git` variant parses + validates here but is NOT resolved in v0.1: the
-        # Grafana provider raises a clear CapabilityError at provision time (Phase 5).
+        if git is not None:
+            # The `git` variant parses + validates successfully (the shape is valid;
+            # git is parsed-but-deferred to v0.2, NOT rejected at parse time), so the
+            # loader DOES emit a consumer-tier pack for it — marked `selector="git"`.
+            # That keeps the deferral boundary explicit and real: a git-only config
+            # loads cleanly, but the Grafana provider raises a clear CapabilityError
+            # when asked to PROVISION the git pack ("parses OK, acting on it fails in
+            # v0.1"). `json_path` records the git ref for diagnostics; the provider
+            # rejects on `selector` before ever touching it.
+            packs.append(
+                DashboardPack(
+                    id="consumer",
+                    tier="consumer",
+                    json_path=Path(_interpolate(git)),
+                    selector="git",
+                )
+            )
     return packs
 
 

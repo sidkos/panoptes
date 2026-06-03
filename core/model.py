@@ -201,8 +201,18 @@ class DashboardPack:
     `core/dashboards/`) from injected consumer packs (resolved under the mounted
     `dashboards.consumer_pack.path`); `json_path` is the resolved location the
     Grafana provider globs/syncs.
+
+    `selector` records WHICH consumer-pack reference form the operator chose —
+    `path` (v0.1, resolved + provisioned) or `git` (v0.2, parsed-but-deferred).
+    The loader emits a `git`-selected consumer pack so the deferral is enforced at
+    PROVISION time (the Grafana provider raises a clear `CapabilityError`), not
+    silently dropped at resolve time — this keeps the "parses OK, acting on it
+    fails in v0.1" boundary explicit and testable. It defaults to `path`, which is
+    the only meaningful selector for a core pack (and the common consumer case), so
+    existing call sites need not pass it.
     """
 
     id: str
     tier: Literal["core", "consumer"]
     json_path: Path
+    selector: Literal["path", "git"] = "path"

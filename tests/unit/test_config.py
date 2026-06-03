@@ -337,7 +337,9 @@ def test_consumer_pack_git_only_parses_and_validates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """git-only is a VALID shape (parsed-but-deferred): it resolves with no error and
-    adds no consumer-tier path pack (Grafana provider raises at provision in v0.1)."""
+    emits a consumer-tier pack marked `selector="git"`. The deferral is real — the
+    Grafana provider raises a CapabilityError when asked to PROVISION that git pack
+    in v0.1 (parse OK, acting on it fails). test_dashboards_valid covers the latter."""
     _set_reference_env(monkeypatch)
     git_block = (
         "    consumer_pack:\n"
@@ -351,4 +353,6 @@ def test_consumer_pack_git_only_parses_and_validates(
     config_path = _write_fixture(tmp_path, body)
     resolved = load_config(config_path, registries=_registries_with_correct_capabilities())
     assert isinstance(resolved, ResolvedConfig)
-    assert [p for p in resolved.dashboard_packs if p.tier == "consumer"] == []
+    consumer_packs = [p for p in resolved.dashboard_packs if p.tier == "consumer"]
+    assert len(consumer_packs) == 1
+    assert consumer_packs[0].selector == "git"

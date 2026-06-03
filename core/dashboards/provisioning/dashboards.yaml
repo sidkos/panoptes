@@ -1,0 +1,23 @@
+# Grafana file-provisioning provider config — the glob root Grafana watches for
+# dashboard JSON. The Panoptes Grafana provider syncs both tiers (core packs from
+# core/dashboards/, plus the injected consumer pack) into the directory referenced
+# by `options.path`; Grafana then loads every dashboard.json found beneath it.
+#
+# `foldersFromFilesStructure: true` mirrors the per-pack subdir layout the provider
+# writes (one subdir per resolved pack) into Grafana folders, so core and consumer
+# packs stay visually grouped without hardcoding folder names.
+apiVersion: 1
+
+providers:
+  - name: panoptes
+    type: file
+    # Read-only: operators edit the source JSON, not the provisioned copy (this is a
+    # read-only monitoring surface — no save-dashboard write path anywhere).
+    allowUiUpdates: false
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      # The provider syncs all resolved dashboard.json files beneath this dir; the
+      # path is environment-injected so the mount root is not baked into the repo.
+      path: ${PANOPTES_PROVISIONING_DIR}
+      foldersFromFilesStructure: true

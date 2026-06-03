@@ -1,0 +1,22 @@
+# Grafana datasource provisioning — the Prometheus-compatible VictoriaMetrics
+# read endpoint that every core/consumer panel queries (PromQL range queries hit
+# VictoriaMetrics' /api/v1/query_range, which is Prometheus-API-compatible).
+#
+# The URL is environment-injected via ${VM_URL} so no infrastructure endpoint is
+# baked into the repo (spec `## Configuration` — endpoints come from config/env,
+# never inlined). docker-compose / Terraform supply VM_URL for the running stack.
+apiVersion: 1
+
+datasources:
+  - name: VictoriaMetrics
+    type: prometheus
+    access: proxy
+    # Prometheus-compatible PromQL endpoint exposed by VictoriaMetrics.
+    url: ${VM_URL}
+    isDefault: true
+    jsonData:
+      httpMethod: POST
+      # VictoriaMetrics implements the Prometheus query API; pin the compat mode so
+      # Grafana does not probe for native-Prometheus-only features.
+      prometheusType: Prometheus
+    editable: false
