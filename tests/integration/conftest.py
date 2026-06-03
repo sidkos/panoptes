@@ -33,7 +33,9 @@ single round-trip and the no-async-in-tests rule holds for every test module.
 import asyncio
 import json
 import os
+import socket
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
@@ -48,7 +50,7 @@ from core.mcp.tools_discovery import (
     _DASHBOARD_QUERY_STEP_SECONDS,
 )
 from fastmcp import Client
-from fastmcp.client.transports import StdioTransport
+from fastmcp.client.transports import StdioTransport, StreamableHttpTransport
 
 # --- Images (the SAME tags the compose file declares) ----------------------------
 _VM_IMAGE = "victoriametrics/victoria-metrics:v1.103.0"
@@ -554,6 +556,184 @@ class _StdioClientContext:
 
     def __exit__(self, *exc: object) -> None:
         return None
+
+
+# --- MCP streamable-HTTP client fixture ------------------------------------------
+
+
+def _free_localhost_port() -> int:
+    """Reserve a free localhost TCP port (bind to 0, read it back, release).
+
+    The kernel assigns an unused ephemeral port; releasing it immediately is acceptable
+    here because the server re-binds it microseconds later and a test run is single-threaded
+    w.r.t. this fixture — the tiny race window is not worth a more elaborate handoff.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
+class _HttpMcpClient:
+    """A synchronous wrapper over the FastMCP streamable-HTTP `Client` (no asyncio in tests).
+
+    Mirrors `_StdioMcpClient`: the FastMCP `Client` is async-only, so every round-trip opens
+    the client as an async context manager and runs exactly one call via `asyncio.run`, so a
+    test body only ever sees plain synchronous methods. The `asyncio` import stays confined to
+    this conftest. The `headers` (a mocked oauth2-proxy identity header) are attached to the
+    `StreamableHttpTransport` so a test can assert the server received/logged them — proving
+    the transport carries the proxy-injected identity (the real gate is the nginx ingress).
+    """
+
+    def __init__(self, url: str, headers: Mapping[str, str] | None = None) -> None:
+        self._url = url
+        self._headers = dict(headers) if headers is not None else {}
+
+    def _transport(self) -> StreamableHttpTransport:
+        return StreamableHttpTransport(url=self._url, headers=self._headers)
+
+    def call_tool_data(self, name: str, arguments: Mapping[str, object]) -> dict[str, object]:
+        """Call one tool over streamable-HTTP and return its structured content (sync)."""
+
+        async def _run() -> dict[str, object]:
+            async with Client(self._transport()) as client:
+                result = await client.call_tool(name, dict(arguments))
+                structured = result.structured_content
+                if structured is None:
+                    raise AssertionError(f"Tool {name!r} returned no structured content over HTTP.")
+                rebuilt: dict[str, object] = {str(key): value for key, value in structured.items()}
+                return rebuilt
+
+        return asyncio.run(_run())
+
+    def list_tool_names(self) -> list[str]:
+        """List the registered tool names over streamable-HTTP (sync)."""
+
+        async def _run() -> list[str]:
+            async with Client(self._transport()) as client:
+                tools = await client.list_tools()
+                return [tool.name for tool in tools]
+
+        return asyncio.run(_run())
+
+
+@dataclass
+class _HttpServerHandle:
+    """A live in-process MCP HTTP server: its base URL + a sync client factory."""
+
+    base_url: str
+
+    def client(self, headers: Mapping[str, str] | None = None) -> _HttpMcpClient:
+        """A sync HTTP MCP client for the streamable-HTTP endpoint (`/mcp` path)."""
+        # FastMCP's streamable-HTTP transport serves the MCP endpoint under `/mcp/`.
+        return _HttpMcpClient(url=f"{self.base_url}/mcp/", headers=headers)
+
+
+@pytest.fixture
+def mcp_http_server(
+    victoriametrics: VictoriaMetricsHandle, tmp_path: Path
+) -> Iterator[_HttpServerHandle]:
+    """Bring up the MCP over streamable-HTTP in a background thread, bound to a free port.
+
+    Runs the REAL `core.mcp.http.run_http` against a synthetic config pointed at the live VM
+    (the SAME `build_server(config)` the stdio path uses — two faces, one store). The server
+    binds `127.0.0.1:<free-port>` on a daemon thread; the fixture polls the endpoint until it
+    answers, yields a handle, and lets the daemon thread die at session teardown (the
+    blocking `run_http` has no clean stop hook — a daemon thread is the simplest bounded
+    teardown for a test-only in-process server).
+
+    Bind note: the server binds a non-loopback address (`0.0.0.0`) in production INSIDE the
+    pod; here it binds `127.0.0.1` so the test never exposes a port beyond the host. On K8s
+    the boundary is the ClusterIP Service + nginx ingress (asserted in the Phase-7 Helm
+    render test), NOT this bind — the server validates no token; the ingress is the gate.
+    """
+    from core.bootstrap import register_core_adapters
+    from core.config import load_config
+    from core.mcp.http import run_http
+
+    config_path = tmp_path / "panoptes-http-integration.yaml"
+    _write_http_integration_config(config_path, victoriametrics.base_url)
+    register_core_adapters()
+    config = load_config(config_path)
+
+    port = _free_localhost_port()
+    host = "127.0.0.1"
+
+    def _serve() -> None:
+        # The runner binds 127.0.0.1:<port>; run_http reads host/port from env, so set them.
+        os.environ["PANOPTES_MCP_HOST"] = host
+        os.environ["PANOPTES_MCP_PORT"] = str(port)
+        run_http(config)
+
+    server_thread = threading.Thread(target=_serve, name="panoptes-mcp-http", daemon=True)
+    server_thread.start()
+
+    base_url = f"http://{host}:{port}"
+    _wait_http_ready(base_url)
+    try:
+        yield _HttpServerHandle(base_url=base_url)
+    finally:
+        # The daemon thread is reaped at process exit; nothing to join (run_http blocks).
+        os.environ.pop("PANOPTES_MCP_HOST", None)
+        os.environ.pop("PANOPTES_MCP_PORT", None)
+
+
+def _wait_http_ready(base_url: str) -> None:
+    """Poll the streamable-HTTP MCP endpoint until it accepts a connection (Risk R13).
+
+    A bare TCP connect proves the server bound its port; the MCP endpoint itself returns a
+    406/400 to a plain GET (it expects the MCP handshake), which still proves "listening".
+    """
+
+    def _probe() -> bool | None:
+        try:
+            with httpx.Client(timeout=2.0) as client:
+                # Any HTTP response (even a 4xx) means the server is listening + routing.
+                client.get(f"{base_url}/mcp/")
+                return True
+        except httpx.HTTPError:
+            return None
+
+    _poll_until(_probe, description="MCP streamable-HTTP endpoint")
+
+
+def _write_http_integration_config(config_path: Path, vm_base_url: str) -> None:
+    """Write a synthetic HTTP-transport config bound to the live VM (mirrors the stdio one).
+
+    Identical to `_write_integration_config` except `mcp.transport: http` — the SAME
+    sources/store/tools, so the parity assertion compares the HTTP face to a direct VM read
+    over the identical tool table.
+    """
+    config = {
+        "panoptes": {
+            "environments": {
+                "dev": {
+                    "enabled": True,
+                    "sources": [{"type": "http-health", "url": f"{vm_base_url}/health"}],
+                }
+            },
+            "store": {"type": "victoriametrics", "url": vm_base_url},
+            "notifiers": [{"type": "logging"}],
+            "dashboards": {
+                "provider": "grafana",
+                "env_variable": True,
+                "core_packs": ["errors-sentry", "logs", "overview"],
+                "consumer_pack": {"path": str(_REPO_ROOT / "examples/demo-pack")},
+            },
+            "mcp": {
+                "transport": "http",
+                "tools": [
+                    "describe_signal_catalog",
+                    "list_dashboards",
+                    "get_dashboard_data",
+                    "query_metric",
+                    "search_incidents",
+                    "search_logs",
+                    "describe_health",
+                ],
+            },
+        }
+    }
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
 
 
 @pytest.fixture

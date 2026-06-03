@@ -103,6 +103,23 @@ class _FastMcpAdapter:
         """Run the underlying FastMCP server over the stdio transport."""
         self._mcp.run(transport="stdio")
 
+    def run_http(self, host: str, port: int) -> None:
+        """Run the underlying FastMCP server over the streamable-HTTP transport.
+
+        Additive over `run()` (stdio): the SAME registered tool table is served, only the
+        transport differs (two faces, one store — spec § MCP server HTTP transport). For
+        fastmcp 3.4.0 the `host`/`port` flow through `run`'s `**transport_kwargs` to
+        `run_http_async`, which accepts them as named kwargs.
+
+        Bind note: the server binds its CONTAINER port (e.g. `0.0.0.0:8080` inside the pod)
+        — acceptable because on K8s the network boundary is the `ClusterIP` Service + the
+        nginx ingress (the only public path), NOT the server's listen address. The GitHub
+        auth gate is enforced at the ingress + oauth2-proxy, not by a non-public bind. The
+        Phase-7 Helm render test asserts the Service is `ClusterIP` + the ingress
+        forward-auth — that is where the boundary lives.
+        """
+        self._mcp.run(transport="streamable-http", host=host, port=port)
+
 
 # The v0.2-listed-but-unimplemented tools. Listing one is NOT a resolve failure —
 # the server registers it as a call-time "not available" stub. All are read-shaped names,
@@ -210,6 +227,16 @@ class PanoptesMcpServer:
     def run(self) -> None:
         """Run the server over the stdio transport (the v0.1 entrypoint)."""
         self.mcp.run()
+
+    def run_http(self, host: str, port: int) -> None:
+        """Run the server over the streamable-HTTP transport (the v0.2 hosted face).
+
+        Delegates to the adapter's `run_http`, mirroring `run()` for stdio. The SAME
+        tool table is served — only the transport differs (two faces, one store). The
+        GitHub auth gate is the nginx ingress + oauth2-proxy's job, not this bind (see
+        `_FastMcpAdapter.run_http`'s bind note).
+        """
+        self.mcp.run_http(host, port)
 
 
 def _configured_tool_names(config: ResolvedConfig) -> list[str]:
@@ -551,10 +578,14 @@ def _import_consumer_pack(pack_ref: str) -> object:
 
 
 def main() -> None:
-    """CLI entrypoint: load the config from `PANOPTES_CONFIG` and run the stdio server.
+    """CLI entrypoint: load the config from `PANOPTES_CONFIG` and run the selected server.
 
     Invoked as `python -m core.mcp.server`. The config path is read from the
-    `PANOPTES_CONFIG` env var (the compose file sets it to the mounted config).
+    `PANOPTES_CONFIG` env var (the compose file sets it to the mounted config). The
+    transport is selected by the config's `mcp.transport` field: `stdio` (the default,
+    the local-dev face) runs the stdio server; `http` runs the streamable-HTTP server
+    (the hosted face — two faces, one store). The already-loaded config is reused for
+    the HTTP path; it is never re-loaded.
     """
     from pathlib import Path
 
@@ -567,7 +598,17 @@ def main() -> None:
     register_core_adapters()
     config_path = os.environ.get("PANOPTES_CONFIG", "panoptes.yaml")
     config = load_config(Path(config_path))
-    build_server(config).run()
+
+    # Dispatch on the configured transport. `http` reuses the SAME loaded config via the
+    # HTTP entrypoint (imported lazily so the stdio path never drags in the HTTP runner);
+    # anything else (incl. the default/unset) runs stdio.
+    transport = config.mcp.get("transport", "stdio")
+    if transport == "http":
+        from core.mcp.http import run_http
+
+        run_http(config)
+    else:
+        build_server(config).run()
 
 
 if __name__ == "__main__":
