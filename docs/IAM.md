@@ -117,16 +117,41 @@ it needs **no** write credential into any system. There is no
 
 ## B. The Panoptes home principal
 
-The collector/MCP process runs under `PanoptesCollector` in the Panoptes home
-account. It holds:
+**v0.2 (hosted, SHIPPED): the home principal is an IRSA-bound role on the dedicated
+EKS cluster**, not an EC2 instance profile. The Terraform module (`modules/stack/irsa.tf`)
+provisions an IAM role whose **trust policy** is an OIDC trust to the **cluster's own OIDC
+provider** (`aws_iam_openid_connect_provider`), with a `StringEquals` condition pinning the
+provider's `:sub` to EXACTLY the collector + MCP Kubernetes service accounts
+(`system:serviceaccount:panoptes:panoptes-collector` and `:panoptes-mcp`) and `:aud` to
+`sts.amazonaws.com`. So the collector/MCP pods receive the role's credential via their
+projected SA token — no node-wide instance profile that any co-scheduled pod would inherit
+(least privilege; this is the v0.2 change from the prior instance-profile assume-role path).
+The cluster's OIDC provider here is **IRSA mechanics**, NOT the user-auth IdP (that is
+GitHub via oauth2-proxy at the ingress — see §C and [`ARCHITECTURE.md`](ARCHITECTURE.md) §6).
 
-1. `sts:AssumeRole` for each `PanoptesReadRole/<env>` (read-only).
-2. Nothing else — no write credential of any kind.
+The IRSA role gives the pod its base identity; it then assumes the per-env read-roles
+**within the SAME AWS account** (decision #1 — no cross-account trust). It holds:
 
-MCP **clients** never use these AWS credentials. Clients authenticate to the MCP
-server over **SSO/OIDC** (no anonymous access — see
-[`ARCHITECTURE.md`](ARCHITECTURE.md) §6); the server, not the client, holds the
-AWS identity.
+1. `sts:AssumeRole` for each configured `PanoptesReadRole/<env>` ARN, in-account
+   (read-only). The grant is **structurally absent when the role-ARN list is empty** (the
+   stage/prod disabled-stub case), so it provably yields ZERO assume-role grants until a
+   non-empty list is supplied — never a `Resource: "*"`.
+2. **One** resource-scoped `sns:Publish` on the single Panoptes-owned alert topic ARN (the
+   only write grant in the whole system, on a Panoptes-owned resource — §A's read-only-
+   wrt-observed boundary holds: this writes to Panoptes' own alert channel, not an observed
+   system).
+3. Nothing else — no `Action: "*"`, no `Put*/Create*/Delete*` on any non-Panoptes resource,
+   no observed write. (The `tests/terraform/test_module_plan.py` plan-assertion test pins
+   every one of these invariants against the rendered config.)
+
+The v0.1 local path (`docker-compose`) keeps the `AWS_PROFILE` + `PANOPTES_ASSUME_ROLE_ARN`
+config seam unchanged — IRSA replaces the home-principal credential SOURCE on EKS, not the
+per-env assume-role mechanism.
+
+MCP **clients** never use these AWS credentials. Clients authenticate to the MCP server at
+the **GitHub-gated nginx ingress** (oauth2-proxy `github` provider, org/team allowlist — no
+anonymous access; see [`ARCHITECTURE.md`](ARCHITECTURE.md) §6); the server holds the AWS
+identity (via IRSA) and validates no client token — the ingress is the boundary.
 
 ---
 

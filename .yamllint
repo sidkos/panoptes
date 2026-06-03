@@ -1,4 +1,4 @@
-# Panoptes YAML lint config — mirrors FIDA's static-analysis discipline for the YAML
+# Panoptes YAML lint config — applies a strict static-analysis discipline to the YAML
 # surface (GitHub workflows, the composite action, docker-compose, and the
 # provisioning / consumer-pack YAMLs). Wired into both `scripts/precommit.sh` and the
 # `lint-type` CI job so a malformed workflow (e.g. the `${{ }}`-in-flow-mapping bug that

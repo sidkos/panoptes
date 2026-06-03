@@ -90,6 +90,74 @@ at it, and Panoptes injects it at deploy time — it is never bundled into core.
 [`examples/demo-pack/`](examples/demo-pack/) for the brand-neutral template and its
 [README](examples/demo-pack/README.md).
 
+## Quickstart (v0.2 — hosted on EKS)
+
+**Local stays `docker compose` (unchanged); hosted is a dedicated EKS cluster.** v0.2 adds
+a Terraform module + a Helm chart + a GHCR image so the same stack runs in-cluster behind a
+GitHub-gated nginx ingress. The MCP face becomes streamable-**HTTP** (the v0.1 stdio face
+still works); the GitHub auth gate is the ingress, not the server.
+
+**1. Provision the dedicated EKS cluster + IRSA + ingress prereqs (Terraform).** The module
+creates Panoptes' OWN dedicated VPC + dedicated EKS cluster (SAME AWS account, never an
+observed cluster/VPC — failure-domain independence), a small managed spot node group, the
+IRSA role (SA-scoped to the collector + MCP service accounts), and the nginx-ingress +
+cert-manager prerequisites:
+
+```hcl
+module "panoptes" {
+  source = "github.com/sidkos/panoptes//modules/stack"
+
+  home_region = "us-east-1"
+  hostname    = "panoptes.example.com"
+  image_tag   = "v0.2.0"                              # an IMMUTABLE tag, never :latest
+
+  github_oauth_client_id     = var.github_oauth_client_id
+  github_oauth_client_secret = var.github_oauth_client_secret  # sensitive
+  github_org                 = "your-github-org"      # the access allowlist (in-account)
+
+  read_role_arns  = ["arn:aws:iam::1234:role/PanoptesReadRole-dev"]  # empty = no grants
+  alert_topic_arn = "arn:aws:sns:us-east-1:1234:panoptes-alerts"     # the ONE write grant
+}
+```
+
+The module's `irsa_role_arn` output is the value the chart annotates the SAs with. A worked
+root config is in [`deploy/terraform/example`](deploy/terraform/example); the module is
+runner-agnostic (Terraform **or** OpenTofu).
+
+**2. Set up the GitHub OAuth app (the access gate).** Create a GitHub OAuth app, set its
+callback to `https://panoptes.<domain>/oauth2/callback`, and supply the client id/secret +
+the **org (and/or team) allowlist** to the chart. `oauth2Proxy.githubOrg` is **REQUIRED and
+FAIL-CLOSED**: an empty org would disable the GitHub allowlist (admitting any GitHub user),
+so the chart's `values.schema.json` + a template `required` guard ABORT the render if it is
+empty. The client secret comes from a referenced Kubernetes Secret — never inlined.
+
+**3. Install the chart.** It renders the single-node VictoriaMetrics store + the
+Grafana/collector/MCP/oauth2-proxy workloads, ClusterIP-only Services (the MCP Service is
+**ClusterIP** — the anonymous-bypass guard; the nginx ingress is the sole public path), and
+the GitHub forward-auth Ingress (oauth2-proxy + cert-manager TLS, with `/healthz` exempt):
+
+```bash
+helm install panoptes ./charts/panoptes \
+  --set image.tag=v0.2.0 \
+  --set hostname=panoptes.example.com \
+  --set irsaRoleArn="$(terraform output -raw irsa_role_arn)" \
+  --set oauth2Proxy.githubOrg=your-github-org \
+  --set oauth2Proxy.githubClientId=Iv1.xxxxxxxx
+```
+
+`stage`/`prod` ship as `enabled:false` config stubs that light up with a flag flip + a
+non-empty read-role ARN (no code change). See
+[`examples/demo-pack/panoptes.hosted.yaml`](examples/demo-pack/panoptes.hosted.yaml).
+
+**4. The GHCR image** (`ghcr.io/sidkos/panoptes:<tag>`) is built + pushed by
+[`.github/workflows/publish.yml`](.github/workflows/publish.yml) on a `v0.2.*` tag — the
+single CI write permission, scoped to the publish job. The Helm `image.tag` + the Terraform
+`image_tag` pin the same immutable tag (never `:latest`).
+
+> **local == compose, hosted == EKS.** The `docker compose` path above is unchanged — it is
+> the local/dev proof at zero cloud cost (stdio MCP, no proxy). The Terraform module + Helm
+> chart are the HOSTED analogue; the **same GHCR image** runs in both.
+
 ### Development
 
 ```bash
@@ -126,14 +194,25 @@ registry, the config loader, the `cloudwatch`/`sentry`/`http-health` sources, th
 read-only MCP stdio server, the brand-neutral demo pack, and the docker-compose
 stack are all implemented and tested (unit + integration, strict CI).
 
-**v0.2 + v0.3 — fully specified, implementation pending.** The hosted deployment
-(a **dedicated EKS cluster** in its own VPC, Helm-packaged, GitHub-SSO-gated via
-oauth2-proxy), the streamable-HTTP MCP face, the `kubernetes`/`prometheus` sources,
-the `sns`/`slack` notifiers, and the second-consumer genericity proof are written
-up in [`docs/specs/`](docs/specs/) (`v0.2_hosted_single_pane.md` + its plan,
-`v0.3_depth_genericity.md` + its plan) and summarized in
-[`docs/ROADMAP.md`](docs/ROADMAP.md). `docker compose` stays the local/dev path;
-EKS is the hosted target.
+**v0.2 (hosted on EKS) — built.** The streamable-**HTTP** MCP face (reusing the same
+`build_server` as stdio — two faces, one store), the `kubernetes` source +
+`get_cluster_state` + the Kubernetes dashboard, the `sns`/`slack` notifiers (with the
+path-scoped no-write guard), declarative alert rules evaluated by the collector,
+`get_slo`/`compare_envs` promoted to real tools (`get_cost` stays a v0.3 stub), the SLO
+dashboard, the Terraform **dedicated-EKS module** (`modules/stack` — dedicated VPC +
+cluster, IRSA SA-scoped trust, resource-scoped publish, managed-not-Karpenter node group),
+the **Helm chart** (ClusterIP-only MCP, IRSA-annotated SAs, GitHub forward-auth nginx
+ingress + cert-manager TLS, unauthenticated `/healthz`, `stage`/`prod` stubs), the
+deploy-time `git` dashboard injection (full-SHA pin, mutable-ref rejected), and the
+GHCR publish workflow are all implemented and tested (unit + integration + the hermetic
+`terraform validate/tflint` + `helm lint/template/kubeconform` gates).
+
+**v0.3 — fully specified, implementation pending.** The `prometheus`/`loki`/`tempo`
+sources, the richer core packs (Compute/Datastore/Cost/Karpenter), and the second-consumer
+genericity proof are written up in
+[`docs/specs/v0.3_depth_genericity.md`](docs/specs/v0.3_depth_genericity.md) + its plan and
+summarized in [`docs/ROADMAP.md`](docs/ROADMAP.md). `docker compose` stays the local/dev
+path; EKS is the hosted target.
 
 ## License
 

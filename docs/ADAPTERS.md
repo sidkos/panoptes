@@ -83,6 +83,14 @@ live target exists.
 `http-health` sources; `victoriametrics` store; `grafana` dashboard; the
 `logging` notifier (`sns`/`slack` deferred to v0.2). See [`ROADMAP.md`](ROADMAP.md).
 
+**v0.2 build set (SHIPPED):** the `kubernetes` source (nodes/pods/events →
+`panoptes_k8s_*` derived gauges + `Warning`-event `incident`s, `capabilities() ==
+{metric, incident}`, the `cluster` label distinguishing observed vs Panoptes' own;
+`core/sources/kubernetes.py`), and the `sns` + `slack` notifiers (alert delivery to
+Panoptes-owned channels; `core/notifiers/{sns,slack}.py`). The no-write guard's
+suppression is **path-scoped** to `core/notifiers/sns.py` — `sns.publish` anywhere else
+(esp. `core/sources/`) still red-bars (`tests/unit/test_no_write_actions_guard.py`).
+
 > **cloudwatch capability set (v0.1):** `cloudwatch` provides `{metric, log}` in
 > v0.1. Normalizing CloudWatch alarms into `incident` signals is a **v0.2**
 > capability — it is intentionally NOT in the v0.1 capability set so the declared

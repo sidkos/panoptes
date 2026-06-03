@@ -1,11 +1,12 @@
 name: 📦 Publish (GHCR)
-# Tag-triggered GHCR build+push SKELETON (Phase 0). The full build/push wiring is
-# finalized in Phase 8 (spec § CI/CD New publish workflow). Until then this workflow:
-#   - triggers ONLY on a `v0.2.*` version tag (immutable-tag discipline — the Helm
-#     `values.image.tag` + the Terraform `image_tag` pin this tag, never a moving ref);
-#   - is `workflow_dispatch`-safe so it can be exercised manually before Phase 8;
-#   - keeps `packages: write` scoped to the publish job ONLY (the single CI write
-#     permission in the whole repo); the top-level grant stays read-only.
+# Tag-triggered GHCR build + push (spec § CI/CD New publish workflow). On a `v0.2.*`
+# version tag this builds the existing Dockerfile and pushes
+# `ghcr.io/sidkos/panoptes:<version>` + `:latest`. The immutable-tag discipline is
+# load-bearing: the Helm `values.image.tag` + the Terraform `image_tag` pin the version
+# tag, never a moving ref (Risk K11). `packages: write` is scoped to the publish job ONLY
+# (the single CI write permission in the whole repo); the top-level grant stays read-only.
+# `workflow_dispatch` is retained for a manual cache-warming dry run (build only, no push —
+# there is no tag to publish on a manual run).
 on:
   push:
     tags: ['v0.2.*']
@@ -43,10 +44,10 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
-      # Log in to GHCR with the job-scoped GITHUB_TOKEN (packages:write). On a manual
-      # `workflow_dispatch` run there is no tag to publish, so login + push are skipped
-      # and only the (cache-warming) build runs — the Phase-8 finalize step removes this
-      # skeleton guard once the publish path is fully wired.
+      # Log in to GHCR with the job-scoped GITHUB_TOKEN (packages:write). The tag guard is
+      # the final behavior, not a placeholder: a `workflow_dispatch` (manual) run has no tag
+      # to publish, so login + push are correctly skipped and only the cache-warming build
+      # runs; the real publish fires only on a `v0.2.*` tag push.
       - name: Log in to GHCR
         if: ${{ startsWith(github.ref, 'refs/tags/') }}
         uses: docker/login-action@v3

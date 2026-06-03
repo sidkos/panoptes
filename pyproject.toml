@@ -43,7 +43,7 @@ line-length = 100
 src = ["core", "examples", "tests"]
 
 [tool.ruff.lint]
-# C90 = mccabe cyclomatic-complexity gate (mirrors FIDA's radon). The threshold is
+# C90 = mccabe cyclomatic-complexity gate (a radon-style complexity guard). The threshold is
 # set to the current codebase ceiling so the gate passes today with no refactor, then
 # red-bars any NEW function that climbs past it.
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "C90"]

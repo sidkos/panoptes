@@ -30,13 +30,13 @@ returns the same data programmatically.
 | 1 | **Errors / Sentry** (`errors-sentry`) | core | sentry | error rate, top issues, tag breakdown, by env | `search_incidents(env, window, tag, level)` |
 | 2 | **Logs** | core | cloudwatch (logs) | log stream, error-log rate, full-text search | `search_logs(env, query, window, level)` |
 | 3 | **Overview / Single Pane** | core | rollup of all | per-env health traffic-light, top alerts/errors, key SLOs | `describe_health(env)` |
-| 4 | **Kubernetes** | core | kubernetes | node count, pod restarts/CrashLoops, pending pods | `get_cluster_state(env)` |
+| 4 | **Kubernetes** (v0.2 — SHIPPED) | core | kubernetes | node count, pod restarts/CrashLoops, pending pods | `get_cluster_state(env)` |
 | 5 | **Compute** | core | cloudwatch | invocations/errors/throttles/p99 across functions | `query_metric(...)` |
 | 6 | **Datastore** | core | cloudwatch | consumed capacity, throttles, latency per table | `query_metric(env, metric, dims)` |
 | 7 | **API gateway** | core | cloudwatch | 4xx/5xx, request count, latency | `query_metric(...)` |
 | 8 | **Networking / Certs** | core | cloudwatch | LB healthy/unhealthy hosts, cert days-until-expiry | `query_metric(...)` |
 | 9 | **Cost** (v0.3) | core | cloudwatch (CE/budgets) | budget burn, per-service spend | `get_cost(env, window)` |
-| 10 | **SLO / Golden Signals** (v0.2) | core | derived | RED/USE rollup, error budgets | `get_slo(name, env)` |
+| 10 | **SLO / Golden Signals** (v0.2 — SHIPPED) | core | derived | RED/USE rollup, error budgets | `get_slo(name, env)` |
 | C1 | **Matchmaking / Allocator** | consumer | cloudwatch + sentry | allocator errors/throttles, success vs 429/503, time-to-match | `get_allocator_pressure(env, window)` |
 | C2 | **Fleet / Agones** | consumer | agones (prometheus) | ready/allocated/reserved, ready-to-serve %, 429 rate | `get_fleet_health(env)` |
 | C3 | **Game / Business** | consumer | http-health + sentry | active matches, connections, match duration, registrations | `get_game_metrics(env)` |
@@ -81,20 +81,24 @@ LLM-facing surface:
 
 Synthesized where one question deserves one call.
 - **Core (v0.1):** `describe_health(env)` — the "one thing to look at" rollup.
-- **Core (deferred):** `get_slo(name, env)` (v0.2), `get_cost(env, window)` (v0.3)
-  — synthesized rollups that ship with their dashboards (catalog rows 10 and 9),
-  mirroring how `get_cluster_state` ships with the Kubernetes source in v0.2.
-- **Core (v0.2, ships with the `kubernetes` source):** `get_cluster_state(env)` —
-  node count, pod restarts/CrashLoops, pending pods (the parallel tool for the
-  Kubernetes dashboard, catalog row 4). Listed here so the
-  "every dashboard has a parallel MCP tool" invariant resolves; introduced
-  alongside its source in v0.2.
+- **Core (v0.2 — SHIPPED):** `get_slo(name, env)` — the SLO rollup (objective vs.
+  actual + error-budget remaining) that ships with the SLO dashboard (catalog row 10).
+  Promoted out of `_V0_2_STUB_TOOLS` to a real registrar (`core/mcp/tools_query.py`).
+- **Core (deferred):** `get_cost(env, window)` (v0.3) — the only remaining call-time stub;
+  it ships with the Cost dashboard (catalog row 9) + the CE/budgets read grant in v0.3.
+- **Core (v0.2 — SHIPPED, ships with the `kubernetes` source):** `get_cluster_state(env)`
+  — node count, pod restarts/CrashLoops, pending pods (the parallel tool for the
+  Kubernetes dashboard, catalog row 4), rendered from the stored `panoptes_k8s_*` gauges
+  (two-faces-one-store parity). Listed here so the "every dashboard has a parallel MCP
+  tool" invariant resolves; introduced alongside its source in v0.2.
 - **Consumer-pack-registered examples** (registered by an injected consumer pack,
   not core): `get_fleet_health(env)`, `get_allocator_pressure(env, window)`,
   `get_game_metrics(env)`.
 
 ### Cross-environment
-- `compare_envs(metric, window)` — same signal across dev/stage/prod.
+- `compare_envs(metric, window)` (v0.2 — SHIPPED) — same signal across dev/stage/prod.
+  Reuses the v0.1 `env="all"` fan-out + per-env error markers; promoted out of
+  `_V0_2_STUB_TOOLS` to a real registrar (`core/mcp/tools_query.py`).
 
 ### Contract — fully read-only
 - The MCP server is **fully read-only**. Every tool is read-only with respect to
