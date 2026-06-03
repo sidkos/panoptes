@@ -1,0 +1,52 @@
+# The pipeline consumer-pack reference config (v0.3 — the genericity proof's consumer #2).
+#
+# This is the shape a generic DATA-PIPELINE platform deploys — deliberately UNRELATED to the
+# fleet consumer (job lag / queue depth / data freshness, not game-server fleets). A single
+# `pipeline` source (the standalone consumer source registered by this pack's `pack.py`) feeds
+# a Pipeline dashboard + the `get_pipeline_lag` MCP tool. The injected `pipeline` source type
+# is available because `PANOPTES_CONSUMER_PACK` / the mounted pack dir imports `pack.py`, which
+# registers it on the core SOURCES registry — a consumer extending a core plane WITHOUT a core
+# change. NO core change distinguishes this deploy from the fleet deploy — only the pack dir.
+#
+# Every endpoint/secret is `${VAR}`-interpolated from the process environment — never inlined.
+# `dev` is live; `stage`/`prod` are wired-but-inert (`enabled: false`).
+panoptes:
+  environments:
+    dev:
+      enabled: true
+      sources:
+        # The consumer `pipeline` source — registered by this pack; STANDALONE (it does not
+        # wrap a core source). It needs the pipeline-metrics endpoint + env.
+        - type: pipeline
+          url: ${PIPELINE_METRICS_URL}
+          env: dev
+    stage:
+      enabled: false
+      sources: []
+    prod:
+      enabled: false
+      sources: []
+  store:
+    type: victoriametrics
+    # The in-network hostname MUST match the docker-compose service name.
+    url: http://victoriametrics:8428
+    retention: 15d
+  notifiers:
+    - type: logging
+  dashboards:
+    provider: grafana
+    env_variable: true
+    # Core packs the operator also ships; the consumer's Pipeline dashboard rides in via the
+    # consumer_pack path below (globbed from `dashboards/pipeline/`).
+    core_packs: [overview]
+    consumer_pack:
+      path: ${CONSUMER_PACK_DIR}   # mounted at /packs/consumer (this pipeline pack dir)
+  slos:
+    - name: pipeline-freshness
+      objective: 0.99
+  mcp:
+    transport: stdio
+    # The core read-only tools the operator exposes; the consumer's `get_pipeline_lag` is
+    # added at runtime by this pack's `register_tools` hook (not listed here).
+    tools: [describe_signal_catalog, list_dashboards, get_dashboard_data,
+            query_metric, search_incidents, search_logs, describe_health]

@@ -1,0 +1,86 @@
+{
+  "title": "Pipeline",
+  "uid": null,
+  "tags": ["panoptes", "consumer", "pipeline"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "templating": {
+    "list": [
+      {
+        "name": "env",
+        "type": "query",
+        "label": "Environment",
+        "datasource": "VictoriaMetrics",
+        "query": "label_values(panoptes_pipeline_lag_seconds, env)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": false,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Job lag (seconds)",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 0 },
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max (panoptes_pipeline_lag_seconds{env=~\"$env\"})",
+          "legendFormat": "lag"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Queue depth",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 0 },
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max (panoptes_pipeline_queue_depth{env=~\"$env\"})",
+          "legendFormat": "queue"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Data freshness (seconds since last update)",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 0 },
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max (panoptes_pipeline_freshness_seconds{env=~\"$env\"})",
+          "legendFormat": "freshness"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Pipeline lag + freshness over time",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max (panoptes_pipeline_lag_seconds{env=~\"$env\"})",
+          "legendFormat": "lag"
+        },
+        {
+          "refId": "B",
+          "expr": "max (panoptes_pipeline_freshness_seconds{env=~\"$env\"})",
+          "legendFormat": "freshness"
+        }
+      ]
+    }
+  ]
+}
