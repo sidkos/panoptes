@@ -189,15 +189,28 @@ def _configured_tool_names(config: ResolvedConfig) -> list[str]:
     return list(KNOWN_READ_ONLY_TOOLS)
 
 
-def build_server(config: ResolvedConfig) -> PanoptesMcpServer:
+def build_server(
+    config: ResolvedConfig,
+    resolve: Callable[[str], object] | None = None,
+) -> PanoptesMcpServer:
     """Construct the FastMCP stdio server + register core / stub / pack tools.
 
     Args:
         config: The resolved config (bound into every tool wrapper).
+        resolve: The consumer-pack resolver seam — given the `PANOPTES_CONSUMER_PACK`
+            reference, returns the loaded pack module (carrying `register_tools`). Defaults
+            to the real file-path-primary + dotted-fallback `_import_consumer_pack`; a test
+            injects a fake resolver returning an in-memory module to exercise the injection
+            mechanism WITHOUT touching the filesystem or `sys.path`.
 
     Returns:
         A `PanoptesMcpServer` with all configured tools registered.
     """
+    # Default to the real adapter here (not as a literal default arg) so the production
+    # resolver function need not be in scope at the `def` site and the seam stays a single,
+    # explicit indirection. A test passes its own `resolve` to bypass the filesystem.
+    pack_resolver = resolve if resolve is not None else _import_consumer_pack
+
     mcp: FastMCP[object] = FastMCP("panoptes")
     server = PanoptesMcpServer(config, _FastMcpAdapter(mcp))
 
@@ -212,7 +225,7 @@ def build_server(config: ResolvedConfig) -> PanoptesMcpServer:
         # is ignored here — config-level adapter validation is the loader's job; the
         # MCP server only wires the tools it knows. (No silent write path is created.)
 
-    _load_consumer_pack(server)
+    _load_consumer_pack(server, resolve=pack_resolver)
     return server
 
 
@@ -319,31 +332,48 @@ def _register_v0_2_stub(server: PanoptesMcpServer, name: str) -> None:
     server._register_stub(name, v0_2_stub_tool, v0_2_stub_invoker)
 
 
-def _load_consumer_pack(server: PanoptesMcpServer) -> None:
-    """Import the consumer pack named by `PANOPTES_CONSUMER_PACK` and register its tools.
+def _load_consumer_pack(
+    server: PanoptesMcpServer, resolve: Callable[[str], object] | None = None
+) -> None:
+    """Resolve the consumer pack named by `PANOPTES_CONSUMER_PACK` and register its tools.
 
-    Default unset = core-only (no import, no consumer coupling). When set, the pack is
-    imported and its `register_tools(mcp_server)` hook is called so the injected pack
-    can add its own read-only tools. `core` never imports the pack statically — the
-    pack is injected at deploy time, never bundled.
+    Default unset = core-only (no resolve, no consumer coupling). When set, the pack is
+    resolved via the injectable `resolve` seam and its `register_tools(mcp_server)` hook
+    is called so the injected pack can add its own read-only tools. `core` never imports
+    the pack statically — the pack is injected at deploy time, never bundled.
 
-    `PANOPTES_CONSUMER_PACK` is primarily a FILE PATH: the compose deployment mounts
-    the consumer's pack as a single file at `/packs/consumer/pack.py` and points the
-    env var at it, so a mounted (non-installed, not-on-`sys.path`) pack is loaded via
-    `importlib.util.spec_from_file_location`. A dotted module name is also accepted as
-    a fallback (an installed or in-repo importable pack).
+    Args:
+        server: The MCP server the resolved pack registers its tools on.
+        resolve: The pack resolver — given the `PANOPTES_CONSUMER_PACK` reference, returns
+            the loaded module. Two real adapters justify the seam: the file-path
+            (`spec_from_file_location`) primary and the dotted (`import_module`) fallback,
+            both housed in the default `_import_consumer_pack`. A test injects a fake
+            resolver to drive the registration WITHOUT any filesystem access.
+
+    `PANOPTES_CONSUMER_PACK` is primarily a FILE PATH: the compose deployment mounts the
+    consumer's pack as a single file at `/packs/consumer/pack.py` and points the env var at
+    it, so a mounted (non-installed, not-on-`sys.path`) pack is loaded via the default
+    resolver's `spec_from_file_location`. A dotted module name is also accepted as a
+    fallback (an installed or in-repo importable pack).
     """
+    # Default to the real two-adapter resolver; a test passes its own fake resolver.
+    pack_resolver = resolve if resolve is not None else _import_consumer_pack
     pack_ref = os.environ.get(_CONSUMER_PACK_ENV_VAR)
     if not pack_ref:
         return
-    module = _import_consumer_pack(pack_ref)
+    module = pack_resolver(pack_ref)
     register_tools = getattr(module, "register_tools", None)
     if callable(register_tools):
         register_tools(server)
 
 
 def _import_consumer_pack(pack_ref: str) -> object:
-    """Load the consumer pack from a file path (deploy model) or a dotted module name."""
+    """Load the consumer pack from a file path (deploy model) or a dotted module name.
+
+    The DEFAULT resolver adapter for the `_load_consumer_pack` seam: it houses the two
+    real resolution paths (file-path primary, dotted fallback) chosen by a `.py`/`/`/
+    `os.sep` heuristic on the reference.
+    """
     # A path-shaped ref (a mounted pack.py) loads from file; everything else is treated
     # as a dotted, importable module name.
     looks_like_path = pack_ref.endswith(".py") or "/" in pack_ref or os.sep in pack_ref
