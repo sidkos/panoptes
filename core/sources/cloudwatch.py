@@ -30,6 +30,7 @@ are NOT installed in slim CI, so a bare runtime import would crash; the runtime
 `boto3` import is unconditional.
 """
 
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -57,7 +58,9 @@ if TYPE_CHECKING:
     # Type-stub-only imports — present at type-check time (boto3-stubs is a dev dep)
     # but NOT installed in slim CI, so they must never run at import time.
     from mypy_boto3_cloudwatch import CloudWatchClient
+    from mypy_boto3_cloudwatch.type_defs import GetMetricDataOutputTypeDef
     from mypy_boto3_logs import CloudWatchLogsClient
+    from mypy_boto3_logs.type_defs import FilterLogEventsResponseTypeDef
     from mypy_boto3_sts import STSClient
 
 # Derived-metric name (spec `## Data Model` — `panoptes_` prefix avoids PromQL
@@ -67,6 +70,36 @@ _METRIC_LOG_ERROR_RATE = "panoptes_log_error_rate"
 # Substrings that mark a log event as ERROR-level for the error-rate derivation.
 # CloudWatch log events carry no structured level, so the message text is inspected.
 _ERROR_MARKERS = ("ERROR", "CRITICAL", "FATAL", "EXCEPTION", "TRACEBACK")
+
+
+def _paginate[PageT](
+    call_page: Callable[[str | None], PageT],
+    read_token: Callable[[PageT], str | None],
+) -> Iterator[PageT]:
+    """Walk a token-paged API, yielding each page until the token is exhausted.
+
+    Owns the one NextToken-style paginate loop that `GetMetricData` (`NextToken`) and
+    `FilterLogEvents` (`nextToken`) both hand-rolled identically. The only things that
+    differed between them were the client call, the request token key, and the
+    response token key — all three are now the caller's concern:
+
+    - `call_page(token)` builds the per-page request (adding the continuation token
+      under the API's own key when it is not `None`) and returns the raw page.
+    - `read_token(page)` extracts the next continuation token from a page, or `None`
+      when the API signals there are no further pages.
+
+    The helper itself is boto3-agnostic (no client, no token-key knowledge), so it
+    stays a module-private of this AWS adapter rather than a public seam. The first
+    page is always requested with `None`; the walk stops as soon as `read_token`
+    returns a falsy token, preserving the original `if not token: break` semantics.
+    """
+    next_token: str | None = None
+    while True:
+        page = call_page(next_token)
+        yield page
+        next_token = read_token(page)
+        if not next_token:
+            return
 
 
 @SOURCES.register("cloudwatch")
@@ -239,21 +272,20 @@ class CloudWatchSource:
             for index, name in enumerate(self._metric_names)
         ]
 
-        signals: list[MetricSignal] = []
-        next_token: str | None = None
-        while True:
+        def call_page(token: str | None) -> "GetMetricDataOutputTypeDef":
             kwargs: dict[str, object] = {
                 "MetricDataQueries": queries,
                 "StartTime": window.start,
                 "EndTime": window.end,
             }
-            if next_token is not None:
-                kwargs["NextToken"] = next_token
-            response = client.get_metric_data(**kwargs)  # type: ignore[arg-type]
+            # `GetMetricData`'s continuation key is `NextToken` (capitalized).
+            if token is not None:
+                kwargs["NextToken"] = token
+            return client.get_metric_data(**kwargs)  # type: ignore[arg-type]
+
+        signals: list[MetricSignal] = []
+        for response in _paginate(call_page, lambda page: page.get("NextToken")):
             signals.extend(self._normalize_metric_results(response.get("MetricDataResults", [])))
-            next_token = response.get("NextToken")
-            if not next_token:
-                break
         return signals
 
     def _normalize_metric_results(self, results: object) -> list[MetricSignal]:
@@ -331,26 +363,27 @@ class CloudWatchSource:
         self, client: "CloudWatchLogsClient", log_group: str, window: TimeWindow
     ) -> list["_LogEvent"]:
         """Page `FilterLogEvents` for one log group, following `nextToken` to exhaustion."""
-        events: list[_LogEvent] = []
-        next_token: str | None = None
         start_millis = int(window.start.timestamp() * 1000)
         end_millis = int(window.end.timestamp() * 1000)
-        while True:
+
+        def call_page(token: str | None) -> "FilterLogEventsResponseTypeDef":
             kwargs: dict[str, object] = {
                 "logGroupName": log_group,
                 "startTime": start_millis,
                 "endTime": end_millis,
             }
-            if next_token is not None:
-                kwargs["nextToken"] = next_token
-            response = client.filter_log_events(**kwargs)  # type: ignore[arg-type]
+            # `FilterLogEvents`' continuation key is `nextToken` (lowercase) — the only
+            # divergence from the metrics walk, now isolated to this per-page builder.
+            if token is not None:
+                kwargs["nextToken"] = token
+            return client.filter_log_events(**kwargs)  # type: ignore[arg-type]
+
+        events: list[_LogEvent] = []
+        for response in _paginate(call_page, lambda page: page.get("nextToken")):
             for raw_event in response.get("events", []):
                 parsed = self._parse_log_event(raw_event)
                 if parsed is not None:
                     events.append(parsed)
-            next_token = response.get("nextToken")
-            if not next_token:
-                break
         return events
 
     def _parse_log_event(self, raw_event: object) -> "_LogEvent | None":

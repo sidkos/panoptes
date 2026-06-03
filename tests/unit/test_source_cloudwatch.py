@@ -28,7 +28,7 @@ from botocore.stub import Stubber
 from core.errors import PanoptesError
 from core.model import LogLevel, LogSignal, MetricSignal, SignalKind, TimeWindow
 from core.registry import ConfigValue
-from core.sources.cloudwatch import CloudWatchSource
+from core.sources.cloudwatch import CloudWatchSource, _paginate
 
 if TYPE_CHECKING:
     # Type-stub-only imports (boto3-stubs is a dev dep): present at type-check time,
@@ -364,3 +364,52 @@ def test_malformed_log_event_is_skipped() -> None:
     assert log_signals[0].message == "ok line"
     cw_stub.assert_no_pending_responses()
     logs_stub.assert_no_pending_responses()
+
+
+def test_paginate_walks_token_to_exhaustion_yielding_every_page() -> None:
+    """The shared `_paginate` helper follows a token across pages until it is absent.
+
+    Drives the helper directly (independent of either boto3 fetch) to prove the
+    NextToken walk is owned in one place: a three-page stream where each page carries
+    a token to the next, the third carrying none. The helper must request each page
+    with the prior page's token and yield all three pages in order.
+    """
+    pages: dict[str | None, dict[str, object]] = {
+        None: {"items": ["a"], "token": "p2"},
+        "p2": {"items": ["b"], "token": "p3"},
+        "p3": {"items": ["c"], "token": None},
+    }
+    requested_tokens: list[str | None] = []
+
+    def call_page(token: str | None) -> dict[str, object]:
+        requested_tokens.append(token)
+        return pages[token]
+
+    def read_token(page: dict[str, object]) -> str | None:
+        raw = page.get("token")
+        return raw if isinstance(raw, str) else None
+
+    collected = list(_paginate(call_page, read_token))
+
+    # Every page yielded in order, and each was requested with the prior page's token.
+    assert [page["items"] for page in collected] == [["a"], ["b"], ["c"]]
+    assert requested_tokens == [None, "p2", "p3"]
+
+
+def test_paginate_single_page_when_first_page_has_no_token() -> None:
+    """A first page with no token terminates the walk after exactly one request."""
+    request_count = 0
+
+    def call_page(token: str | None) -> dict[str, object]:
+        nonlocal request_count
+        request_count += 1
+        return {"items": ["only"], "token": None}
+
+    def read_token(page: dict[str, object]) -> str | None:
+        raw = page.get("token")
+        return raw if isinstance(raw, str) else None
+
+    collected = list(_paginate(call_page, read_token))
+
+    assert len(collected) == 1
+    assert request_count == 1
