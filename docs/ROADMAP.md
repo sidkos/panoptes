@@ -37,31 +37,46 @@ MCP/AI-ops, typed Python.
 
 ## v0.2 — hosted, the deployed single pane
 
-**Goal:** stand the stack up in its own always-on home and gate access.
+**Goal:** stand the stack up in its own always-on home — a **dedicated,
+right-sized Panoptes EKS cluster** (never an observed cluster) — and gate access.
 
-- **Terraform module** that provisions the home host + the per-environment
-  read-roles, and runs the compose stack (store + Grafana + collector + MCP +
-  auth proxy).
-- MCP over **streamable HTTP**, **SSO/OIDC-gated** (OAuth 2.1 via an auth
-  proxy) — reachable by any MCP client after SSO.
-- Add the **kubernetes** source; add notifiers (**sns**, **slack**) and
-  declarative alert rules.
+- **Terraform module** that provisions a **dedicated VPC + dedicated EKS cluster**
+  (control plane + a minimal **managed** node group, spot-eligible) **in the SAME AWS
+  account** as the observed infra + **IRSA** for the collector/MCP service accounts
+  (the IRSA base identity then assumes the per-env read-roles in-account, via the
+  existing AWS-profile / assume-role seam — replacing the old EC2 instance-profile
+  path) + an **nginx-ingress + cert-manager** GitHub-gated ingress, and a **Helm
+  chart** that runs the stack as Kubernetes workloads (store + Grafana + collector +
+  MCP + auth proxy). The **local** path stays `docker-compose up` (v0.1); EKS is the
+  **hosted** target — same GHCR image, two deploy shapes.
+- MCP over **streamable HTTP**, **GitHub-SSO-gated** (oauth2-proxy's `github` provider
+  with an org/team allowlist, fronted by an nginx forward-auth ingress + cert-manager
+  TLS) — reachable by any MCP client after the GitHub login. The HTTP face reuses the
+  same `build_server` tool table as stdio.
+- Add the **kubernetes** source (consumer-agnostic core — it also observes Panoptes'
+  OWN cluster); add notifiers (**sns**, **slack**) and declarative alert rules.
 - SLO dashboard + `get_slo` / `compare_envs`.
 - Wire `stage`/`prod` as `enabled: false` config stubs.
 
-**Demonstrates:** IaC (Terraform module), cross-account read-only roles, hosted
-service with SSO auth, GitOps image/build pipeline, alerting.
+**Demonstrates:** IaC (Terraform EKS + IRSA + ingress), Helm packaging, cross-account
+read-only roles via IRSA, a failure-domain-independent hosted service with SSO auth,
+GitOps image/build pipeline, alerting.
 
 ---
 
 ## v0.3 — stretch (depth + provable genericity)
 
-- **prometheus** core source (stand up an in-cluster Prometheus). The
-  **Fleet / Game-Business** dashboards are driven by a **consumer-pack source
-  adapter** for the consumer's fleet technology (e.g. an Agones source that
-  scrapes fleet metrics via that Prometheus) — that adapter is domain-specific and
-  lives in the consumer's own repo, not in core, so it stays out of the
-  brand-neutral core catalog and the core-purity guard's banned-term set.
+- **prometheus** core source — a read-only PromQL scrape of any reachable
+  Prometheus. Panoptes does **not** stand up a Prometheus of its own (cost
+  discipline); it scrapes a consumer-run one. Because Panoptes now runs on its own
+  dedicated EKS cluster (v0.2), the `prometheus` source + the Kubernetes/Karpenter
+  core packs can also observe **Panoptes' OWN cluster** (self-monitoring), in
+  addition to observed consumer clusters. The **Fleet / Game-Business** dashboards
+  are driven by a **consumer-pack source adapter** for the consumer's fleet
+  technology (e.g. an Agones source that scrapes fleet metrics via that Prometheus)
+  — that adapter is domain-specific and lives in the consumer's own repo, not in
+  core, so it stays out of the brand-neutral core catalog and the core-purity
+  guard's banned-term set.
 - Richer **core** dashboard packs (Kubernetes/Karpenter, Cost, Datastore).
 - A **second, unrelated consumer** wired in to prove the core is genuinely
   generic — not just "the reference consumer's monitoring with extra steps."
@@ -90,17 +105,45 @@ own repo and are injected at deploy time.
 
 ## Distribution
 
-- **Terraform module** — `module "panoptes" { source = "github.com/<org>/panoptes//modules/stack" … }` (replace `<org>` with the GitHub org/account the repo is published under). Runner-agnostic (Terraform or OpenTofu).
-- **Container image** (GHCR) — the runnable stack (collector + MCP server).
+- **Terraform module** — `module "panoptes" { source = "github.com/<org>/panoptes//modules/stack" … }` (replace `<org>` with the GitHub org/account the repo is published under). Runner-agnostic (Terraform or OpenTofu). As of v0.2 the hosted target is a **dedicated, right-sized EKS cluster**, so the module provisions the EKS control plane + a minimal managed node group + IRSA + the SSO ingress (see v0.2 spec).
+- **Helm chart** (v0.2) — the in-cluster deploy artifact for the stack (store + Grafana + collector + MCP + auth proxy) as Kubernetes workloads. (Helm is the confirmed packaging path — operator decision 2026-06-03; no Kustomize alternative.)
+- **Container image** (GHCR) — the runnable stack image (collector + MCP server); pulled by the in-cluster workloads (hosted) and by docker-compose (local).
 - **Python package** — the adapter framework + MCP server, for local/stdio use.
+
+> **Local vs hosted (the deploy split — load-bearing).** The **local** dev/proof loop
+> is `docker-compose up` on a laptop (v0.1, unchanged — zero cloud cost, stdio MCP). The
+> **hosted** target (v0.2) is a dedicated Panoptes **EKS** cluster running the same
+> stack as Kubernetes workloads (Helm). Compose is NOT deleted — it remains the local
+> experience; EKS is the hosted experience. The same GHCR image runs in both.
 
 ---
 
 ## Non-negotiables (carried from the principles)
 
-- Failure-domain independence: never deploy inside an observed cluster.
+- **Failure-domain independence — a SEPARATE, DEDICATED Panoptes cluster + VPC (be
+  precise about what IS and ISN'T independent).** Panoptes must never share a *cluster*
+  or *network* failure domain with what it observes. The hosted home (v0.2) is its **own
+  dedicated EKS cluster in its own dedicated VPC, and NEVER an observed cluster/VPC** — so
+  a cluster crash, node-group failure, or VPC-network fault in an observed environment
+  cannot take Panoptes down with it. **What is NOT independent:** the v0.2 home runs in
+  the **SAME AWS account** as the observed infra (a deliberate trade — it lets the
+  existing AWS-profile / in-account assume-role multi-env access mechanism keep working),
+  so the **account control-plane** blast radius is shared (a root-credential compromise,
+  account-wide quota exhaustion, or account suspension is a shared event). Cluster + VPC
+  isolation satisfies the rule's sharpest edge ("don't die with the thing you monitor");
+  full account isolation is the stronger form and a clean future hardening (own account +
+  cross-account assume-role) if the shared-account risk ever outweighs the access
+  convenience. "Don't share a failure domain with what you watch" means *a separate,
+  dedicated Panoptes cluster + VPC*, not *no cluster at all* and not necessarily *a
+  separate account*.
 - Read-only everywhere: sources and MCP tools never write to observed systems.
-- No anonymous MCP access: SSO/OIDC only.
-- Cost discipline: single-node store, single small home host, compose over a
-  dedicated cluster.
+- No anonymous MCP access: SSO only (v0.2: a **GitHub**-gated nginx ingress via
+  oauth2-proxy's `github` provider — an org/team allowlist).
+- **Cost discipline — a minimal, right-sized dedicated cluster.** A single small
+  **managed** node group (spot-eligible; single-AZ acceptable for a dev/home stack), a
+  single-node store, and no Agones / game-server / Karpenter / multi-node machinery. The
+  dedicated Panoptes EKS cluster is a deliberate, honest **cost step-up** over the prior
+  single-EC2 + compose idea — accepted because it is the cluster/VPC-failure-domain-
+  independent, IRSA-native, GitHub-gated home the hosted single pane needs; it is kept
+  minimal to hold the line on cost.
 - Two faces, one store: never let Grafana and MCP read different data.

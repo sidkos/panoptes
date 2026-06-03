@@ -124,9 +124,16 @@ registry, the config loader, the `cloudwatch`/`sentry`/`http-health` sources, th
 `victoriametrics`/`passthrough` stores, the collector loop + `logging` notifier, the
 `grafana` provider with three core dashboard packs + consumer-pack injection, the
 read-only MCP stdio server, the brand-neutral demo pack, and the docker-compose
-stack are all implemented and tested (unit + integration, strict CI). The hosted
-Terraform deployment, the SSO-gated HTTP MCP face, and additional adapters are
-v0.2+ — see [`docs/ROADMAP.md`](docs/ROADMAP.md).
+stack are all implemented and tested (unit + integration, strict CI).
+
+**v0.2 + v0.3 — fully specified, implementation pending.** The hosted deployment
+(a **dedicated EKS cluster** in its own VPC, Helm-packaged, GitHub-SSO-gated via
+oauth2-proxy), the streamable-HTTP MCP face, the `kubernetes`/`prometheus` sources,
+the `sns`/`slack` notifiers, and the second-consumer genericity proof are written
+up in [`docs/specs/`](docs/specs/) (`v0.2_hosted_single_pane.md` + its plan,
+`v0.3_depth_genericity.md` + its plan) and summarized in
+[`docs/ROADMAP.md`](docs/ROADMAP.md). `docker compose` stays the local/dev path;
+EKS is the hosted target.
 
 ## License
 

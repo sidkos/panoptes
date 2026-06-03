@@ -162,11 +162,13 @@ box, exposing the same data the dashboards show (see
 [`DASHBOARDS.md`](DASHBOARDS.md) for the tool surface).
 
 **Access is SSO-gated. There is no anonymous access.** The HTTP endpoint sits
-behind an OAuth 2.1 / OIDC flow backed by an SSO identity provider (e.g. AWS IAM
-Identity Center or a Google Workspace / Okta OIDC app), enforced by an
-`oauth2-proxy`-style sidecar in front of the MCP server. Any MCP client — Claude
-Code, Claude Desktop, Cursor, a custom agent — authenticates through SSO before
-it can call a tool.
+behind an OAuth flow backed by an SSO identity provider, enforced by an
+`oauth2-proxy` gate in front of the MCP server (the v0.2 deployment uses GitHub
+as the provider, restricted by org/team allowlist — see
+[`ROADMAP.md`](ROADMAP.md) §v0.2; other OAuth/OIDC providers, e.g. AWS IAM
+Identity Center or an Okta OIDC app, plug in the same way). Any MCP client —
+Claude Code, Claude Desktop, Cursor, a custom agent — authenticates through SSO
+before it can call a tool.
 
 **Fully read-only.** MCP tools are read-only **with respect to observed
 systems** — they never write to CloudWatch/Sentry/DynamoDB/etc. — and the server
