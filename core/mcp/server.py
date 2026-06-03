@@ -36,6 +36,7 @@ from fastmcp import FastMCP
 
 from core.config import ResolvedConfig
 from core.errors import CapabilityError, PanoptesError
+from core.mcp.context import QueryContext
 from core.mcp.tools_discovery import (
     DashboardData,
     DashboardSummary,
@@ -214,7 +215,11 @@ def build_server(
     mcp: FastMCP[object] = FastMCP("panoptes")
     server = PanoptesMcpServer(config, _FastMcpAdapter(mcp))
 
-    core_registrars = _core_registrars(config)
+    # Build the small `QueryContext` seam ONCE from the resolved config and bind it
+    # into every tool wrapper, so the tools depend on the context interface — not the
+    # `ResolvedConfig` shape (the deep test seam: a tool test drives only the context).
+    context = QueryContext(config)
+    core_registrars = _core_registrars(context)
     for name in _configured_tool_names(config):
         registrar = core_registrars.get(name)
         if registrar is not None:
@@ -230,33 +235,33 @@ def build_server(
 
 
 def _core_registrars(
-    config: ResolvedConfig,
+    context: QueryContext,
 ) -> Mapping[str, Callable[[PanoptesMcpServer, str], None]]:
-    """Map each v0.1 core tool name to a registrar that binds `config` into a wrapper.
+    """Map each v0.1 core tool name to a registrar that binds `context` into a wrapper.
 
-    Each wrapper closes over `config` so the FastMCP-facing signature carries only the
-    caller-supplied arguments (env / name / window / …), and returns the precise
-    nested-`TypedDict` shapes from `tools_discovery` / `tools_query`.
+    Each wrapper closes over the `QueryContext` so the FastMCP-facing signature carries
+    only the caller-supplied arguments (env / name / window / …), and returns the
+    precise nested-`TypedDict` shapes from `tools_discovery` / `tools_query`.
     """
 
     def register_describe_signal_catalog(server: PanoptesMcpServer, name: str) -> None:
         def describe_signal_catalog_tool() -> SignalCatalog:
             """List environments, configured sources + capabilities, metrics, dashboards."""
-            return describe_signal_catalog(config)
+            return describe_signal_catalog(context)
 
         server._register_tool(name, describe_signal_catalog_tool)
 
     def register_list_dashboards(server: PanoptesMcpServer, name: str) -> None:
         def list_dashboards_tool() -> list[DashboardSummary]:
             """Return the dashboard catalog (core + injected consumer packs)."""
-            return list_dashboards(config.dashboard_packs)
+            return list_dashboards(context.dashboard_packs)
 
         server._register_tool(name, list_dashboards_tool)
 
     def register_get_dashboard_data(server: PanoptesMcpServer, name: str) -> None:
         def get_dashboard_data_tool(dashboard_id: str, env: str) -> DashboardData:
             """Execute one dashboard's panels for `env`: title + PromQL + series."""
-            return get_dashboard_data(dashboard_id, env, config, config.dashboard_packs)
+            return get_dashboard_data(dashboard_id, env, context)
 
         server._register_tool(name, get_dashboard_data_tool)
 
@@ -265,7 +270,7 @@ def _core_registrars(
             env: str, metric: str, window: str, filters: dict[str, str] | None = None
         ) -> list[MetricSeries]:
             """Run a PromQL passthrough query for a metric against the store."""
-            return query_metric(config, env=env, name=metric, window=window, filters=filters)
+            return query_metric(context, env=env, name=metric, window=window, filters=filters)
 
         server._register_tool(name, query_metric_tool)
 
@@ -274,7 +279,7 @@ def _core_registrars(
             env: str, window: str, tag: str | None = None, level: str | None = None
         ) -> list[IncidentSignal] | IncidentFanOut:
             """Search incident signals for `env` (or fan out across all enabled envs)."""
-            return search_incidents(config, env=env, window=window, tag=tag, level=level)
+            return search_incidents(context, env=env, window=window, tag=tag, level=level)
 
         server._register_tool(name, search_incidents_tool)
 
@@ -283,14 +288,14 @@ def _core_registrars(
             env: str, query: str, window: str, level: str | None = None
         ) -> list[LogSignal] | LogFanOut:
             """Search log signals for `env` (or fan out across all enabled envs)."""
-            return search_logs(config, env=env, query=query, window=window, level=level)
+            return search_logs(context, env=env, query=query, window=window, level=level)
 
         server._register_tool(name, search_logs_tool)
 
     def register_describe_health(server: PanoptesMcpServer, name: str) -> None:
         def describe_health_tool(env: str) -> HealthRollup:
             """Roll up per-source reachability + open-incident count for `env`."""
-            return describe_health(config, env=env)
+            return describe_health(context, env=env)
 
         server._register_tool(name, describe_health_tool)
 

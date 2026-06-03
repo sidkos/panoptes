@@ -13,10 +13,12 @@ catalog (spec `## API Surface` → MCP server → Discovery / parity):
   PromQL is executed, so the returned series is the data the operator would see in
   Grafana for that env.
 
-Each function takes an **explicit context** (`ResolvedConfig` + the resolved
-dashboard-pack catalog) rather than reaching for module globals, so they are
-unit-testable without standing up FastMCP. The server module (`core/mcp/server.py`)
-binds the live `ResolvedConfig` into thin FastMCP-registered wrappers.
+Each function takes an explicit **`QueryContext`** seam (a small read-only view of
+the resolved config) rather than reaching for `ResolvedConfig`'s shape or module
+globals, so they are unit-testable from a minimal hand-built config without standing
+up FastMCP. The server module (`core/mcp/server.py`) builds one `QueryContext` and
+binds it into thin FastMCP-registered wrappers. (`list_dashboards` still takes the
+resolved pack list directly — it needs nothing else from the context.)
 
 IMPORTANT (FastMCP / PEP-563): this module must NOT add
 `from __future__ import annotations` — deferred annotations break FastMCP's schema
@@ -26,8 +28,8 @@ generation for the nested-`TypedDict` return shapes defined here.
 import json
 from typing import TypedDict
 
-from core.config import ResolvedConfig
 from core.errors import CapabilityError
+from core.mcp.context import QueryContext
 from core.model import (
     DashboardPack,
     MetricQuery,
@@ -105,17 +107,18 @@ class DashboardData(TypedDict):
     panels: list[PanelData]
 
 
-def describe_signal_catalog(config: ResolvedConfig) -> SignalCatalog:
+def describe_signal_catalog(context: QueryContext) -> SignalCatalog:
     """List the environments, configured sources + capabilities, metrics, dashboards.
 
     Args:
-        config: The resolved Panoptes config (sources are live only for enabled envs).
+        context: The query context (sources are live only for enabled envs; the
+            catalog lists EVERY declared env, hence `all_envs`/`env_names`).
 
     Returns:
         A `SignalCatalog` describing the full discoverable surface.
     """
     sources: list[SourceCapabilityInfo] = []
-    for environment in config.environments.values():
+    for environment in context.all_envs():
         for resolved_source in environment.sources:
             sources.append(
                 SourceCapabilityInfo(
@@ -126,10 +129,10 @@ def describe_signal_catalog(config: ResolvedConfig) -> SignalCatalog:
                 )
             )
     return SignalCatalog(
-        environments=list(config.environments.keys()),
+        environments=context.env_names(),
         sources=sources,
         metrics=list(_KNOWN_DERIVED_METRICS),
-        dashboards=[pack.id for pack in config.dashboard_packs],
+        dashboards=[pack.id for pack in context.dashboard_packs],
     )
 
 
@@ -149,8 +152,7 @@ def list_dashboards(packs: list[DashboardPack]) -> list[DashboardSummary]:
 def get_dashboard_data(
     dashboard_id: str,
     env: str,
-    config: ResolvedConfig,
-    packs: list[DashboardPack],
+    context: QueryContext,
 ) -> DashboardData:
     """Execute one dashboard's panels for `env` and return title + PromQL + series.
 
@@ -159,10 +161,10 @@ def get_dashboard_data(
     PromQL against the store, and attaches the resolved series (Open Q3 / Risk R5).
 
     Args:
-        dashboard_id: The pack id to render (must exist in `packs`).
+        dashboard_id: The pack id to render (must exist in the catalog).
         env: The environment to substitute into each panel's `$env` template var.
-        config: The resolved config (its `store` answers the PromQL).
-        packs: The resolved dashboard-pack catalog to resolve `dashboard_id` against.
+        context: The query context (its `store` answers the PromQL; its
+            `dashboard_packs` is the catalog `dashboard_id` is resolved against).
 
     Returns:
         A `DashboardData` with per-panel titles + executed PromQL + series.
@@ -172,6 +174,7 @@ def get_dashboard_data(
             separate `NotFoundError`; an unknown id is surfaced explicitly, never
             silent/None).
     """
+    packs = context.dashboard_packs
     pack = next((p for p in packs if p.id == dashboard_id), None)
     if pack is None:
         available = ", ".join(p.id for p in packs) or "(none)"
@@ -203,7 +206,7 @@ def get_dashboard_data(
                 # so the PromQL executed against the store matches what the dashboard
                 # would render for that env.
                 expr = _substitute_env(raw_expr, env)
-                series = config.store.query(
+                series = context.store.query(
                     MetricQuery(
                         expr=expr, window=window, step_seconds=_DASHBOARD_QUERY_STEP_SECONDS
                     )

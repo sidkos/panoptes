@@ -24,6 +24,7 @@ annotations break FastMCP's schema generation. The registered tool presents conc
 `env` / `window` params (FastMCP rejects `*args`/`**kwargs`).
 """
 
+from core.mcp.context import QueryContext
 from core.mcp.tools_query import search_traces
 
 
@@ -31,14 +32,16 @@ def register_tools(mcp_server: object) -> None:
     """Register a read-only `search_traces` tool bound to the server's resolved config.
 
     Mirrors the demo pack's hook shape: resolve the server's bound config dynamically
-    (depending on the documented hook contract, not the server's concrete type) and
-    register a thin wrapper that delegates to the real core `search_traces`, which
-    raises the explicit "no trace source" `CapabilityError` in v0.1.
+    (depending on the documented hook contract, not the server's concrete type), wrap
+    it in the `QueryContext` seam the tools now consume, and register a thin wrapper
+    that delegates to the real core `search_traces`, which raises the explicit "no
+    trace source" `CapabilityError` in v0.1.
     """
     config = mcp_server._config  # type: ignore[attr-defined]
+    context = QueryContext(config)
 
     def search_traces_tool(env: str, window: str) -> list[object]:
         """Probe for trace signals — always the explicit 'no trace source' error in v0.1."""
-        return search_traces(config, env=env, window=window)
+        return search_traces(context, env=env, window=window)
 
     mcp_server._register_tool("search_traces", search_traces_tool)  # type: ignore[attr-defined]

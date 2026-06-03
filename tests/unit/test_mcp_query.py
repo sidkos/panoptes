@@ -38,6 +38,7 @@ from core.config import (
     ResolvedSource,
 )
 from core.errors import CapabilityError
+from core.mcp.context import QueryContext
 from core.mcp.server import (
     KNOWN_READ_ONLY_TOOLS,
     PanoptesMcpServer,
@@ -218,7 +219,9 @@ def _dev_only_config(
 
 def test_search_incidents_aggregates_incident_signals() -> None:
     config = _dev_only_config(sentry_signals=[_incident("dev")])
-    incidents = search_incidents(config, env="dev", window="15m", tag=None, level=None)
+    incidents = search_incidents(
+        QueryContext(config), env="dev", window="15m", tag=None, level=None
+    )
     assert isinstance(incidents, list)  # single-env returns a flat list, not a fan-out
     assert len(incidents) == 1
     assert incidents[0].title == "boom"
@@ -236,12 +239,12 @@ def test_search_incidents_no_source_for_kind_raises_capability_error() -> None:
         }
     )
     with pytest.raises(CapabilityError):
-        search_incidents(config, env="dev", window="15m", tag=None, level=None)
+        search_incidents(QueryContext(config), env="dev", window="15m", tag=None, level=None)
 
 
 def test_search_logs_aggregates_log_signals() -> None:
     config = _dev_only_config(cloudwatch_signals=[_log("dev")])
-    logs = search_logs(config, env="dev", query="error", window="15m", level=None)
+    logs = search_logs(QueryContext(config), env="dev", query="error", window="15m", level=None)
     assert isinstance(logs, list)  # single-env returns a flat list, not a fan-out
     assert len(logs) == 1
     assert logs[0].message == "error happened"
@@ -252,7 +255,7 @@ def test_search_logs_aggregates_log_signals() -> None:
 
 def test_describe_health_marks_unreachable_source() -> None:
     config = _dev_only_config(cloudwatch_reachable=False)
-    rollup = describe_health(config, env="dev")
+    rollup = describe_health(QueryContext(config), env="dev")
     by_type = {s["type"]: s for s in rollup["sources"]}
     assert by_type["cloudwatch"]["reachable"] is False
     assert "connection refused" in by_type["cloudwatch"]["detail"]
@@ -262,7 +265,7 @@ def test_describe_health_marks_unreachable_source() -> None:
 
 def test_describe_health_counts_open_incidents() -> None:
     config = _dev_only_config(sentry_signals=[_incident("dev"), _incident("dev")])
-    rollup = describe_health(config, env="dev")
+    rollup = describe_health(QueryContext(config), env="dev")
     assert rollup["open_incident_count"] == 2
 
 
@@ -274,7 +277,9 @@ def test_query_metric_returns_series_from_store() -> None:
         MetricSeries(metric="panoptes_health_up", labels={"env": "dev"}, points=[(_now(), 1.0)])
     ]
     config = _dev_only_config(store=_FakeStore(series))
-    result = query_metric(config, env="dev", name="panoptes_health_up", window="15m", filters=None)
+    result = query_metric(
+        QueryContext(config), env="dev", name="panoptes_health_up", window="15m", filters=None
+    )
     assert result[0].metric == "panoptes_health_up"
 
 
@@ -283,7 +288,9 @@ def test_query_metric_passthrough_store_surfaces_capability_error() -> None:
     passthrough = PassthroughStore({})
     config = _dev_only_config(store=passthrough)
     with pytest.raises(CapabilityError):
-        query_metric(config, env="dev", name="panoptes_health_up", window="15m", filters=None)
+        query_metric(
+            QueryContext(config), env="dev", name="panoptes_health_up", window="15m", filters=None
+        )
 
 
 # --- capability negotiation (TRACE) ----------------------------------------------
@@ -295,7 +302,7 @@ def test_no_trace_source_capability_negotiation() -> None:
 
     config = _dev_only_config()
     with pytest.raises(CapabilityError) as excinfo:
-        search_traces(config, env="dev", window="15m")
+        search_traces(QueryContext(config), env="dev", window="15m")
     assert "trace" in str(excinfo.value).lower()
 
 
@@ -321,7 +328,7 @@ def test_env_all_fan_out_aggregates_per_env() -> None:
             ),
         }
     )
-    fan_out = search_incidents(config, env="all", window="15m", tag=None, level=None)
+    fan_out = search_incidents(QueryContext(config), env="all", window="15m", tag=None, level=None)
     # `env="all"` returns a per-env fan-out result (a TypedDict), not a flat list.
     assert not isinstance(fan_out, list)
     assert {r["env"] for r in fan_out["results"]} == {"dev", "stage"}
@@ -349,7 +356,7 @@ def test_env_all_fan_out_partial_result_marks_down_env() -> None:
             ),
         }
     )
-    fan_out = search_incidents(config, env="all", window="15m", tag=None, level=None)
+    fan_out = search_incidents(QueryContext(config), env="all", window="15m", tag=None, level=None)
     assert not isinstance(fan_out, list)
     by_env = {r["env"]: r for r in fan_out["results"]}
     assert by_env["dev"]["error"] is None
@@ -446,7 +453,7 @@ def test_search_logs_no_source_for_kind_raises_capability_error() -> None:
         }
     )
     with pytest.raises(CapabilityError):
-        search_logs(config, env="dev", query="x", window="15m", level=None)
+        search_logs(QueryContext(config), env="dev", query="x", window="15m", level=None)
 
 
 def test_search_logs_env_all_partial_result_marks_down_env() -> None:
@@ -464,7 +471,7 @@ def test_search_logs_env_all_partial_result_marks_down_env() -> None:
             ),
         }
     )
-    fan_out = search_logs(config, env="all", query="error", window="15m", level=None)
+    fan_out = search_logs(QueryContext(config), env="all", query="error", window="15m", level=None)
     assert not isinstance(fan_out, list)
     by_env = {r["env"]: r for r in fan_out["results"]}
     assert len(by_env["dev"]["logs"]) == 1
@@ -479,11 +486,13 @@ def test_search_incidents_filters_by_level_and_tag() -> None:
             _incident("dev", level=IncidentLevel.WARNING),
         ]
     )
-    errors = search_incidents(config, env="dev", window="15m", tag=None, level="error")
+    errors = search_incidents(
+        QueryContext(config), env="dev", window="15m", tag=None, level="error"
+    )
     assert isinstance(errors, list)
     assert all(i.level is IncidentLevel.ERROR for i in errors)
     # The `project` label value "p" is present on every fixture incident.
-    tagged = search_incidents(config, env="dev", window="15m", tag="p", level=None)
+    tagged = search_incidents(QueryContext(config), env="dev", window="15m", tag="p", level=None)
     assert isinstance(tagged, list)
     assert len(tagged) == 2
 
@@ -495,10 +504,14 @@ def test_search_logs_filters_by_message_and_level() -> None:
             _log("dev", level=LogLevel.WARNING),
         ]
     )
-    only_errors = search_logs(config, env="dev", query="error", window="15m", level="error")
+    only_errors = search_logs(
+        QueryContext(config), env="dev", query="error", window="15m", level="error"
+    )
     assert isinstance(only_errors, list)
     assert all(log.level is LogLevel.ERROR for log in only_errors)
-    no_match = search_logs(config, env="dev", query="no-such-text", window="15m", level=None)
+    no_match = search_logs(
+        QueryContext(config), env="dev", query="no-such-text", window="15m", level=None
+    )
     assert isinstance(no_match, list)
     assert no_match == []
 
@@ -518,7 +531,7 @@ def test_query_metric_applies_filters_to_selector() -> None:
 
     config = _dev_only_config(store=_RecordingStore())
     query_metric(
-        config,
+        QueryContext(config),
         env="dev",
         name="panoptes_health_up",
         window="15m",
@@ -533,13 +546,13 @@ def test_query_metric_applies_filters_to_selector() -> None:
 def test_require_env_unknown_env_raises_capability_error() -> None:
     config = _dev_only_config()
     with pytest.raises(CapabilityError):
-        describe_health(config, env="does-not-exist")
+        describe_health(QueryContext(config), env="does-not-exist")
 
 
 def test_require_env_disabled_env_raises_capability_error() -> None:
     config = _config({"stage": ResolvedEnvironment(name="stage", enabled=False, sources=[])})
     with pytest.raises(CapabilityError):
-        describe_health(config, env="stage")
+        describe_health(QueryContext(config), env="stage")
 
 
 # --- consumer-pack injection hook -------------------------------------------------

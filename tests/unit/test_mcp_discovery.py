@@ -30,6 +30,7 @@ from core.config import (
     ResolvedSource,
 )
 from core.errors import CapabilityError
+from core.mcp.context import QueryContext
 from core.mcp.tools_discovery import (
     describe_signal_catalog,
     get_dashboard_data,
@@ -159,7 +160,7 @@ def _write_inline_dashboard(tmp_path: Path) -> Path:
 
 def test_describe_signal_catalog_lists_envs_sources_and_capabilities() -> None:
     config = _build_config(_FakeStore([]))
-    catalog = describe_signal_catalog(config)
+    catalog = describe_signal_catalog(QueryContext(config))
 
     assert catalog["environments"] == ["dev", "stage"]
     # Each configured source of the (enabled) dev env appears with its capabilities.
@@ -175,7 +176,7 @@ def test_describe_signal_catalog_lists_known_metrics_and_dashboard_ids() -> None
         DashboardPack(id="consumer", tier="consumer", json_path=Path("/packs/consumer")),
     ]
     config = _build_config(_FakeStore([]), dashboard_packs=packs)
-    catalog = describe_signal_catalog(config)
+    catalog = describe_signal_catalog(QueryContext(config))
 
     # Derived metric names are surfaced so an LLM knows what it can query.
     assert "panoptes_health_up" in catalog["metrics"]
@@ -208,7 +209,7 @@ def test_get_dashboard_data_returns_titles_promql_and_executed_series(tmp_path: 
     packs = [DashboardPack(id="inline", tier="core", json_path=dashboard_path)]
     config = _build_config(store, dashboard_packs=packs)
 
-    data = get_dashboard_data("inline", "dev", config, packs)
+    data = get_dashboard_data("inline", "dev", QueryContext(config))
 
     assert data["id"] == "inline"
     assert data["env"] == "dev"
@@ -230,13 +231,13 @@ def test_get_dashboard_data_unknown_id_raises_capability_error(tmp_path: Path) -
     config = _build_config(store, dashboard_packs=packs)
 
     with pytest.raises(CapabilityError) as excinfo:
-        get_dashboard_data("does-not-exist", "dev", config, packs)
+        get_dashboard_data("does-not-exist", "dev", QueryContext(config))
     assert "does-not-exist" in str(excinfo.value)
 
 
 def test_describe_signal_catalog_only_lists_enabled_env_sources() -> None:
     """A disabled env carries no sources, so it contributes nothing to `sources`."""
     config = _build_config(_FakeStore([]))
-    catalog = describe_signal_catalog(config)
+    catalog = describe_signal_catalog(QueryContext(config))
     # Only the dev env's three sources appear; the disabled stage env adds none.
     assert len(catalog["sources"]) == 3

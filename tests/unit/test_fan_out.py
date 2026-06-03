@@ -13,11 +13,17 @@ so the per-tool fan-out tests in `test_mcp_query.py` stay focused on the project
 
 from core.config import ResolvedConfig, ResolvedEnvironment
 from core.errors import CapabilityError
+from core.mcp.context import QueryContext
 from core.mcp.tools_query import fan_out_over_envs
 
 
-def _config(environments: dict[str, ResolvedEnvironment]) -> ResolvedConfig:
-    """A minimal `ResolvedConfig` carrying only the environments the helper iterates."""
+def _context(environments: dict[str, ResolvedEnvironment]) -> QueryContext:
+    """A minimal `QueryContext` carrying only the environments the helper iterates.
+
+    The helper now consumes the `QueryContext` seam, so a fan-out test no longer needs
+    to drive `fan_out_over_envs` through the raw `ResolvedConfig` — it builds the
+    smallest config the context needs (just the envs) and wraps it once.
+    """
 
     class _NullStore:
         type = "null"
@@ -28,7 +34,7 @@ def _config(environments: dict[str, ResolvedEnvironment]) -> ResolvedConfig:
         def query(self, query: object) -> list[object]:  # pragma: no cover - unused
             return []
 
-    return ResolvedConfig(
+    config = ResolvedConfig(
         environments=environments,
         store=_NullStore(),  # type: ignore[arg-type]
         notifiers=[],
@@ -36,6 +42,7 @@ def _config(environments: dict[str, ResolvedEnvironment]) -> ResolvedConfig:
         slos=[],
         mcp={},
     )
+    return QueryContext(config)
 
 
 def _env(name: str, *, enabled: bool = True) -> ResolvedEnvironment:
@@ -44,9 +51,9 @@ def _env(name: str, *, enabled: bool = True) -> ResolvedEnvironment:
 
 def test_fan_out_collects_one_result_per_enabled_env() -> None:
     """The helper iterates every ENABLED env and carries each `fetch_one` result."""
-    config = _config({"dev": _env("dev"), "stage": _env("stage")})
+    context = _context({"dev": _env("dev"), "stage": _env("stage")})
 
-    results = fan_out_over_envs(config, lambda environment: f"data-for-{environment.name}")
+    results = fan_out_over_envs(context, lambda environment: f"data-for-{environment.name}")
 
     by_env = {result.env: result for result in results}
     assert set(by_env) == {"dev", "stage"}
@@ -58,9 +65,9 @@ def test_fan_out_collects_one_result_per_enabled_env() -> None:
 
 def test_fan_out_skips_disabled_envs() -> None:
     """A disabled env is inert — it is not iterated (mirrors `_enabled_envs`)."""
-    config = _config({"dev": _env("dev"), "stage": _env("stage", enabled=False)})
+    context = _context({"dev": _env("dev"), "stage": _env("stage", enabled=False)})
 
-    results = fan_out_over_envs(config, lambda environment: environment.name)
+    results = fan_out_over_envs(context, lambda environment: environment.name)
 
     assert {result.env for result in results} == {"dev"}
 
@@ -71,14 +78,14 @@ def test_fan_out_marks_a_raising_env_with_an_error_not_a_wholesale_fail() -> Non
     The other envs still return their data — the call is a partial result, not a
     wholesale failure.
     """
-    config = _config({"dev": _env("dev"), "stage": _env("stage")})
+    context = _context({"dev": _env("dev"), "stage": _env("stage")})
 
     def _fetch_one(environment: ResolvedEnvironment) -> str:
         if environment.name == "stage":
             raise CapabilityError("stage cannot answer this query")
         return f"data-for-{environment.name}"
 
-    results = fan_out_over_envs(config, _fetch_one)
+    results = fan_out_over_envs(context, _fetch_one)
 
     by_env = {result.env: result for result in results}
     # dev answered with data + no error.
