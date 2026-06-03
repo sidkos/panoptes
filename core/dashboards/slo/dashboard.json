@@ -1,0 +1,130 @@
+{
+  "title": "SLO",
+  "uid": null,
+  "tags": ["panoptes", "core", "slo"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "templating": {
+    "list": [
+      {
+        "name": "env",
+        "type": "query",
+        "label": "Environment",
+        "datasource": "VictoriaMetrics",
+        "query": "label_values(panoptes_health_up, env)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": false,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "SLO actual vs objective (availability)",
+      "type": "timeseries",
+      "description": "The measured availability per env (the SLO actual). Compare it against the configured objective threshold; the get_slo MCP tool reads the same panoptes_health_up gauge.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": "VictoriaMetrics",
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 0.99 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "avg by (env) (panoptes_health_up{env=~\"$env\"})",
+          "legendFormat": "{{env}} actual"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Error-budget burn (consumed fraction)",
+      "type": "timeseries",
+      "description": "The consumed error budget = 1 - measured availability, per env. A rising line is budget burning down; pair it with the objective to see headroom.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": "VictoriaMetrics",
+      "fieldConfig": {
+        "defaults": { "min": 0, "max": 1 },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1 - avg by (env) (panoptes_health_up{env=~\"$env\"})",
+          "legendFormat": "{{env}} burned"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "RED/USE — request success rate",
+      "type": "stat",
+      "description": "RED 'Rate' dimension: the success/availability rate per env (panoptes_health_up averaged).",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
+      "datasource": "VictoriaMetrics",
+      "fieldConfig": {
+        "defaults": { "min": 0, "max": 1, "unit": "percentunit" },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "avg by (env) (panoptes_health_up{env=~\"$env\"})",
+          "legendFormat": "{{env}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "RED/USE — error rate",
+      "type": "stat",
+      "description": "RED 'Errors' dimension: the fraction of ERROR-and-above log events per env (panoptes_log_error_rate averaged).",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
+      "datasource": "VictoriaMetrics",
+      "fieldConfig": {
+        "defaults": { "min": 0, "max": 1, "unit": "percentunit" },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "avg by (env) (panoptes_log_error_rate{env=~\"$env\"})",
+          "legendFormat": "{{env}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "RED/USE — latency (duration)",
+      "type": "stat",
+      "description": "RED 'Duration' / USE saturation proxy: the worst observed health-probe latency per env (panoptes_health_latency_ms max).",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 },
+      "datasource": "VictoriaMetrics",
+      "fieldConfig": {
+        "defaults": { "unit": "ms" },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (env) (panoptes_health_latency_ms{env=~\"$env\"})",
+          "legendFormat": "{{env}}"
+        }
+      ]
+    }
+  ]
+}

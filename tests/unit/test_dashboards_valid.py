@@ -37,8 +37,10 @@ from core.errors import CapabilityError, PanoptesError
 from core.model import DashboardPack
 
 # The in-repo core packs the provider ships + provisions (spec UI-Surfaces table).
-# v0.2 adds the `kubernetes` pack (spec § Directory Layout / Rollout Phase 1).
-_CORE_PACK_IDS = ("errors-sentry", "logs", "overview", "kubernetes")
+# v0.2 adds the `kubernetes` pack (Phase 1) and the `slo` pack (spec § UI Surfaces row
+# `slo` — per-SLO actual-vs-objective, error-budget burn, RED/USE rollup; it completes
+# the Phase-4 SLO feature).
+_CORE_PACK_IDS = ("errors-sentry", "logs", "overview", "kubernetes", "slo")
 _CORE_DASHBOARDS_DIR = Path(__file__).resolve().parents[2] / "core" / "dashboards"
 
 # The exact label set each derived metric emits (asserted against each source's
