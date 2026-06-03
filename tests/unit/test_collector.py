@@ -85,6 +85,21 @@ class _FetchFailingSource(_FakeSource):
         raise RuntimeError("upstream unreachable")
 
 
+class _UnreachableSource(_FakeSource):
+    """A `Source` whose `health()` RETURNS reachable=False (does not raise).
+
+    Mirrors a CloudWatch assume-role denial: the source surfaces a credential failure as
+    an unreachable health result, not an exception. The collector must skip its fetch and
+    keep its signals out of the store (F2k).
+    """
+
+    def health(self) -> SourceHealth:
+        self.health_calls += 1
+        return SourceHealth(
+            reachable=False, detail="AccessDenied: not authorized", checked_at=_now()
+        )
+
+
 class _SlowSource(_FakeSource):
     """A `Source` whose `fetch()` blocks until released — drives the timeout bound."""
 
@@ -207,6 +222,31 @@ def test_health_failure_does_not_abort_run(caplog: pytest.LogCaptureFixture) -> 
         collector.run_once()
 
     # The healthy sibling is still fetched and written despite the broken source.
+    assert healthy.fetch_calls == 1
+    assert store.written_names() == {"panoptes_sentry_count"}
+    assert "cloudwatch" in caplog.text
+
+
+def test_unreachable_source_is_skipped_and_sibling_still_stored(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A source whose health() returns reachable=False is skipped; sibling still stored (F2k).
+
+    The unreachable source must NOT be fetched (no upstream call with no usable creds) and
+    its signals must NOT reach the store, while a healthy sibling is fetched + written and
+    the failure is error-logged.
+    """
+    store = _RecordingStore()
+    unreachable = _UnreachableSource("dev", "cloudwatch")
+    healthy = _FakeSource("dev", "sentry")
+    env = _enabled_env("dev", [_resolved(unreachable), _resolved(healthy)])
+    collector = Collector(_config({"dev": env}, store))
+
+    with caplog.at_level(logging.ERROR, logger="core.collector"):
+        collector.run_once()
+
+    # The unreachable source was never fetched; the healthy sibling was fetched + written.
+    assert unreachable.fetch_calls == 0
     assert healthy.fetch_calls == 1
     assert store.written_names() == {"panoptes_sentry_count"}
     assert "cloudwatch" in caplog.text

@@ -217,6 +217,179 @@ def test_query_empty_matrix_returns_empty_list_not_error() -> None:
     assert series == []
 
 
+# --- F2l: malformed-but-200 responses each raise a clear PanoptesError -----------
+
+
+@respx.mock
+def test_query_data_not_an_object_raises() -> None:
+    """A 200 with `data` not an object raises a clear PanoptesError (F2l)."""
+    respx.get(f"{_BASE_URL}/api/v1/query_range").mock(
+        return_value=httpx.Response(200, json={"status": "success", "data": "not-an-object"})
+    )
+    with pytest.raises(PanoptesError, match="data"):
+        _store().query(_query())
+
+
+@respx.mock
+def test_query_result_not_a_list_raises() -> None:
+    """A 200 whose `data.result` is not a list raises a clear PanoptesError (F2l)."""
+    respx.get(f"{_BASE_URL}/api/v1/query_range").mock(
+        return_value=httpx.Response(
+            200,
+            json={"status": "success", "data": {"resultType": "matrix", "result": "nope"}},
+        )
+    )
+    with pytest.raises(PanoptesError, match="result"):
+        _store().query(_query())
+
+
+@respx.mock
+def test_query_non_numeric_sample_value_raises() -> None:
+    """A sample value that is not a numeric string raises a clear PanoptesError (F2l)."""
+    respx.get(f"{_BASE_URL}/api/v1/query_range").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "success",
+                "data": {
+                    "resultType": "matrix",
+                    "result": [
+                        {
+                            "metric": {"__name__": "panoptes_health_up", "env": "dev"},
+                            # A non-string sample value (an int, not the VM `"1"` string form).
+                            "values": [[_FIXED_EPOCH_SECONDS, 1]],
+                        }
+                    ],
+                },
+            },
+        )
+    )
+    with pytest.raises(PanoptesError, match="value"):
+        _store().query(_query())
+
+
+@respx.mock
+def test_query_malformed_value_pair_raises() -> None:
+    """A malformed `values` pair (wrong arity) raises a clear PanoptesError (F2l)."""
+    respx.get(f"{_BASE_URL}/api/v1/query_range").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "success",
+                "data": {
+                    "resultType": "matrix",
+                    "result": [
+                        {
+                            "metric": {"__name__": "panoptes_health_up", "env": "dev"},
+                            # A single-element pair (should be [ts, value]).
+                            "values": [[_FIXED_EPOCH_SECONDS]],
+                        }
+                    ],
+                },
+            },
+        )
+    )
+    with pytest.raises(PanoptesError, match="pair"):
+        _store().query(_query())
+
+
+@respx.mock
+def test_query_status_error_raises() -> None:
+    """A 200 with `status: error` raises a clear PanoptesError (F2l).
+
+    VictoriaMetrics can return HTTP 200 with a Prometheus-style `{"status":"error",...}`
+    envelope. `raise_for_status` does NOT catch it (it is a 200), so the store must
+    inspect the envelope and surface the error rather than silently returning empty.
+    """
+    respx.get(f"{_BASE_URL}/api/v1/query_range").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "error",
+                "errorType": "422",
+                "error": "promql parse error: unexpected token",
+            },
+        )
+    )
+    with pytest.raises(PanoptesError, match="error"):
+        _store().query(_query())
+
+
+@respx.mock
+def test_query_wrong_result_type_raises() -> None:
+    """A 200 whose `resultType` is not `matrix` raises a clear PanoptesError (F2l).
+
+    The store issues a RANGE query, whose result is always a `matrix`. A `vector`/`scalar`
+    resultType means the response does not match the expected range shape and must fail
+    loudly rather than be mis-parsed.
+    """
+    respx.get(f"{_BASE_URL}/api/v1/query_range").mock(
+        return_value=httpx.Response(
+            200,
+            json={"status": "success", "data": {"resultType": "vector", "result": []}},
+        )
+    )
+    with pytest.raises(PanoptesError, match=r"resultType|matrix"):
+        _store().query(_query())
+
+
+@respx.mock
+def test_write_only_non_metric_signals_makes_zero_http_calls() -> None:
+    """A write of only non-MetricSignals issues ZERO HTTP calls (F2l empty-body skip)."""
+    route = respx.post(f"{_BASE_URL}/api/v1/import").mock(return_value=httpx.Response(204))
+    store = _store()
+    incident = IncidentSignal(
+        id="ISSUE-1",
+        title="boom",
+        level=IncidentLevel.ERROR,
+        first_seen=_FIXED_TIMESTAMP,
+        last_seen=_FIXED_TIMESTAMP,
+        count=1,
+        labels={"env": "dev"},
+    )
+
+    store.write([incident])
+
+    # No MetricSignal in the batch → empty import body → no round-trip to the server.
+    assert not route.called
+
+
+@respx.mock
+def test_query_degenerate_start_equals_end_window_returns_one_point() -> None:
+    """A degenerate `start == end` window issues one clean range request → one point (F2l)."""
+    captured: dict[str, str] = {}
+
+    def _record(request: httpx.Request) -> httpx.Response:
+        captured.update(dict(request.url.params))
+        return httpx.Response(
+            200,
+            json={
+                "status": "success",
+                "data": {
+                    "resultType": "matrix",
+                    "result": [
+                        {
+                            "metric": {"__name__": "panoptes_health_up", "env": "dev"},
+                            "values": [[_FIXED_EPOCH_SECONDS, "1"]],
+                        }
+                    ],
+                },
+            },
+        )
+
+    route = respx.get(f"{_BASE_URL}/api/v1/query_range").mock(side_effect=_record)
+    store = _store()
+
+    # `_query()` uses a TimeWindow with start == end (both _FIXED_TIMESTAMP).
+    series = store.query(_query())
+
+    # Exactly one clean request; start == end in the params; one returned point.
+    assert route.call_count == 1
+    assert captured["start"] == captured["end"] == str(_FIXED_EPOCH_SECONDS)
+    assert len(series) == 1
+    assert series[0].points == [(datetime(2026, 1, 1, tzinfo=UTC), 1.0)]
+
+
 @respx.mock
 def test_write_5xx_with_body_raises_and_surfaces_body() -> None:
     rejection_body = "field 'env' rejected: cannot be empty"

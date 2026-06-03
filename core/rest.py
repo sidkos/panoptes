@@ -54,13 +54,59 @@ _BODY_TRIM_CHARS = 800
 # terminates instead of blocking the `ThreadPoolExecutor` teardown (F5).
 _DEFAULT_TIMEOUT_SECONDS = 30.0
 
-# Redaction patterns for the surfaced upstream body (F4). A Sentry/proxy that reflects
-# request headers into its error body could otherwise land the bearer token in operator
-# logs AND the MCP client. We replace any `Bearer <token>` and any echoed `Authorization`
-# header value with a constant marker BEFORE surfacing the (already trimmed) body.
-_BEARER_RE = re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]+")
-_AUTH_HEADER_RE = re.compile(r"(?i)(authorization)\s*[:=]\s*\S+")
+# Redaction marker substituted in place of any surfaced credential.
 _REDACTED = "[REDACTED]"
+
+# Redaction patterns for the surfaced upstream body (F4 / F2b). A Sentry/proxy that
+# reflects request headers (or a request URL / JSON body) into its error body could
+# otherwise land a credential in operator logs AND the MCP client. The patterns below are
+# applied IN ORDER; each `re.sub` replaces the matched span wholesale with `[REDACTED]`,
+# so a later pattern never re-scans an already-redacted span (this is what fixes the old
+# `Bearer X` double-`[REDACTED]` bug — the Authorization-header rule consumes the whole
+# value first, leaving nothing for the standalone-bearer rule to re-hit).
+#
+# F2b coverage gaps the old two-regex pair missed:
+# - `Authorization: Token <x>` / `Authorization: Basic <b64>` — the old single `\S+`
+#   surfaced the real value; the header rule now redacts the WHOLE value to end-of-line
+#   (or a comma, the multi-header separator).
+# - base64url tokens — the old bearer char class `[A-Za-z0-9._\-]+` missed `+`/`/`/`=`.
+# - standalone `Token <x>` / secret header names / `?token=`/`?api_key=` query params /
+#   `"api_key"`/`"token":"..."` JSON fields — none were covered at all.
+
+# (1) Any `Authorization:`/`Authorization=` header — redact its value (an OPTIONAL scheme
+# word `Bearer`/`Token`/`Basic`/… plus the single credential token, which is one
+# whitespace-delimited run). Runs FIRST and consumes the scheme token, so the
+# standalone-scheme rule (2) never double-fires on an `Authorization: Bearer X` (the old
+# `[REDACTED] [REDACTED]` bug). Redacting a single `\S+` token (not the whole rest of
+# line) keeps any trailing diagnostic prose like `— denied` in the surfaced message. A
+# credential is always a single token, so this captures Bearer/Token/Basic values fully.
+_AUTH_HEADER_RE = re.compile(r"(?i)(authorization)\s*[:=]\s*(?:[A-Za-z]+\s+)?\S+")
+
+# (2) A standalone `Bearer <token>` / `Token <token>` scheme token NOT prefixed by an
+# Authorization header (already redacted by rule 1). The char class is base64url-complete
+# (`+`/`/`/`=` included) so a reflected base64url credential is fully consumed.
+_SCHEME_TOKEN_RE = re.compile(r"(?i)\b(bearer|token)\s+[A-Za-z0-9._\-+/=]+")
+
+# (3) Other secret-bearing header NAMES (api-key / x-api-key / x-auth-token) — redact the
+# single value token, mirroring the Authorization rule (trailing prose preserved).
+_SECRET_HEADER_RE = re.compile(r"(?i)\b(x-api-key|api-key|x-auth-token)\s*[:=]\s*\S+")
+
+# (4) `?token=`/`?api_key=`/`&token=` query-string credentials — redact the value up to
+# the next `&`/whitespace/quote.
+_QUERY_CRED_RE = re.compile(r"(?i)([?&](?:token|api_key))=[^&\s\"']+")
+
+# (5) `"api_key": "..."` / `"token": "..."` JSON credential fields — redact the quoted
+# value only (keep the field name so the message still says WHICH field leaked).
+_JSON_CRED_RE = re.compile(r'(?i)("(?:api_key|token)"\s*:\s*)"[^"]*"')
+
+# Applied in declaration order; each carries its own replacement template.
+_REDACTION_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (_AUTH_HEADER_RE, rf"\1: {_REDACTED}"),
+    (_SCHEME_TOKEN_RE, rf"\1 {_REDACTED}"),
+    (_SECRET_HEADER_RE, rf"\1: {_REDACTED}"),
+    (_QUERY_CRED_RE, rf"\1={_REDACTED}"),
+    (_JSON_CRED_RE, rf'\1"{_REDACTED}"'),
+)
 
 
 class RestClient:
@@ -98,6 +144,23 @@ class RestClient:
     def http(self) -> httpx.Client:
         """The underlying httpx client, for adapters whose flow drives it directly."""
         return self._client
+
+    def close(self) -> None:
+        """Close the underlying httpx client, releasing its connection pool (F2c).
+
+        A long-lived `RestClient` (the VM store's, alive for the process lifetime) would
+        otherwise leak an unclosed socket that surfaces as a `ResourceWarning` at
+        interpreter/teardown. Idempotent: closing an already-closed client is a no-op.
+        """
+        self._client.close()
+
+    def __enter__(self) -> "RestClient":
+        """Enter the context manager, returning self (the client is already open)."""
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        """Exit the context manager, closing the underlying httpx client (F2c)."""
+        self.close()
 
     def get_json(
         self,
@@ -203,12 +266,17 @@ def _format_failure(prefix: str, identifier: str, exc: httpx.HTTPError) -> str:
 
 
 def _redact_secrets(text: str) -> str:
-    """Replace reflected bearer tokens / Authorization header values with a marker (F4).
+    """Replace any reflected credential in a surfaced body with a marker (F4 / F2b).
 
-    A `Bearer <token>` becomes `Bearer [REDACTED]`; an echoed `Authorization: <value>`
-    (or `Authorization=<value>`) header has its value replaced. Applied to any surfaced
-    upstream body so a header-reflecting upstream cannot leak the request's own secret.
+    Applies the ordered `_REDACTION_RULES` so a header-reflecting (or URL-/JSON-echoing)
+    upstream cannot leak the request's own secret into operator logs or the MCP client.
+    The Authorization-header rule runs FIRST and consumes the WHOLE header value, so the
+    standalone-scheme rule never double-fires on it (no `[REDACTED] [REDACTED]`). Covers
+    Bearer/Token/Basic Authorization values, base64url tokens, standalone scheme tokens,
+    `api-key`/`x-api-key`/`x-auth-token` headers, `?token=`/`?api_key=` query params, and
+    `"api_key"`/`"token":"..."` JSON fields.
     """
-    redacted = _BEARER_RE.sub(f"Bearer {_REDACTED}", text)
-    redacted = _AUTH_HEADER_RE.sub(rf"\1: {_REDACTED}", redacted)
+    redacted = text
+    for pattern, replacement in _REDACTION_RULES:
+        redacted = pattern.sub(replacement, redacted)
     return redacted

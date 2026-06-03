@@ -33,6 +33,7 @@ boto3 mutation-verb calls (the no-write guard scans ``examples/`` too).
 
 from typing import Protocol, TypedDict
 
+from core.mcp.tools_query import escape_promql_value
 from core.model import CanonicalSignal, MetricQuery, MetricSeries, TimeWindow
 from core.registry import STORES, ConfigBlock
 
@@ -129,9 +130,11 @@ def get_demo_signal(store: _StoreLike, env: str, window: str) -> DemoSignal:
         A `DemoSignal` with the per-series latest values + a roll-up sample count.
     """
     # Escape the env for the double-quoted PromQL string so a value containing a quote /
-    # backslash cannot break out of the selector (F7 — mirrors the core query_metric
-    # hardening; backslash first, then the double quote).
-    escaped_env = env.replace("\\", "\\\\").replace('"', '\\"')
+    # backslash cannot break out of the selector (F7). Reuse the canonical core primitive
+    # (F2d) rather than hand-copying the two `.replace(...)` calls — a copy could drift and
+    # miss the load-bearing backslash-first ordering. This is exactly how a real consumer
+    # pack should reuse the escape: import it from `core.mcp.tools_query`.
+    escaped_env = escape_promql_value(env)
     expr = f'{_DEMO_METRIC}{{env="{escaped_env}"}}'
     metric_query = MetricQuery(
         expr=expr,

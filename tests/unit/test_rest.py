@@ -138,6 +138,75 @@ def test_failure_body_redacts_bearer_token() -> None:
     assert "denied" in message
 
 
+@pytest.mark.parametrize(
+    ("leaky_body", "secret"),
+    [
+        # Non-Bearer Authorization schemes the old single-`\S+` pattern surfaced.
+        ("Authorization: Basic dXNlcjpwYXNz was rejected", "dXNlcjpwYXNz"),
+        ("denied: Authorization: Token abc123secret here", "abc123secret"),
+        # Standalone scheme tokens (no Authorization header prefix).
+        ("got header Token abc123secret in request", "abc123secret"),
+        # Base64url bearer (the old char class missed `+`/`/`/`=`).
+        ("Authorization: Bearer tok+with/slash= denied", "tok+with/slash="),
+        ("reflected bearer tok+with/slash= in body", "tok+with/slash="),
+        # Other secret-bearing header names.
+        ("X-Api-Key: k3ysecret rejected", "k3ysecret"),
+        ("api-key: k3ysecret rejected", "k3ysecret"),
+        ("X-Auth-Token: authsecret denied", "authsecret"),
+        # Query-string credentials.
+        ("upstream url ?token=secretval failed", "secretval"),
+        ("upstream url ?api_key=secretval failed", "secretval"),
+        # JSON-field credentials.
+        ('echoed body {"api_key":"secretjson"} rejected', "secretjson"),
+        ('echoed body {"token":"secretjson2"} rejected', "secretjson2"),
+    ],
+)
+@respx.mock
+def test_failure_body_redacts_non_bearer_credentials(leaky_body: str, secret: str) -> None:
+    """Every credential-bearing shape is redacted, not just `Bearer <token>` (F2b).
+
+    The old redaction consumed only ONE `\\S+` after `Authorization:` (so `Basic`/`Token`
+    surfaced the real value) and a bearer char class that missed base64url chars. The
+    reworked redaction must surface `[REDACTED]` and NEVER the secret for every shape:
+    non-Bearer Authorization schemes, standalone scheme tokens, base64url bearers, other
+    secret headers, query-string creds, and JSON credential fields.
+    """
+    respx.get(_URL).mock(return_value=httpx.Response(403, text=leaky_body))
+    client = RestClient()
+
+    with pytest.raises(PanoptesError) as excinfo:
+        client.get_json(_URL, prefix="thing fetch failed", identifier=_URL)
+
+    message = str(excinfo.value)
+    assert secret not in message, f"the secret {secret!r} must not leak"
+    assert "[REDACTED]" in message
+
+
+@respx.mock
+def test_failure_body_bearer_redacts_cleanly_without_double_marker() -> None:
+    """`Authorization: Bearer x` redacts once, not `[REDACTED] [REDACTED]` (F2b).
+
+    The old code ran the Authorization-header pattern AND the standalone-bearer pattern
+    over the same span, double-firing on `Authorization: Bearer x`. The reworked
+    redaction redacts the whole Authorization header value first and does not re-scan it.
+    """
+    respx.get(_URL).mock(
+        return_value=httpx.Response(403, text="Authorization: Bearer secrettok123 was denied")
+    )
+    client = RestClient()
+
+    with pytest.raises(PanoptesError) as excinfo:
+        client.get_json(_URL, prefix="thing fetch failed", identifier=_URL)
+
+    message = str(excinfo.value)
+    assert "secrettok123" not in message
+    assert "[REDACTED]" in message
+    # No double-redaction artifact from two patterns firing over the same span.
+    assert "[REDACTED] [REDACTED]" not in message
+    # Surrounding non-secret context survives.
+    assert "denied" in message
+
+
 @respx.mock
 def test_send_returns_response_on_2xx() -> None:
     # `send` is the generic seam used by adapters whose request shape is not a plain
@@ -228,6 +297,27 @@ def test_constructor_timeout_override_is_applied() -> None:
     """An explicit `default_timeout` overrides the built-in default on the client (F5)."""
     client = RestClient(default_timeout=5.0)
     assert client.http.timeout.read == 5.0
+
+
+def test_close_closes_underlying_client() -> None:
+    """`RestClient.close()` closes the underlying httpx client (F2c socket hygiene).
+
+    A long-lived `RestClient` (e.g. the VM store's, alive for the process lifetime)
+    leaves an unclosed socket → a `ResourceWarning` at teardown. `close()` must close
+    the underlying httpx client so the socket is released.
+    """
+    client = RestClient()
+    assert client.http.is_closed is False
+    client.close()
+    assert client.http.is_closed is True
+
+
+def test_context_manager_closes_client_on_exit() -> None:
+    """`RestClient` is a context manager that closes its client on exit (F2c)."""
+    with RestClient() as client:
+        assert client.http.is_closed is False
+        inner = client
+    assert inner.http.is_closed is True
 
 
 def test_injected_client_is_used() -> None:

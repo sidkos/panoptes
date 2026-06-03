@@ -65,6 +65,17 @@ class VictoriaMetricsStore:
         self._base_url = url.rstrip("/")
         self._rest = RestClient(client)
 
+    def close(self) -> None:
+        """Close the underlying REST client's httpx connection pool (F2c).
+
+        The store owns its `RestClient` for the process lifetime; closing it releases the
+        long-lived socket so it does not surface as a `ResourceWarning` at teardown. A
+        process-lifetime store can leave this to interpreter exit, but a directly-built
+        store (e.g. an integration test) should call this to keep teardown warning-clean.
+        Idempotent — closing an already-closed client is a no-op.
+        """
+        self._rest.close()
+
     def write(self, signals: list[CanonicalSignal]) -> None:
         """Serialize metric signals to VM import lines and POST them.
 
@@ -138,9 +149,25 @@ class VictoriaMetricsStore:
         """
         if not isinstance(payload, dict):
             raise PanoptesError(f"VM query returned a non-object response: {payload!r}.")
+        # VictoriaMetrics can answer HTTP 200 with a Prometheus-style error envelope
+        # (`{"status":"error","error":...}`); `raise_for_status` never catches it (F2l), so
+        # the store must inspect `status` and surface the error rather than returning empty.
+        status = payload.get("status")
+        if status == "error":
+            error_detail = payload.get("error", payload)
+            raise PanoptesError(f"VM query returned status=error: {error_detail!r}.")
         data = payload.get("data")
         if not isinstance(data, dict):
             raise PanoptesError(f"VM query response missing a 'data' object: {payload!r}.")
+        # A range query's result is always a `matrix`; a `vector`/`scalar` resultType means
+        # the response does not match the expected range shape and must fail loudly rather
+        # than be mis-parsed into wrong/empty series (F2l). `resultType` is optional in the
+        # response, so only a PRESENT-and-wrong value is rejected.
+        result_type = data.get("resultType")
+        if result_type is not None and result_type != "matrix":
+            raise PanoptesError(
+                f"VM range query expected resultType 'matrix' but got {result_type!r}."
+            )
         result = data.get("result")
         if not isinstance(result, list):
             raise PanoptesError(f"VM query 'data.result' is not a list: {result!r}.")

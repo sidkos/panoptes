@@ -262,6 +262,24 @@ def _default_registries() -> PlaneRegistries:
 _PROVIDES_TO_KIND: dict[str, SignalKind] = {kind.value: kind for kind in SignalKind}
 
 
+def _require_present(block: Mapping[str, object], key: str, where: str) -> None:
+    """Assert a required key is present in a config block, raising a clear PanoptesError.
+
+    The loader narrows raw YAML through `TypedDict`s that mark some keys required, but a
+    YAML missing such a key still parses into a plain dict — so a bare `block[key]` index
+    raises a raw `KeyError` that escapes a caller's `except PanoptesError` and undercuts
+    the "malformed config → clear PanoptesError" contract (F2e). Callers run this presence
+    check FIRST, then index the `TypedDict` directly — so the precise per-key type is
+    preserved (a generic value-returning helper would collapse every value to `object`)
+    while a missing key surfaces a clear, hierarchy-correct `PanoptesError` instead.
+
+    `where` is a human location (e.g. "the `panoptes:` body", "environment 'dev'") so the
+    operator sees exactly which block is incomplete.
+    """
+    if key not in block:
+        raise PanoptesError(f"Config error: required key '{key}' is missing from {where}.")
+
+
 def _interpolate(value: str) -> str:
     """Replace every `${VAR}` in `value` from `os.environ`, failing fast if unset."""
 
@@ -349,7 +367,9 @@ def _resolve_sources(
     not adapter config), so they are read off the raw `source_config` directly.
     """
     resolved: list[ResolvedSource] = []
+    _require_present(env_config, "sources", f"environment '{env_name}'")
     for source_config in env_config["sources"]:
+        _require_present(source_config, "type", f"a source entry in environment '{env_name}'")
         source_type = source_config["type"]
         block = {**_interpolate_block(source_config), "env": env_name}
         source = registries.sources.build(source_type, block)
@@ -462,6 +482,8 @@ def load_config(path: Path, registries: PlaneRegistries | None = None) -> Resolv
 
     environments: dict[str, ResolvedEnvironment] = {}
     for env_name, env_config in body.get("environments", {}).items():
+        # Every env block must declare `enabled` (F2e — a missing key was a raw KeyError).
+        _require_present(env_config, "enabled", f"environment '{env_name}'")
         enabled = env_config["enabled"]
         # Disabled envs parse but produce NO live adapters (wired-but-inert).
         sources = _resolve_sources(env_name, env_config, active_registries) if enabled else []
@@ -469,11 +491,15 @@ def load_config(path: Path, registries: PlaneRegistries | None = None) -> Resolv
             name=env_name, enabled=enabled, sources=sources
         )
 
+    # The store block is required; a config without it was a raw KeyError (F2e).
+    _require_present(body, "store", "the `panoptes:` body")
     store_config = body["store"]
+    _require_present(store_config, "type", "the `store` block")
     store = active_registries.stores.build(store_config["type"], _interpolate_block(store_config))
 
     notifiers: list[Notifier] = []
     for notifier_config in body.get("notifiers", []):
+        _require_present(notifier_config, "type", "a `notifiers` entry")
         notifiers.append(
             active_registries.notifiers.build(
                 notifier_config["type"], _interpolate_block(notifier_config)

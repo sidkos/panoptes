@@ -366,6 +366,97 @@ def test_malformed_log_event_is_skipped() -> None:
     logs_stub.assert_no_pending_responses()
 
 
+def test_classify_level_maps_markers_to_true_levels() -> None:
+    """`_classify_level` maps each marker to its TRUE `LogLevel` (F2h), not a lossy ERROR.
+
+    The old classifier collapsed CRITICAL/FATAL to ERROR and never emitted WARNING/DEBUG.
+    Each severity marker must now map to its real level so a downstream consumer sees the
+    actual severity.
+    """
+    classify = CloudWatchSource._classify_level
+    assert classify("CRITICAL kernel panic") == LogLevel.CRITICAL
+    assert classify("a FATAL crash occurred") == LogLevel.CRITICAL
+    assert classify("ERROR boom in handler") == LogLevel.ERROR
+    assert classify("EXCEPTION raised") == LogLevel.ERROR
+    assert classify("WARNING disk almost full") == LogLevel.WARNING
+    assert classify("DEBUG verbose trace here") == LogLevel.DEBUG
+    assert classify("request served ok") == LogLevel.INFO
+
+
+def test_critical_and_warning_log_lines_keep_their_level() -> None:
+    """A CRITICAL log line becomes a CRITICAL LogSignal; a WARNING line stays WARNING (F2h)."""
+    cw = _cloudwatch_client()
+    logs = _logs_client()
+    cw_stub = Stubber(cw)
+    logs_stub = Stubber(logs)
+
+    cw_stub.add_response("get_metric_data", {"MetricDataResults": []})
+    event_ts_millis = int(_SAMPLE_TS.timestamp() * 1000)
+    # First group: a CRITICAL + a WARNING line; second group empty.
+    logs_stub.add_response(
+        "filter_log_events",
+        {
+            "events": [
+                {"message": "CRITICAL kernel panic", "timestamp": event_ts_millis},
+                {"message": "WARNING disk almost full", "timestamp": event_ts_millis},
+            ]
+        },
+    )
+    logs_stub.add_response("filter_log_events", {"events": []})
+
+    cw_stub.activate()
+    logs_stub.activate()
+
+    source = CloudWatchSource(_config(), cloudwatch_client=cw, logs_client=logs)
+    log_signals = [s for s in source.fetch(_WINDOW) if isinstance(s, LogSignal)]
+
+    by_message = {s.message: s.level for s in log_signals}
+    assert by_message["CRITICAL kernel panic"] == LogLevel.CRITICAL
+    assert by_message["WARNING disk almost full"] == LogLevel.WARNING
+    cw_stub.assert_no_pending_responses()
+    logs_stub.assert_no_pending_responses()
+
+
+def test_error_rate_counts_error_and_above_levels() -> None:
+    """`panoptes_log_error_rate` counts error-ish levels: ERROR + CRITICAL (F2h).
+
+    With one ERROR, one CRITICAL, and one WARNING line in a group, the error rate counts
+    the two error-and-above lines → 2/3.
+    """
+    cw = _cloudwatch_client()
+    logs = _logs_client()
+    cw_stub = Stubber(cw)
+    logs_stub = Stubber(logs)
+
+    cw_stub.add_response("get_metric_data", {"MetricDataResults": []})
+    event_ts_millis = int(_SAMPLE_TS.timestamp() * 1000)
+    logs_stub.add_response(
+        "filter_log_events",
+        {
+            "events": [
+                {"message": "ERROR boom", "timestamp": event_ts_millis},
+                {"message": "CRITICAL panic", "timestamp": event_ts_millis},
+                {"message": "WARNING almost full", "timestamp": event_ts_millis},
+            ]
+        },
+    )
+    logs_stub.add_response("filter_log_events", {"events": []})
+
+    cw_stub.activate()
+    logs_stub.activate()
+
+    source = CloudWatchSource(_config(), cloudwatch_client=cw, logs_client=logs)
+    error_rates = {
+        s.labels["log_group"]: s.value
+        for s in source.fetch(_WINDOW)
+        if isinstance(s, MetricSignal) and s.name == "panoptes_log_error_rate"
+    }
+    # 2 of 3 lines are error-and-above (ERROR + CRITICAL); WARNING does not count.
+    assert error_rates["/app/api"] == pytest.approx(2 / 3)
+    cw_stub.assert_no_pending_responses()
+    logs_stub.assert_no_pending_responses()
+
+
 def test_paginate_walks_token_to_exhaustion_yielding_every_page() -> None:
     """The shared `_paginate` helper follows a token across pages until it is absent.
 

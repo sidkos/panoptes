@@ -235,6 +235,46 @@ def test_get_dashboard_data_unknown_id_raises_capability_error(tmp_path: Path) -
     assert "does-not-exist" in str(excinfo.value)
 
 
+# --- F2a: get_dashboard_data PromQL injection (the F7 sibling sink) ---------------
+
+
+def test_get_dashboard_data_rejects_unknown_env(tmp_path: Path) -> None:
+    """An env not in the catalog is rejected with a CapabilityError (F2a).
+
+    `get_dashboard_data` substitutes `env` into each panel's `$env` template var and
+    executes the result against the store. An unvalidated env reaches the selector
+    unchecked, so an unknown env (or a breakout attempt) must be rejected explicitly —
+    the same hardening F7 applied to `query_metric`.
+    """
+    store = _FakeStore([])
+    packs = [DashboardPack(id="inline", tier="core", json_path=_write_inline_dashboard(tmp_path))]
+    config = _build_config(store, dashboard_packs=packs)
+
+    with pytest.raises(CapabilityError) as excinfo:
+        get_dashboard_data("inline", "prod-typo", QueryContext(config))
+    assert "prod-typo" in str(excinfo.value)
+    # The store was never queried with the unvalidated env.
+    assert store.queried_exprs == []
+
+
+def test_get_dashboard_data_breakout_env_does_not_corrupt_selector(tmp_path: Path) -> None:
+    """A breakout-shaped env must NEVER produce a broken/breakout selector (F2a).
+
+    A caller passing `env='a"} or x{b="'` would, under a naive `.replace`, close the
+    `=~"$env"` matcher early and read an arbitrary metric (cross-env / corrupt panel).
+    The fix rejects an unknown env (this value is not a declared env) BEFORE any
+    substitution, so the store is never queried with a corrupted selector.
+    """
+    store = _FakeStore([])
+    packs = [DashboardPack(id="inline", tier="core", json_path=_write_inline_dashboard(tmp_path))]
+    config = _build_config(store, dashboard_packs=packs)
+
+    with pytest.raises(CapabilityError):
+        get_dashboard_data("inline", 'a"} or x{b="', QueryContext(config))
+    # No selector was ever executed — the breakout never reached the store.
+    assert store.queried_exprs == []
+
+
 def test_describe_signal_catalog_only_lists_enabled_env_sources() -> None:
     """A disabled env carries no sources, so it contributes nothing to `sources`."""
     config = _build_config(_FakeStore([]))

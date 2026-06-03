@@ -35,6 +35,7 @@ httpx is mocked in tests with `respx`; the `RestClient`'s default `httpx.Client(
 intercepted globally, and is threaded as a constructor seam for explicit control.
 """
 
+import math
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -201,6 +202,12 @@ class SentrySource:
         try:
             delay = float(raw)
         except ValueError:
+            delay = 1.0
+        # F2i — explicit non-finite guard. `float("nan")`/`float("inf")` parse without
+        # raising, and the old `max`/`min` clamp only neutralized them by ordering accident
+        # (a fragile guarantee). Fall back to the 1.0 courtesy delay so `time.sleep` is
+        # never handed nan/inf.
+        if not math.isfinite(delay):
             delay = 1.0
         delay = max(0.0, min(delay, _MAX_RETRY_AFTER_SECONDS))
         self._sleep(delay)

@@ -151,6 +151,23 @@ def test_get_demo_signal_returns_typed_demo_signal_over_panoptes_metrics() -> No
     assert "panoptes_" in store.queries[0].expr
 
 
+def test_get_demo_signal_escapes_env_via_canonical_core_primitive() -> None:
+    """The demo pack reuses the canonical `escape_promql_value` (F2d), not a hand-copy.
+
+    An env containing a `"` must be escaped into a single closed PromQL string in the
+    executed selector — proving the demo consumes the shared core primitive rather than
+    a copy that could drift and miss the backslash-first ordering.
+    """
+    pack = _import_pack()
+    store = _FakeStore()
+    pack.get_demo_signal(store, env='a"b', window="15m")  # type: ignore[attr-defined]
+
+    assert store.queries, "get_demo_signal must read the store"
+    expr = store.queries[0].expr
+    # The embedded quote is escaped — the value stays one closed string, no break-out.
+    assert r'env="a\"b"' in expr
+
+
 def test_pack_registers_synthetic_adapter_on_a_core_registry() -> None:
     """Importing the pack adds a synthetic adapter to a core registry (additive injection)."""
     from core.registry import STORES

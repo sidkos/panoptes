@@ -30,6 +30,7 @@ from typing import TypedDict
 
 from core.errors import CapabilityError
 from core.mcp.context import QueryContext
+from core.mcp.tools_query import escape_promql_value
 from core.model import (
     DashboardPack,
     MetricQuery,
@@ -172,8 +173,26 @@ def get_dashboard_data(
     Raises:
         CapabilityError: `dashboard_id` is not in the catalog (the spec defines no
             separate `NotFoundError`; an unknown id is surfaced explicitly, never
-            silent/None).
+            silent/None), OR `env` is not a declared environment (F2a — the F7 sibling
+            sink: an unvalidated env reaches the panel `$env` substitution and could
+            otherwise break out of the `=~"$env"` selector for a cross-env / corrupt
+            read).
     """
+    # F2a — validate `env` against the declared environments BEFORE it is substituted
+    # into any panel selector. `env` is spliced into each panel's `=~"$env"` matcher, so
+    # an unvalidated value carrying `"`/`{`/`}` would break out of the selector (the same
+    # PromQL-injection class F7 closed for `query_metric`). Rejecting an unknown env here
+    # — and escaping the validated value in `_substitute_env` (defense in depth) — keeps
+    # the executed PromQL scoped to exactly the requested, declared env. `env_names()`
+    # spans declared envs incl. disabled ones (a dashboard for a disabled env is a valid
+    # request; it simply has no live sources).
+    if env not in context.env_names():
+        available = ", ".join(context.env_names()) or "(none)"
+        raise CapabilityError(
+            f"Unknown environment '{env}' for get_dashboard_data. "
+            f"Available environments: {available}."
+        )
+
     packs = context.dashboard_packs
     pack = next((p for p in packs if p.id == dashboard_id), None)
     if pack is None:
@@ -249,8 +268,14 @@ def _substitute_env(expr: str, env: str) -> str:
     Grafana panels reference the env template var as `$env` (and a regex match
     `=~"$env"`); v0.1 substitutes the literal `$env` token so the executed PromQL
     is scoped to the requested environment.
+
+    The substituted value is ESCAPED via the canonical `escape_promql_value` primitive
+    (F2a / F2d) so a `"`/`\\` in the env can never break out of the surrounding quoted
+    selector. `get_dashboard_data` already rejects an unknown env, so a valid env name
+    needs no escaping in practice; this is defense in depth so a future caller of
+    `_substitute_env` cannot reintroduce the F7-class injection here.
     """
-    return expr.replace("$env", env)
+    return expr.replace("$env", escape_promql_value(env))
 
 
 def _serialize_series(series: MetricSeries) -> MetricSeriesData:

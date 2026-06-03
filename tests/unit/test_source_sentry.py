@@ -248,6 +248,76 @@ def test_retry_after_unparseable_falls_back() -> None:
 
 
 @respx.mock
+def test_retry_after_zero_sleeps_zero() -> None:
+    """`Retry-After: 0` sleeps 0.0 — distinct from an unparseable header (→ 1.0) (F2m)."""
+    sleep_calls: list[float] = []
+    route = respx.get(_ISSUES_URL)
+    route.side_effect = [
+        httpx.Response(429, headers={"Retry-After": "0"}),
+        httpx.Response(200, json=[]),
+    ]
+
+    _source(sleep_calls=sleep_calls).fetch(_WINDOW)
+
+    assert sleep_calls == [0.0]
+
+
+@respx.mock
+def test_retry_after_negative_clamps_to_zero() -> None:
+    """A negative `Retry-After` clamps to 0.0 (F2m) — never a negative sleep."""
+    sleep_calls: list[float] = []
+    route = respx.get(_ISSUES_URL)
+    route.side_effect = [
+        httpx.Response(429, headers={"Retry-After": "-5"}),
+        httpx.Response(200, json=[]),
+    ]
+
+    _source(sleep_calls=sleep_calls).fetch(_WINDOW)
+
+    assert sleep_calls == [0.0]
+
+
+@respx.mock
+def test_retry_after_huge_is_capped_at_max() -> None:
+    """An absurdly large `Retry-After` is capped at the 60s ceiling (F2m)."""
+    from core.sources.sentry import _MAX_RETRY_AFTER_SECONDS
+
+    sleep_calls: list[float] = []
+    route = respx.get(_ISSUES_URL)
+    route.side_effect = [
+        httpx.Response(429, headers={"Retry-After": "100000"}),
+        httpx.Response(200, json=[]),
+    ]
+
+    _source(sleep_calls=sleep_calls).fetch(_WINDOW)
+
+    assert sleep_calls == [_MAX_RETRY_AFTER_SECONDS]
+    assert _MAX_RETRY_AFTER_SECONDS == 60.0
+
+
+@respx.mock
+@pytest.mark.parametrize("retry_after", ["nan", "inf", "-inf"])
+def test_retry_after_non_finite_falls_back_to_courtesy_delay(retry_after: str) -> None:
+    """A non-finite `Retry-After` (`nan`/`inf`) falls back to the 1.0 courtesy delay (F2i).
+
+    `float("nan")` parses without raising and the old `max`/`min` clamp neutralized it
+    only by ordering accident; an explicit `math.isfinite` guard now falls back to the
+    courtesy delay so `time.sleep` is never called with nan/inf.
+    """
+    sleep_calls: list[float] = []
+    route = respx.get(_ISSUES_URL)
+    route.side_effect = [
+        httpx.Response(429, headers={"Retry-After": retry_after}),
+        httpx.Response(200, json=[]),
+    ]
+
+    _source(sleep_calls=sleep_calls).fetch(_WINDOW)
+
+    # A finite, safe value was passed to sleep (the courtesy fallback), never nan/inf.
+    assert sleep_calls == [1.0]
+
+
+@respx.mock
 def test_unknown_level_defaults_to_error() -> None:
     payload = [
         {

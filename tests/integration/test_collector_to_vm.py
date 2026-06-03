@@ -39,6 +39,9 @@ def test_collector_writes_round_trip_through_victoriametrics(
     is visible, then range-queries them back and asserts both the values and the
     mandatory `env` label survived the round-trip.
     """
+    # Build the store directly (the integration leg under test). It owns a long-lived
+    # httpx client; close it at the end so the socket is released and the run stays clean
+    # under `pytest -W error::ResourceWarning` (F2c).
     store = VictoriaMetricsStore({"url": victoriametrics.base_url})
 
     sample_time = now_utc()
@@ -79,3 +82,7 @@ def test_collector_writes_round_trip_through_victoriametrics(
     # The synthetic value (1.0) is present at every returned grid point.
     assert series.points, "expected sample points in the returned series"
     assert all(value == pytest.approx(1.0) for _timestamp, value in series.points)
+
+    # Release the store's long-lived httpx socket (F2c) so the run is clean under
+    # `pytest -m integration -W error::ResourceWarning`.
+    store.close()

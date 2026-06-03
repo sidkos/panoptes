@@ -67,9 +67,21 @@ if TYPE_CHECKING:
 # collisions with native upstream metric names).
 _METRIC_LOG_ERROR_RATE = "panoptes_log_error_rate"
 
-# Substrings that mark a log event as ERROR-level for the error-rate derivation.
-# CloudWatch log events carry no structured level, so the message text is inspected.
-_ERROR_MARKERS = ("ERROR", "CRITICAL", "FATAL", "EXCEPTION", "TRACEBACK")
+# Message-substring markers → their TRUE `LogLevel` (F2h). CloudWatch log events carry no
+# structured level, so the message text is inspected. Ordered MOST-SEVERE FIRST so a line
+# carrying multiple markers classifies at its highest severity (e.g. a CRITICAL line that
+# also mentions "error" stays CRITICAL). The previous classifier collapsed CRITICAL/FATAL
+# to ERROR and never emitted WARNING/DEBUG — a lossy mapping this list fixes.
+_LEVEL_MARKERS: tuple[tuple[tuple[str, ...], LogLevel], ...] = (
+    (("CRITICAL", "FATAL"), LogLevel.CRITICAL),
+    (("ERROR", "EXCEPTION", "TRACEBACK"), LogLevel.ERROR),
+    (("WARNING", "WARN"), LogLevel.WARNING),
+    (("DEBUG",), LogLevel.DEBUG),
+)
+
+# The levels that count toward `panoptes_log_error_rate` (F2h): ERROR and above
+# (ERROR + CRITICAL). WARNING/DEBUG/INFO are NOT errors, so they do not inflate the rate.
+_ERROR_RATE_LEVELS = frozenset({LogLevel.ERROR, LogLevel.CRITICAL})
 
 
 def _paginate[PageT](
@@ -324,7 +336,8 @@ class CloudWatchSource:
         """Page `FilterLogEvents` per log group, normalizing events + deriving error rate.
 
         Returns `(log_signals, error_rate_metrics)`. For each configured log group every
-        event becomes a `LogSignal`; the fraction of ERROR-marked events becomes one
+        event becomes a `LogSignal` at its classified level; the fraction of
+        ERROR-and-above events (ERROR + CRITICAL, F2h) becomes one
         `panoptes_log_error_rate` gauge with exact labels `{env, log_group}`.
         """
         client = self._logs()
@@ -337,7 +350,9 @@ class CloudWatchSource:
             error_count = 0
             for event in events:
                 level = self._classify_level(event.message)
-                if level == LogLevel.ERROR:
+                # The error rate counts ERROR-and-above (ERROR + CRITICAL), F2h — WARNING/
+                # DEBUG/INFO are not errors and must not inflate the gauge.
+                if level in _ERROR_RATE_LEVELS:
                     error_count += 1
                 log_signals.append(
                     LogSignal(
@@ -403,14 +418,19 @@ class CloudWatchSource:
 
     @staticmethod
     def _classify_level(message: str) -> LogLevel:
-        """Classify a log message as ERROR (matches an error marker) or INFO otherwise.
+        """Classify a log message to its TRUE `LogLevel` from its severity marker (F2h).
 
         CloudWatch log events carry no structured level, so the message text is matched
-        against `_ERROR_MARKERS` (case-insensitive). The error rate counts only ERROR.
+        (case-insensitive) against `_LEVEL_MARKERS`, which is ordered most-severe-first so
+        a line carrying multiple markers classifies at its highest severity. CRITICAL/FATAL
+        → CRITICAL, ERROR/EXCEPTION/TRACEBACK → ERROR, WARNING/WARN → WARNING, DEBUG →
+        DEBUG; anything unmatched → INFO. (Previously CRITICAL/FATAL lossily collapsed to
+        ERROR and WARNING/DEBUG were never emitted.)
         """
         upper = message.upper()
-        if any(marker in upper for marker in _ERROR_MARKERS):
-            return LogLevel.ERROR
+        for markers, level in _LEVEL_MARKERS:
+            if any(marker in upper for marker in markers):
+                return level
         return LogLevel.INFO
 
     @staticmethod

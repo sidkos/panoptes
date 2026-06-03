@@ -86,6 +86,15 @@ class GrafanaDashboardProvider:
         self._grafana_url = url.rstrip("/") if isinstance(url, str) and url else None
         self._rest = RestClient(client)
 
+    def close(self) -> None:
+        """Close the provider's REST client httpx pool (F2c socket hygiene).
+
+        The provider owns a `RestClient` even when no Grafana `url` is configured (the
+        offline file-sync case), so a directly-built provider should close it to keep
+        teardown clean under `-W error::ResourceWarning`. Idempotent.
+        """
+        self._rest.close()
+
     def provision(self, packs: list[DashboardPack]) -> None:
         """Resolve, sync, and (when a url is configured) confirm every pack's JSON.
 

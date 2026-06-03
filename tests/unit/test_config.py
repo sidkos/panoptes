@@ -362,6 +362,107 @@ def test_consumer_pack_git_only_parses_and_validates(
     assert consumer_packs[0].selector == "git"
 
 
+# --- F2e: required-key access raises PanoptesError, not raw KeyError -------------
+
+
+def test_missing_store_block_raises_panoptes_error_naming_store(tmp_path: Path) -> None:
+    """A config with `panoptes:` but no `store` raises a clear PanoptesError (F2e).
+
+    The loader indexes `body["store"]` directly; a missing key would raise a raw
+    `KeyError` that escapes a caller's `except PanoptesError`. It must instead raise a
+    PanoptesError naming the missing `store` block.
+    """
+    body = "panoptes:\n  environments: {}\n"
+    config_path = _write_fixture(tmp_path, body)
+    with pytest.raises(PanoptesError) as excinfo:
+        load_config(config_path, registries=_registries_with_correct_capabilities())
+    assert "store" in str(excinfo.value)
+    # Not a bare KeyError leaking through.
+    assert not isinstance(excinfo.value, KeyError)
+
+
+def test_env_missing_enabled_raises_panoptes_error_naming_field(tmp_path: Path) -> None:
+    """An environment block missing `enabled` raises a clear PanoptesError (F2e)."""
+    body = (
+        "panoptes:\n"
+        "  environments:\n"
+        "    dev:\n"
+        "      sources: []\n"
+        "  store:\n"
+        "    type: victoriametrics\n"
+        "    url: http://vm:8428\n"
+    )
+    config_path = _write_fixture(tmp_path, body)
+    with pytest.raises(PanoptesError) as excinfo:
+        load_config(config_path, registries=_registries_with_correct_capabilities())
+    message = str(excinfo.value)
+    assert "enabled" in message
+    assert "dev" in message
+
+
+def test_env_missing_sources_raises_panoptes_error_naming_field(tmp_path: Path) -> None:
+    """An enabled environment block missing `sources` raises a clear PanoptesError (F2e)."""
+    body = (
+        "panoptes:\n"
+        "  environments:\n"
+        "    dev:\n"
+        "      enabled: true\n"
+        "  store:\n"
+        "    type: victoriametrics\n"
+        "    url: http://vm:8428\n"
+    )
+    config_path = _write_fixture(tmp_path, body)
+    with pytest.raises(PanoptesError) as excinfo:
+        load_config(config_path, registries=_registries_with_correct_capabilities())
+    assert "sources" in str(excinfo.value)
+
+
+def test_source_missing_type_raises_panoptes_error_naming_field(tmp_path: Path) -> None:
+    """A source entry missing `type` raises a clear PanoptesError (F2e), not KeyError."""
+    body = (
+        "panoptes:\n"
+        "  environments:\n"
+        "    dev:\n"
+        "      enabled: true\n"
+        "      sources:\n"
+        "        - url: http://app/health\n"
+        "  store:\n"
+        "    type: victoriametrics\n"
+        "    url: http://vm:8428\n"
+    )
+    config_path = _write_fixture(tmp_path, body)
+    with pytest.raises(PanoptesError) as excinfo:
+        load_config(config_path, registries=_registries_with_correct_capabilities())
+    assert "type" in str(excinfo.value)
+    assert not isinstance(excinfo.value, KeyError)
+
+
+def test_store_missing_type_raises_panoptes_error_naming_field(tmp_path: Path) -> None:
+    """A store block missing `type` raises a clear PanoptesError (F2e)."""
+    body = "panoptes:\n  environments: {}\n  store:\n    url: http://vm:8428\n"
+    config_path = _write_fixture(tmp_path, body)
+    with pytest.raises(PanoptesError) as excinfo:
+        load_config(config_path, registries=_registries_with_correct_capabilities())
+    assert "type" in str(excinfo.value)
+
+
+def test_notifier_missing_type_raises_panoptes_error_naming_field(tmp_path: Path) -> None:
+    """A notifier entry missing `type` raises a clear PanoptesError (F2e)."""
+    body = (
+        "panoptes:\n"
+        "  environments: {}\n"
+        "  store:\n"
+        "    type: victoriametrics\n"
+        "    url: http://vm:8428\n"
+        "  notifiers:\n"
+        "    - foo: bar\n"
+    )
+    config_path = _write_fixture(tmp_path, body)
+    with pytest.raises(PanoptesError) as excinfo:
+        load_config(config_path, registries=_registries_with_correct_capabilities())
+    assert "type" in str(excinfo.value)
+
+
 # --- PlaneRegistries test-isolation seam -----------------------------------------
 #
 # `PlaneRegistries.empty()` is the documented canonical seam for obtaining a fully

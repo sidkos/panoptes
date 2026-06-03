@@ -46,6 +46,7 @@ from core.mcp.server import (
 )
 from core.mcp.tools_query import (
     describe_health,
+    escape_promql_value,
     query_metric,
     search_incidents,
     search_logs,
@@ -261,6 +262,74 @@ def test_describe_health_marks_unreachable_source() -> None:
     assert "connection refused" in by_type["cloudwatch"]["detail"]
     # The unreachable source is still present in the rollup, not omitted.
     assert set(by_type) == {"cloudwatch", "sentry", "http-health"}
+
+
+def test_describe_health_surfaces_key_derived_metrics_value() -> None:
+    """`describe_health` surfaces the spec's "key derived metrics" with their VALUE (F2g).
+
+    The spec § MCP server defines `describe_health -> HealthRollup` as per-source
+    reachability + key derived metrics + open incident count. The rollup must carry a
+    `metrics` field reflecting `panoptes_health_up` read from the store — asserting the
+    VALUE, not just key presence.
+    """
+
+    class _HealthMetricStore:
+        type = "health-metric"
+
+        def write(self, signals: list[CanonicalSignal]) -> None:
+            return None
+
+        def query(self, query: MetricQuery) -> list[MetricSeries]:
+            # Answer the health-up probe with a 1.0 latest sample.
+            if "panoptes_health_up" in query.expr:
+                return [
+                    MetricSeries(
+                        metric="panoptes_health_up",
+                        labels={"env": "dev"},
+                        points=[(_now(), 1.0)],
+                    )
+                ]
+            return []
+
+    config = _dev_only_config(store=_HealthMetricStore())
+    rollup = describe_health(QueryContext(config), env="dev")
+
+    metrics_by_name = {m["name"]: m["value"] for m in rollup["metrics"]}
+    assert metrics_by_name.get("panoptes_health_up") == 1.0
+
+
+def test_describe_health_env_all_includes_metrics_field() -> None:
+    """The `env="all"` aggregate rollup still carries a coherent `metrics` field (F2g)."""
+
+    class _HealthMetricStore:
+        type = "health-metric"
+
+        def write(self, signals: list[CanonicalSignal]) -> None:
+            return None
+
+        def query(self, query: MetricQuery) -> list[MetricSeries]:
+            if "panoptes_health_up" in query.expr:
+                return [
+                    MetricSeries(
+                        metric="panoptes_health_up", labels={"env": "x"}, points=[(_now(), 1.0)]
+                    )
+                ]
+            return []
+
+    config = _config(
+        {
+            "dev": ResolvedEnvironment(
+                name="dev",
+                enabled=True,
+                sources=[_resolved_source("http-health", {SignalKind.METRIC})],
+            ),
+        },
+        store=_HealthMetricStore(),
+    )
+    rollup = describe_health(QueryContext(config), env="all")
+    assert rollup["env"] == "all"
+    # The metrics field is present and a list (coherent for the aggregate path).
+    assert isinstance(rollup["metrics"], list)
 
 
 def test_describe_health_counts_open_incidents() -> None:
@@ -568,6 +637,104 @@ def test_query_metric_rejects_bogus_filter_label_key() -> None:
             window="15m",
             filters={'url"=="': "x"},
         )
+
+
+# --- F2f: _window_for parses the window arg; step is sub-window -------------------
+
+
+def test_window_for_parses_1h() -> None:
+    """`_window_for("1h")` spans 60 minutes (F2f — the arg is no longer ignored)."""
+    from core.mcp.tools_query import _window_for
+
+    window = _window_for("1h")
+    span_minutes = round((window.end - window.start).total_seconds() / 60)
+    assert span_minutes == 60
+
+
+def test_window_for_parses_24h_and_1d_equivalently() -> None:
+    """`_window_for("24h")` and `"1d"` both span 1440 minutes (F2f)."""
+    from core.mcp.tools_query import _window_for
+
+    for window_str in ("24h", "1d"):
+        window = _window_for(window_str)
+        span_minutes = round((window.end - window.start).total_seconds() / 60)
+        assert span_minutes == 1440, f"{window_str!r} should span 1440 minutes"
+
+
+def test_window_for_default_when_empty() -> None:
+    """An empty/None window falls back to the default 15-minute trailing window (F2f)."""
+    from core.mcp.tools_query import _DEFAULT_WINDOW_MINUTES, _window_for
+
+    window = _window_for("")
+    span_minutes = round((window.end - window.start).total_seconds() / 60)
+    assert span_minutes == _DEFAULT_WINDOW_MINUTES
+
+
+def test_window_for_unrecognized_falls_back_to_default_explicitly(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unrecognized window is handled EXPLICITLY (F2f) — fall back to default 15m AND
+    surface the offending value in a warning (asserted behavior, not silent-15m)."""
+    import logging
+
+    from core.mcp.tools_query import _DEFAULT_WINDOW_MINUTES, _window_for
+
+    with caplog.at_level(logging.WARNING):
+        window = _window_for("not-a-window")
+    span_minutes = round((window.end - window.start).total_seconds() / 60)
+    assert span_minutes == _DEFAULT_WINDOW_MINUTES
+    # The offending value is surfaced (explicit, not silent).
+    assert any("not-a-window" in record.getMessage() for record in caplog.records)
+
+
+def test_query_metric_step_is_strictly_sub_window_for_multiple_points() -> None:
+    """`query_metric`'s step_seconds is strictly LESS than the window span (F2f).
+
+    The old code used step == window (15m over a 15m window) → a single degenerate
+    bucket. The step must be sub-window so a range yields multiple points.
+    """
+    captured: list[MetricQuery] = []
+
+    class _RecordingStore:
+        type = "recording"
+
+        def write(self, signals: list[CanonicalSignal]) -> None:
+            return None
+
+        def query(self, query: MetricQuery) -> list[MetricSeries]:
+            captured.append(query)
+            return []
+
+    config = _dev_only_config(store=_RecordingStore())
+    query_metric(
+        QueryContext(config), env="dev", name="panoptes_health_up", window="1h", filters=None
+    )
+    assert captured, "the store query was executed"
+    query = captured[0]
+    window_span_seconds = (query.window.end - query.window.start).total_seconds()
+    assert query.step_seconds < window_span_seconds, (
+        "step must be sub-window so the range yields multiple buckets, not one"
+    )
+    # And the step is a sane positive floor (never zero / sub-second).
+    assert query.step_seconds >= 15
+
+
+# --- F2d: public PromQL value-escape primitive -----------------------------------
+
+
+def test_escape_promql_value_is_public_and_escapes_backslash_first() -> None:
+    """`escape_promql_value` is the PUBLIC canonical primitive (F2d).
+
+    It must be importable from `core.mcp.tools_query` (so consumers — incl. the demo
+    pack — reuse one implementation) and must escape backslash FIRST, then the double
+    quote, so a value like `a"b` becomes the single closed PromQL string `a\\"b` rather
+    than breaking out of the selector.
+    """
+    assert escape_promql_value('a"b') == r"a\"b"
+    # Backslash-first ordering: a lone backslash doubles, and a backslash-then-quote
+    # value does not collapse the quote-escape's own backslash.
+    assert escape_promql_value(r"a\b") == r"a\\b"
+    assert escape_promql_value('a\\"b') == r"a\\\"b"
 
 
 # --- v0.2 stub tools -------------------------------------------------------------

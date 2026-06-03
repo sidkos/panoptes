@@ -8,6 +8,10 @@ no single source/env failure aborts a cycle:
 
 - A source `health()` or `fetch` raising is caught, logged (f-string), and the loop
   CONTINUES to the next source/env — a flaky upstream never stalls the whole run.
+- A source whose `health()` RETURNS `reachable=False` (e.g. a CloudWatch assume-role
+  denial, which the source surfaces as unreachable rather than raising) is skipped for
+  the cycle: its signals must not reach the store. It is recorded as a per-source failure
+  so the throttle + error log treat it like any other failure.
 - A `store.write()` raising (e.g. VM unreachable) is caught per-batch, logged, and
   the loop continues to the next env.
 - Each `fetch` is bounded by that source's `fetch_timeout_seconds` (spec default
@@ -170,9 +174,19 @@ class Collector:
         # The broad `except Exception` is the deliberate resilience boundary — ANY
         # source failure is caught, logged, and the loop continues to the next source.
         try:
-            source.health()
+            health = source.health()
         except Exception as exc:
             self._record_failure(env_name, key, source.type, f"health() failed: {exc}")
+            return
+        # An UNREACHABLE source (e.g. a CloudWatch assume-role denial, which the source
+        # surfaces as reachable=False rather than raising) is skipped for this cycle: its
+        # fetch would attempt upstream calls with no usable credentials and its signals
+        # must NOT reach the store. Record it as a failure so the per-source throttle +
+        # error log treat it exactly like a fetch failure (resilience boundary, F2k).
+        if not health.reachable:
+            self._record_failure(
+                env_name, key, source.type, f"health() reported unreachable: {health.detail}"
+            )
             return
 
         # Bound the fetch by this source's fetch_timeout_seconds. The fetch runs in the

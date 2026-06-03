@@ -28,9 +28,11 @@ IMPORTANT (FastMCP / PEP-563): this module must NOT add
 generation for the nested-`TypedDict` return shapes defined here.
 """
 
+import logging
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TypedDict
 
 from core.config import ResolvedEnvironment
@@ -46,6 +48,8 @@ from core.model import (
 )
 from core.planes.source import Source
 
+_LOGGER = logging.getLogger(__name__)
+
 # `env="all"` is the fan-out sentinel — iterate every enabled env (spec § MCP
 # server contract — "Accept and respect an `env` argument (or `all`)").
 _ALL_ENVS = "all"
@@ -58,9 +62,37 @@ _ALL_ENVS = "all"
 _PROMQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_:]*$")
 
 # Default query window for the live-source fetch tools. The MCP `window` argument is
-# a human string in v0.1 (e.g. "15m"); v0.1 maps an unparsed/default window to the
-# trailing N minutes so the tools have a bounded fetch without a full duration parser.
+# a human string (e.g. "15m"); an empty/None/unrecognized window resolves to this
+# trailing default so a tool always has a bounded fetch.
 _DEFAULT_WINDOW_MINUTES = 15
+
+# The known human window strings → trailing minutes (F2f). The previous `_window_for`
+# hard-returned 15m for EVERY input, so `window="24h"` silently gave 15m. These cover the
+# common cadences; a bare integer is interpreted as minutes; anything else falls back to
+# the default WITH the value surfaced (explicit, never silent).
+_WINDOW_STRING_TO_MINUTES: dict[str, int] = {
+    "15m": 15,
+    "30m": 30,
+    "1h": 60,
+    "6h": 360,
+    "24h": 1440,
+    "1d": 1440,
+    "7d": 10080,
+}
+
+# The step floor (seconds) for a range query (F2f). The step is computed as
+# window_seconds / _STEP_TARGET_BUCKETS so a range yields multiple points (never one
+# degenerate bucket), then clamped to at least this floor so a tiny window cannot ask the
+# store for an absurdly fine grid.
+_STEP_TARGET_BUCKETS = 60
+_MIN_STEP_SECONDS = 15
+
+# The key derived health metrics `describe_health` surfaces (F2g — spec § MCP server:
+# `describe_health -> HealthRollup` = per-source reachability + "key derived metrics" +
+# open incident count). `panoptes_health_up` is the overview pack's traffic-light backing;
+# latency is included when the store has it. A metric absent from the store simply does
+# not appear (best-effort enrichment — reachability remains the rollup's mandatory promise).
+_KEY_HEALTH_METRICS = ("panoptes_health_up", "panoptes_health_latency_ms")
 
 
 class SourceHealthInfo(TypedDict):
@@ -77,11 +109,25 @@ class SourceHealthInfo(TypedDict):
     detail: str
 
 
+class HealthMetricInfo(TypedDict):
+    """One key derived health metric in a `describe_health` rollup (F2g).
+
+    Carries `env` so an `env="all"` aggregate keeps each metric's owning environment
+    identifiable; `value` is the latest sample of that derived gauge for the env.
+    """
+
+    env: str
+    name: str
+    value: float
+
+
 class HealthRollup(TypedDict):
-    """The 'one thing to look at': per-source reachability + open-incident count."""
+    """The 'one thing to look at': per-source reachability + key derived metrics +
+    open-incident count (spec § MCP server — `describe_health -> HealthRollup`)."""
 
     env: str
     sources: list[SourceHealthInfo]
+    metrics: list[HealthMetricInfo]
     open_incident_count: int
 
 
@@ -171,24 +217,71 @@ def fan_out_over_envs[ResultT](
     return results
 
 
-def _escape_promql_value(value: str) -> str:
-    """Escape a value for a double-quoted PromQL label-matcher string (F7).
+def escape_promql_value(value: str) -> str:
+    """Escape a value for a double-quoted PromQL label-matcher string (F7 / F2d).
 
     Backslash is escaped FIRST so the quote-escape's own backslash is not re-doubled, then
     the double quote. This keeps a value like `a"b` a single closed string (`"a\\"b"`)
     instead of breaking out of the selector (cross-env read / corrupted query).
+
+    This is the canonical PromQL value-escape primitive (F2d): it is PUBLIC so every
+    caller that interpolates a value into a quoted PromQL string — `query_metric` here,
+    `get_dashboard_data`'s `$env` substitution, and the demo consumer pack — reuses ONE
+    implementation rather than hand-copying the two `.replace(...)` calls (a copy that can
+    drift and miss the backslash-first ordering).
     """
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _window_for(_window: str) -> TimeWindow:
-    """Resolve the MCP `window` string to a `TimeWindow` (v0.1: trailing N minutes).
+def _window_minutes(window: str) -> int:
+    """Parse the MCP `window` string into trailing minutes (F2f).
 
-    v0.1 does not ship a full duration-string parser; every window resolves to the
-    default trailing window. The argument is accepted (and forwarded) so the tool
-    signature is forward-compatible when a parser lands in v0.2.
+    Recognizes the common cadence strings (`"15m"`, `"30m"`, `"1h"`, `"6h"`, `"24h"`/
+    `"1d"`, `"7d"`) and a bare integer (interpreted as minutes). An empty/None window
+    resolves to the default. An UNRECOGNIZED window is handled EXPLICITLY: it falls back
+    to the default AND logs a warning surfacing the offending value — never the old
+    silent-15m-for-everything behavior that made `window="24h"` quietly mean 15m.
     """
-    return TimeWindow.last(minutes=_DEFAULT_WINDOW_MINUTES)
+    normalized = window.strip().lower() if window else ""
+    if not normalized:
+        return _DEFAULT_WINDOW_MINUTES
+    known = _WINDOW_STRING_TO_MINUTES.get(normalized)
+    if known is not None:
+        return known
+    # A bare integer is accepted as minutes (forward-compatible with a fuller parser).
+    if normalized.isdigit():
+        parsed = int(normalized)
+        if parsed > 0:
+            return parsed
+    # Unrecognized — fall back to the default, but surface the value so the operator
+    # knows their window was not honored (explicit, not silent).
+    _LOGGER.warning(
+        f"Unrecognized MCP window {window!r}; falling back to the default "
+        f"{_DEFAULT_WINDOW_MINUTES}-minute window."
+    )
+    return _DEFAULT_WINDOW_MINUTES
+
+
+def _window_for(window: str) -> TimeWindow:
+    """Resolve the MCP `window` string to a trailing `TimeWindow` (F2f).
+
+    Delegates to `_window_minutes` (which now genuinely PARSES the window rather than
+    ignoring it) and returns a trailing window of that many minutes ending 'now'.
+    """
+    return TimeWindow.last(minutes=_window_minutes(window))
+
+
+def _step_seconds_for(window: str) -> int:
+    """Compute a sane range step (seconds) that is strictly sub-window (F2f).
+
+    The old `query_metric` used `step == window`, producing a single degenerate bucket.
+    This divides the window into `_STEP_TARGET_BUCKETS` points, then clamps the step to a
+    `_MIN_STEP_SECONDS` floor so a small window cannot request an absurdly fine grid. The
+    result is always strictly less than the window span, so a range yields multiple points.
+    """
+    window_seconds = _window_minutes(window) * 60
+    step = window_seconds // _STEP_TARGET_BUCKETS
+    return max(_MIN_STEP_SECONDS, step)
 
 
 def _fetch_incidents(
@@ -439,10 +532,12 @@ def query_metric(
             # The label VALUE is interpolated inside a double-quoted PromQL string, so it
             # is ESCAPED (not identifier-validated): backslash FIRST (so the quote-escape's
             # own backslash is not doubled), then the double quote.
-            selectors.append(f'{key}="{_escape_promql_value(value)}"')
+            selectors.append(f'{key}="{escape_promql_value(value)}"')
     expr = f"{name}{{{','.join(selectors)}}}"
+    # F2f — the step is now strictly sub-window (was `step == window`, a single degenerate
+    # bucket), so a range query returns multiple points over the requested window.
     metric_query = MetricQuery(
-        expr=expr, window=_window_for(window), step_seconds=_DEFAULT_WINDOW_MINUTES * 60
+        expr=expr, window=_window_for(window), step_seconds=_step_seconds_for(window)
     )
     # A passthrough store raises CapabilityError here — it propagates as the
     # structured MCP error the read-only contract requires (never swallowed).
@@ -471,30 +566,37 @@ def describe_health(context: QueryContext, env: str) -> HealthRollup:
         `env="all"`, the env field is `"all"` and the rollup is the across-env aggregate.
     """
     if env == _ALL_ENVS:
-        # Aggregate the union of per-env source health + the sum of open incidents.
+        # Aggregate the union of per-env source health + metrics + the sum of incidents.
         aggregated_sources: list[SourceHealthInfo] = []
+        aggregated_metrics: list[HealthMetricInfo] = []
         aggregated_count = 0
         for environment in context.enabled_envs():
-            env_sources, env_count = _health_for_env(context, environment)
+            env_sources, env_metrics, env_count = _health_for_env(context, environment)
             aggregated_sources.extend(env_sources)
+            aggregated_metrics.extend(env_metrics)
             aggregated_count += env_count
         return HealthRollup(
-            env=_ALL_ENVS, sources=aggregated_sources, open_incident_count=aggregated_count
+            env=_ALL_ENVS,
+            sources=aggregated_sources,
+            metrics=aggregated_metrics,
+            open_incident_count=aggregated_count,
         )
 
     environment = context.require_env(env)
-    sources, open_incident_count = _health_for_env(context, environment)
-    return HealthRollup(env=env, sources=sources, open_incident_count=open_incident_count)
+    sources, metrics, open_incident_count = _health_for_env(context, environment)
+    return HealthRollup(
+        env=env, sources=sources, metrics=metrics, open_incident_count=open_incident_count
+    )
 
 
 def _health_for_env(
     context: QueryContext, environment: ResolvedEnvironment
-) -> tuple[list[SourceHealthInfo], int]:
-    """Probe one env's per-source reachability + its open-incident count.
+) -> tuple[list[SourceHealthInfo], list[HealthMetricInfo], int]:
+    """Probe one env's per-source reachability + key derived metrics + open-incident count.
 
     Extracted so a single-env rollup and the `env="all"` aggregate share one
-    implementation. Each `SourceHealthInfo` carries the env so an aggregate rollup
-    keeps every entry's owning environment identifiable.
+    implementation. Each `SourceHealthInfo`/`HealthMetricInfo` carries the env so an
+    aggregate rollup keeps every entry's owning environment identifiable.
     """
     sources: list[SourceHealthInfo] = []
     for resolved in environment.sources:
@@ -508,6 +610,8 @@ def _health_for_env(
             )
         )
 
+    metrics = _health_metrics_for_env(context, environment)
+
     # Open incidents are a best-effort enrichment: if the env has an incident source,
     # count its incidents; if not, health is still answerable (count stays 0) — we do
     # NOT raise here, because reachability is the rollup's mandatory promise.
@@ -516,4 +620,55 @@ def _health_for_env(
         open_incident_count = len(
             _fetch_incidents(context, environment, TimeWindow.last(minutes=_DEFAULT_WINDOW_MINUTES))
         )
-    return sources, open_incident_count
+    return sources, metrics, open_incident_count
+
+
+def _health_metrics_for_env(
+    context: QueryContext, environment: ResolvedEnvironment
+) -> list[HealthMetricInfo]:
+    """Read the key derived health metrics for one env from the store (F2g).
+
+    Queries each `_KEY_HEALTH_METRICS` gauge (`panoptes_health_up`, and latency when
+    present) scoped to this env and surfaces the LATEST sample value — the overview pack's
+    traffic-light backing. This is best-effort enrichment: a metric the store has no data
+    for (or a store that returns nothing) simply does not appear; a passthrough store that
+    raises `CapabilityError` is swallowed here so health stays answerable from
+    reachability alone (the rollup's mandatory promise must not depend on a metric store).
+    """
+    metrics: list[HealthMetricInfo] = []
+    window = TimeWindow.last(minutes=_DEFAULT_WINDOW_MINUTES)
+    for metric_name in _KEY_HEALTH_METRICS:
+        # The env name is a declared, validated env (require_env already ran for the
+        # single-env path; enabled_envs for the aggregate) — but escape defensively so a
+        # future label-bearing env can never corrupt the selector (F7 discipline).
+        expr = f'{metric_name}{{env="{escape_promql_value(environment.name)}"}}'
+        try:
+            series = context.store.query(
+                MetricQuery(expr=expr, window=window, step_seconds=_step_seconds_for("15m"))
+            )
+        except CapabilityError:
+            # A non-metric (passthrough) store cannot answer — health is still answerable
+            # from reachability, so drop the metric enrichment rather than failing.
+            return metrics
+        latest = _latest_value(series)
+        if latest is not None:
+            metrics.append(HealthMetricInfo(env=environment.name, name=metric_name, value=latest))
+    return metrics
+
+
+def _latest_value(series: list[MetricSeries]) -> float | None:
+    """The most recent sample value across a metric's series, or None if there is none.
+
+    `describe_health` surfaces a single scalar per key metric, so this picks the latest
+    point across the returned series (each series is one label-set; for a single-env
+    `env`-scoped health gauge there is typically one). Returns None when there is no data,
+    so the caller omits the metric rather than inventing a 0.0.
+    """
+    latest_timestamp: datetime | None = None
+    latest_value: float | None = None
+    for one_series in series:
+        for timestamp, value in one_series.points:
+            if latest_timestamp is None or timestamp >= latest_timestamp:
+                latest_timestamp = timestamp
+                latest_value = value
+    return latest_value

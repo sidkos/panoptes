@@ -302,7 +302,12 @@ def _sync_dashboards_to(generated_dir: Path, vm_base_url: str) -> None:
         ),
     ]
     provider = GrafanaDashboardProvider({"provisioning_dir": str(generated_dir)})
-    provider.provision(packs)
+    try:
+        provider.provision(packs)
+    finally:
+        # Release the provider's long-lived httpx socket (F2c) so the run is clean under
+        # `pytest -m integration -W error::ResourceWarning`.
+        provider.close()
 
 
 @pytest.fixture(scope="session")
