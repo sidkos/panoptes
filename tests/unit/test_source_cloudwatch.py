@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 import boto3
 import pytest
+from botocore.exceptions import ClientError
 from botocore.stub import Stubber
 from core.errors import PanoptesError
 from core.model import LogLevel, LogSignal, MetricSignal, SignalKind, TimeWindow
@@ -250,6 +251,48 @@ def test_assume_role_denial_surfaces_through_health_without_crashing() -> None:
 
     assert health.reachable is False
     assert "AccessDenied" in health.detail or "credential" in health.detail
+
+
+def test_health_detail_does_not_leak_sensitive_exception_text() -> None:
+    """A cloudwatch health() failure must NOT echo verbatim `str(exc)` into `detail` (F3c).
+
+    `health().detail` is surfaced through the MCP-visible `describe_health` rollup. Boto
+    `ClientError`/`BotoCoreError` messages can carry the role ARN / account id / external
+    id. Mirroring `SentrySource.health()`, the detail must be a GENERIC auth/transport
+    summary (exception class name + region), never the raw message — so a sensitive token
+    embedded in the exception cannot reach the MCP client.
+    """
+    sensitive_arn = "arn:aws:iam::999988887777:role/SuperSecretLeakRole"
+
+    class _LeakyStsClient:
+        """An sts stand-in whose assume_role raises a ClientError embedding the ARN."""
+
+        def assume_role(self, **kwargs: object) -> dict[str, object]:
+            raise ClientError(
+                error_response={
+                    "Error": {
+                        "Code": "AccessDenied",
+                        "Message": f"User is not authorized to assume {sensitive_arn}",
+                    }
+                },
+                operation_name="AssumeRole",
+            )
+
+    # The leaky client is structurally an STSClient for our single call path; cast via the
+    # injected seam (the source only ever calls `.assume_role(...)` on it).
+    source = CloudWatchSource(
+        _config(assume_role_arn=sensitive_arn, external_id=_EXTERNAL_ID),
+        sts_client=_LeakyStsClient(),  # type: ignore[arg-type]
+    )
+
+    health = source.health()
+
+    assert health.reachable is False
+    # The sensitive ARN must NOT appear anywhere in the surfaced detail.
+    assert sensitive_arn not in health.detail
+    assert "999988887777" not in health.detail
+    # The detail is still a useful, generic auth/transport summary.
+    assert "credential" in health.detail.lower() or "auth" in health.detail.lower()
 
 
 def test_health_reachable_when_no_assume_role_configured() -> None:

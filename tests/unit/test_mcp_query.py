@@ -80,6 +80,9 @@ def _now() -> datetime:
 class _FakeSource:
     """A typed fake `Source` returning fixed signals + a configurable health."""
 
+    # Default outage-fetch opt-out (most sources skip fetch when unreachable — F3a).
+    fetch_when_unreachable = False
+
     def __init__(
         self,
         source_type: str,

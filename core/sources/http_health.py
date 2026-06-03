@@ -63,6 +63,13 @@ class HttpHealthSource:
 
     type = "http-health"
 
+    # The outage IS the signal: `health()` returns reachable=False whenever the
+    # monitored endpoint is down, but `fetch()` is purpose-built to emit
+    # `panoptes_health_up=0` in exactly that state. Opt the collector into fetching even
+    # when unreachable so that mandated `0` reaches the store and the overview
+    # traffic-light goes RED rather than blank/stale (F3a).
+    fetch_when_unreachable = True
+
     def __init__(self, config: ConfigBlock, client: httpx.Client | None = None) -> None:
         """Read the required `url` and `env` from config; accept an optional client.
 

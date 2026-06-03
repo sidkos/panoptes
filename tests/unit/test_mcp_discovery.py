@@ -32,6 +32,7 @@ from core.config import (
 from core.errors import CapabilityError
 from core.mcp.context import QueryContext
 from core.mcp.tools_discovery import (
+    _substitute_env,
     describe_signal_catalog,
     get_dashboard_data,
     list_dashboards,
@@ -57,6 +58,9 @@ def _now() -> datetime:
 
 class _FakeSource:
     """A typed fake `Source` with a fixed capability set + a stamped `type`."""
+
+    # Default outage-fetch opt-out (most sources skip fetch when unreachable — F3a).
+    fetch_when_unreachable = False
 
     def __init__(self, source_type: str, capabilities: set[SignalKind]) -> None:
         self.type = source_type
@@ -273,6 +277,27 @@ def test_get_dashboard_data_breakout_env_does_not_corrupt_selector(tmp_path: Pat
         get_dashboard_data("inline", 'a"} or x{b="', QueryContext(config))
     # No selector was ever executed — the breakout never reached the store.
     assert store.queried_exprs == []
+
+
+def test_substitute_env_does_not_eat_longer_var_prefix() -> None:
+    """`$env` substitution must respect a word boundary, not match as a prefix (F3b).
+
+    A naive `expr.replace("$env", env)` corrupts any longer Grafana template var that
+    starts with `$env` — `$environment` becomes `prodironment`, `$env_id` becomes
+    `prod_id`. The word-boundary substitution must replace only the standalone `$env`
+    token, leaving `$environment` / `$env_id` intact.
+    """
+    expr = 'up{env=~"$env", scope="$environment", shard="$env_id"}'
+
+    substituted = _substitute_env(expr, "prod")
+
+    # The standalone `$env` was substituted...
+    assert 'env=~"prod"' in substituted
+    # ...but the longer vars were left untouched (no greedy prefix corruption).
+    assert "$environment" in substituted
+    assert "$env_id" in substituted
+    assert "prodironment" not in substituted
+    assert "prod_id" not in substituted
 
 
 def test_describe_signal_catalog_only_lists_enabled_env_sources() -> None:

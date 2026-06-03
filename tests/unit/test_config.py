@@ -99,6 +99,9 @@ def _now() -> datetime:
 class _FakeSource:
     """Typed fake `Source`. Its `capabilities()` are set by the registered type."""
 
+    # Default outage-fetch opt-out (most sources skip fetch when unreachable — F3a).
+    fetch_when_unreachable = False
+
     def __init__(self, config: ConfigBlock, capabilities: set[SignalKind]) -> None:
         self.config = config
         self._capabilities = capabilities

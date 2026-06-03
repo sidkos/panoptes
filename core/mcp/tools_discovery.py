@@ -26,6 +26,7 @@ generation for the nested-`TypedDict` return shapes defined here.
 """
 
 import json
+import re
 from typing import TypedDict
 
 from core.errors import CapabilityError
@@ -269,13 +270,23 @@ def _substitute_env(expr: str, env: str) -> str:
     `=~"$env"`); v0.1 substitutes the literal `$env` token so the executed PromQL
     is scoped to the requested environment.
 
+    Substitution is WORD-BOUNDARY-anchored (`\\$env\\b`), not a plain `.replace`, so the
+    `$env` token is matched only as a standalone variable — never as a PREFIX of a longer
+    Grafana var. A naive `.replace("$env", env)` corrupts `$environment` → `prodironment`
+    and `$env_id` → `prod_id`; the `\\b` ensures only the lone `$env` is replaced (F3b).
+
     The substituted value is ESCAPED via the canonical `escape_promql_value` primitive
     (F2a / F2d) so a `"`/`\\` in the env can never break out of the surrounding quoted
-    selector. `get_dashboard_data` already rejects an unknown env, so a valid env name
-    needs no escaping in practice; this is defense in depth so a future caller of
+    selector. The escaped value is injected via a lambda (not as the replacement string)
+    so a `\\`/`\\g`-shaped escape product can never be reinterpreted as a `re.sub`
+    backreference. `get_dashboard_data` already rejects an unknown env, so a valid env
+    name needs no escaping in practice; this is defense in depth so a future caller of
     `_substitute_env` cannot reintroduce the F7-class injection here.
     """
-    return expr.replace("$env", escape_promql_value(env))
+    replacement = escape_promql_value(env)
+    # `lambda _: replacement` returns the escaped value verbatim — re.sub never parses it
+    # for backreferences, so a `\g`/`\1` inside an escaped env can't corrupt the output.
+    return re.sub(r"\$env\b", lambda _match: replacement, expr)
 
 
 def _serialize_series(series: MetricSeries) -> MetricSeriesData:

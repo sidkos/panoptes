@@ -74,13 +74,18 @@ _REDACTED = "[REDACTED]"
 #   `"api_key"`/`"token":"..."` JSON fields — none were covered at all.
 
 # (1) Any `Authorization:`/`Authorization=` header — redact its value (an OPTIONAL scheme
-# word `Bearer`/`Token`/`Basic`/… plus the single credential token, which is one
-# whitespace-delimited run). Runs FIRST and consumes the scheme token, so the
-# standalone-scheme rule (2) never double-fires on an `Authorization: Bearer X` (the old
-# `[REDACTED] [REDACTED]` bug). Redacting a single `\S+` token (not the whole rest of
-# line) keeps any trailing diagnostic prose like `— denied` in the surfaced message. A
-# credential is always a single token, so this captures Bearer/Token/Basic values fully.
-_AUTH_HEADER_RE = re.compile(r"(?i)(authorization)\s*[:=]\s*(?:[A-Za-z]+\s+)?\S+")
+# word `Bearer`/`Token`/`Basic`/… plus the single credential token). The credential token
+# is matched as `[^\s,]+` — one run of non-whitespace, NON-COMMA chars — so it stops at a
+# comma, the multi-header separator (e.g. `Authorization: Bearer X, X-Other: Y`): the comma
+# and the following header survive in the redacted message rather than being swallowed. (A
+# plain `\S+` would consume a trailing comma too; over-redacting it is harmless since the
+# value is fully `[REDACTED]`, but stopping at the comma preserves the multi-header
+# structure the surfaced diagnostic relies on — F3e.) Runs FIRST and consumes the scheme
+# token, so the standalone-scheme rule (2) never double-fires on `Authorization: Bearer X`
+# (the old `[REDACTED] [REDACTED]` bug). Redacting a single token (not the whole rest of
+# line) keeps trailing diagnostic prose like `— denied`; a credential is always one token,
+# so this captures Bearer/Token/Basic values fully.
+_AUTH_HEADER_RE = re.compile(r"(?i)(authorization)\s*[:=]\s*(?:[A-Za-z]+\s+)?[^\s,]+")
 
 # (2) A standalone `Bearer <token>` / `Token <token>` scheme token NOT prefixed by an
 # Authorization header (already redacted by rule 1). The char class is base64url-complete

@@ -16,6 +16,15 @@ class Source(Protocol):
 
     type: str
 
+    # Whether the collector should still run `fetch()` when `health()` reports
+    # `reachable=False`. Defaults to False — for most sources (cloudwatch/sentry) an
+    # unreachable result means "no usable credentials/transport", so fetching is
+    # pointless and its signals must NOT reach the store. http-health is the deliberate
+    # exception: it maps `reachable=False` to "the MONITORED endpoint is down" and its
+    # fetch is purpose-built to emit `panoptes_health_up=0` in exactly that state, so it
+    # sets this True — the outage IS the signal and must reach the store (F3a).
+    fetch_when_unreachable: bool
+
     def capabilities(self) -> set[SignalKind]:
         """The signal kinds this source can emit (its plane contract)."""
         ...

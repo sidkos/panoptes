@@ -120,6 +120,11 @@ class CloudWatchSource:
 
     type = "cloudwatch"
 
+    # An unreachable cloudwatch source means credentials/transport are unusable, so a
+    # fetch is pointless and its signals must NOT reach the store — keep the collector's
+    # default skip-on-unreachable behavior (F3a).
+    fetch_when_unreachable = False
+
     def __init__(
         self,
         config: ConfigBlock,
@@ -181,13 +186,25 @@ class CloudWatchSource:
         try:
             self._resolve_credentials()
         except (ClientError, BotoCoreError) as exc:
+            # Mirror SentrySource.health(): the surfaced `detail` reaches the MCP-visible
+            # `describe_health` rollup, and a raw `str(ClientError/BotoCoreError)` can echo
+            # the role ARN / account id / external id. Report only a GENERIC auth/transport
+            # summary (exception class + region), never the verbatim message (F3c).
             return SourceHealth(
                 reachable=False,
-                detail=f"cloudwatch credential resolution failed: {exc}",
+                detail=f"cloudwatch credential resolution failed "
+                f"(auth/transport error: {type(exc).__name__}, region {self._region})",
                 checked_at=checked_at,
             )
         except PanoptesError as exc:
-            return SourceHealth(reachable=False, detail=str(exc), checked_at=checked_at)
+            # Same defense-in-depth: a PanoptesError raised during credential resolution
+            # is summarized by class name, not its (potentially detail-bearing) message.
+            return SourceHealth(
+                reachable=False,
+                detail=f"cloudwatch credential resolution failed "
+                f"(auth/transport error: {type(exc.__cause__ or exc).__name__})",
+                checked_at=checked_at,
+            )
         return SourceHealth(
             reachable=True,
             detail=f"cloudwatch credentials resolved for region {self._region}",

@@ -51,6 +51,11 @@ def _metric(env: str, name: str) -> MetricSignal:
 class _FakeSource:
     """A `Source` that emits one named metric per fetch and is always healthy."""
 
+    # The default for the `Source` Protocol's outage-fetch opt-in: most sources treat
+    # `reachable=False` as "no usable signal, skip the fetch". http-health overrides
+    # this to True because its outage IS the signal (panoptes_health_up=0).
+    fetch_when_unreachable = False
+
     def __init__(self, env: str, type_name: str) -> None:
         self.type = type_name
         self._env = env
@@ -100,6 +105,31 @@ class _UnreachableSource(_FakeSource):
         )
 
 
+class _OutageSignalSource(_FakeSource):
+    """A `Source` mirroring http-health: health() returns reachable=False during an
+    outage, but fetch() deliberately emits the down signal (panoptes_health_up=0.0).
+
+    `fetch_when_unreachable=True` tells the collector the unreachable state IS the
+    signal, so it must still run the fetch and let the `0` reach the store (F3a).
+    """
+
+    fetch_when_unreachable = True
+
+    def health(self) -> SourceHealth:
+        self.health_calls += 1
+        return SourceHealth(
+            reachable=False, detail="endpoint down (latency 12.0ms)", checked_at=_now()
+        )
+
+    def fetch(self, window: TimeWindow) -> list[CanonicalSignal]:
+        self.fetch_calls += 1
+        return [
+            MetricSignal(
+                name="panoptes_health_up", value=0.0, timestamp=_now(), labels={"env": self._env}
+            )
+        ]
+
+
 class _SlowSource(_FakeSource):
     """A `Source` whose `fetch()` blocks until released — drives the timeout bound."""
 
@@ -109,9 +139,13 @@ class _SlowSource(_FakeSource):
 
     def fetch(self, window: TimeWindow) -> list[CanonicalSignal]:
         self.fetch_calls += 1
-        # Block on the event with a short ceiling so the worker thread never leaks
-        # past the test even though the collector abandons the future on timeout.
-        self._release.wait(timeout=5.0)
+        # Block on the event with a SHORT ceiling (0.2s) so the worker self-releases
+        # quickly and the per-cycle executor's shutdown(wait=True) at run_once() exit is
+        # bounded to a fraction of a second. The timeout-abandonment assertions still
+        # hold: fetch_timeout_seconds=0 abandons the future immediately, so the slow
+        # signals never reach the store regardless of this ceiling — the ceiling only
+        # bounds teardown, it is not the thing under test (F3d).
+        self._release.wait(timeout=0.2)
         return [_metric(self._env, "panoptes_slow_count")]
 
 
@@ -250,6 +284,35 @@ def test_unreachable_source_is_skipped_and_sibling_still_stored(
     assert healthy.fetch_calls == 1
     assert store.written_names() == {"panoptes_sentry_count"}
     assert "cloudwatch" in caplog.text
+
+
+def test_outage_signal_source_is_fetched_despite_unreachable_health() -> None:
+    """An http-health-style source still emits its down signal during an outage (F3a).
+
+    Its health() reports reachable=False (the monitored endpoint is down), but because
+    it opts in via fetch_when_unreachable=True, the collector must STILL run the fetch so
+    the mandated derived metric panoptes_health_up=0 reaches the store — that 0 is what
+    turns the overview traffic-light RED. Skipping it would leave the light blank/stale
+    exactly when it must show the outage.
+    """
+    store = _RecordingStore()
+    outage = _OutageSignalSource("dev", "http-health")
+    env = _enabled_env("dev", [_resolved(outage)])
+    collector = Collector(_config({"dev": env}, store))
+
+    collector.run_once()
+
+    # The fetch ran despite reachable=False, and the down signal landed in the store.
+    assert outage.fetch_calls == 1
+    assert "panoptes_health_up" in store.written_names()
+    # The actual outage value (0.0) reached the store — not merely the metric name.
+    down_values = [
+        signal.value
+        for batch in store.batches
+        for signal in batch
+        if isinstance(signal, MetricSignal) and signal.name == "panoptes_health_up"
+    ]
+    assert down_values == [0.0]
 
 
 def test_store_write_failure_is_caught_and_loop_continues(

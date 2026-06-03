@@ -38,6 +38,9 @@ from core.planes.store import Store
 class _FakeSource:
     """A typed fake `Source` advertising a fixed capability set."""
 
+    # Default outage-fetch opt-out (most sources skip fetch when unreachable — F3a).
+    fetch_when_unreachable = False
+
     def __init__(self, source_type: str, capabilities: set[SignalKind]) -> None:
         self.type = source_type
         self._capabilities = capabilities

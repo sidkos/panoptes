@@ -33,6 +33,8 @@ class _FakeSource:
     """
 
     type = "fake"
+    # Default outage-fetch opt-out (most sources skip fetch when unreachable — F3a).
+    fetch_when_unreachable = False
 
     def __init__(self, config: ConfigBlock) -> None:
         self.config = config

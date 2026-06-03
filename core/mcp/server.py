@@ -137,7 +137,12 @@ class PanoptesMcpServer:
         # (currently the v0.2 stubs, which already match the `_ToolCallable` shape).
         self._callables: dict[str, _ToolCallable] = {}
 
-    def _register_tool[**ToolParams](self, name: str, fn: Callable[ToolParams, object]) -> None:
+    def _register_tool[**ToolParams](
+        self,
+        name: str,
+        fn: Callable[ToolParams, object],
+        invoker: _ToolCallable | None = None,
+    ) -> None:
         """Register a real-signature tool wrapper under `name` with FastMCP.
 
         `fn` keeps its real (typed, nested-`TypedDict`) signature so FastMCP can
@@ -145,9 +150,21 @@ class PanoptesMcpServer:
         `name` (independent of the wrapper's `__name__`). The name is mirrored into
         `_tool_names` for the synchronous structural read-only assertion. A
         `ParamSpec` keeps this `Any`-free while accepting any concrete wrapper.
+
+        `invoker` is an OPTIONAL separate uniform-shape (`_ToolCallable`) handle that
+        calls the SAME underlying tool logic. When supplied (every v0.1 core tool does),
+        it is stored in `_callables` so a synchronous unit test can invoke that tool
+        directly via `tool_callable(name)(...)` — without driving FastMCP's async stdio
+        transport. FastMCP rejects `*args`/`**kwargs` tools, so the introspectable `fn`
+        and the uniform `invoker` must be two separate handles (mirroring
+        `_register_stub`). It stays OPTIONAL so the documented consumer-pack seam —
+        `server._register_tool(name, fn)` — keeps working unchanged; a pack that wants
+        the same synchronous invocability passes its own invoker.
         """
         self.mcp.tool(name, fn)
         self._tool_names.append(name)
+        if invoker is not None:
+            self._callables[name] = invoker
 
     def _register_stub[**ToolParams](
         self, name: str, fastmcp_fn: Callable[ToolParams, object], invoker: _ToolCallable
@@ -169,7 +186,11 @@ class PanoptesMcpServer:
         return list(self._tool_names)
 
     def tool_callable(self, name: str) -> _ToolCallable:
-        """The bound callable for a stub tool (for the synchronous v0.2-stub test)."""
+        """The bound uniform-shape callable for a registered tool (synchronous test seam).
+
+        Covers both the real v0.1 tools (their `invoker` handle) and the v0.2 stubs, so a
+        unit test can invoke either directly without driving FastMCP's async transport.
+        """
         return self._callables[name]
 
     def run(self) -> None:
@@ -234,6 +255,46 @@ def build_server(
     return server
 
 
+# --- Uniform-invoker kwarg coercion (F3f synchronous test seam) ----------------------
+# The `_ToolCallable` invoker shape is `(*args: object, **kwargs: object)`, so a test
+# passes tool args by keyword and these helpers narrow each `object` value back to the
+# concrete type the underlying core function needs — `object`-typed and isinstance-guarded
+# so they carry no `Any` and never silently coerce a wrong-typed test argument.
+
+
+def _str_kwarg(kwargs: dict[str, object], key: str) -> str:
+    """Return the required str-valued kwarg `key`, raising on absence/wrong type."""
+    value = kwargs.get(key)
+    if not isinstance(value, str):
+        raise TypeError(f"tool invoker expected str kwarg '{key}', got {type(value).__name__}")
+    return value
+
+
+def _opt_str_kwarg(kwargs: dict[str, object], key: str) -> str | None:
+    """Return an optional str-valued kwarg `key` (None when absent), raising on wrong type."""
+    value = kwargs.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"tool invoker expected str|None kwarg '{key}', got {type(value).__name__}")
+    return value
+
+
+def _str_dict_kwarg(kwargs: dict[str, object], key: str) -> dict[str, str] | None:
+    """Return an optional `dict[str, str]` kwarg `key` (None when absent/empty)."""
+    value = kwargs.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise TypeError(f"tool invoker expected dict kwarg '{key}', got {type(value).__name__}")
+    coerced: dict[str, str] = {}
+    for inner_key, inner_value in value.items():
+        if not isinstance(inner_key, str) or not isinstance(inner_value, str):
+            raise TypeError(f"tool invoker expected dict[str, str] for kwarg '{key}'")
+        coerced[inner_key] = inner_value
+    return coerced
+
+
 def _core_registrars(
     context: QueryContext,
 ) -> Mapping[str, Callable[[PanoptesMcpServer, str], None]]:
@@ -244,26 +305,42 @@ def _core_registrars(
     precise nested-`TypedDict` shapes from `tools_discovery` / `tools_query`.
     """
 
+    # Each registrar binds `context` into TWO handles for its tool: the introspectable
+    # `*_tool` wrapper (FastMCP schema generation) and a uniform `_ToolCallable` invoker
+    # (the synchronous unit-test seam). Both close over the same core function, so the
+    # invoker is a faithful, transport-free stand-in for the registered tool (F3f).
+
     def register_describe_signal_catalog(server: PanoptesMcpServer, name: str) -> None:
         def describe_signal_catalog_tool() -> SignalCatalog:
             """List environments, configured sources + capabilities, metrics, dashboards."""
             return describe_signal_catalog(context)
 
-        server._register_tool(name, describe_signal_catalog_tool)
+        def invoker(*_args: object, **_kwargs: object) -> object:
+            return describe_signal_catalog(context)
+
+        server._register_tool(name, describe_signal_catalog_tool, invoker)
 
     def register_list_dashboards(server: PanoptesMcpServer, name: str) -> None:
         def list_dashboards_tool() -> list[DashboardSummary]:
             """Return the dashboard catalog (core + injected consumer packs)."""
             return list_dashboards(context.dashboard_packs)
 
-        server._register_tool(name, list_dashboards_tool)
+        def invoker(*_args: object, **_kwargs: object) -> object:
+            return list_dashboards(context.dashboard_packs)
+
+        server._register_tool(name, list_dashboards_tool, invoker)
 
     def register_get_dashboard_data(server: PanoptesMcpServer, name: str) -> None:
         def get_dashboard_data_tool(dashboard_id: str, env: str) -> DashboardData:
             """Execute one dashboard's panels for `env`: title + PromQL + series."""
             return get_dashboard_data(dashboard_id, env, context)
 
-        server._register_tool(name, get_dashboard_data_tool)
+        def invoker(*_args: object, **kwargs: object) -> object:
+            return get_dashboard_data(
+                _str_kwarg(kwargs, "dashboard_id"), _str_kwarg(kwargs, "env"), context
+            )
+
+        server._register_tool(name, get_dashboard_data_tool, invoker)
 
     def register_query_metric(server: PanoptesMcpServer, name: str) -> None:
         def query_metric_tool(
@@ -272,7 +349,16 @@ def _core_registrars(
             """Run a PromQL passthrough query for a metric against the store."""
             return query_metric(context, env=env, name=metric, window=window, filters=filters)
 
-        server._register_tool(name, query_metric_tool)
+        def invoker(*_args: object, **kwargs: object) -> object:
+            return query_metric(
+                context,
+                env=_str_kwarg(kwargs, "env"),
+                name=_str_kwarg(kwargs, "metric"),
+                window=_str_kwarg(kwargs, "window"),
+                filters=_str_dict_kwarg(kwargs, "filters"),
+            )
+
+        server._register_tool(name, query_metric_tool, invoker)
 
     def register_search_incidents(server: PanoptesMcpServer, name: str) -> None:
         def search_incidents_tool(
@@ -281,7 +367,16 @@ def _core_registrars(
             """Search incident signals for `env` (or fan out across all enabled envs)."""
             return search_incidents(context, env=env, window=window, tag=tag, level=level)
 
-        server._register_tool(name, search_incidents_tool)
+        def invoker(*_args: object, **kwargs: object) -> object:
+            return search_incidents(
+                context,
+                env=_str_kwarg(kwargs, "env"),
+                window=_str_kwarg(kwargs, "window"),
+                tag=_opt_str_kwarg(kwargs, "tag"),
+                level=_opt_str_kwarg(kwargs, "level"),
+            )
+
+        server._register_tool(name, search_incidents_tool, invoker)
 
     def register_search_logs(server: PanoptesMcpServer, name: str) -> None:
         def search_logs_tool(
@@ -290,14 +385,26 @@ def _core_registrars(
             """Search log signals for `env` (or fan out across all enabled envs)."""
             return search_logs(context, env=env, query=query, window=window, level=level)
 
-        server._register_tool(name, search_logs_tool)
+        def invoker(*_args: object, **kwargs: object) -> object:
+            return search_logs(
+                context,
+                env=_str_kwarg(kwargs, "env"),
+                query=_str_kwarg(kwargs, "query"),
+                window=_str_kwarg(kwargs, "window"),
+                level=_opt_str_kwarg(kwargs, "level"),
+            )
+
+        server._register_tool(name, search_logs_tool, invoker)
 
     def register_describe_health(server: PanoptesMcpServer, name: str) -> None:
         def describe_health_tool(env: str) -> HealthRollup:
             """Roll up per-source reachability + open-incident count for `env`."""
             return describe_health(context, env=env)
 
-        server._register_tool(name, describe_health_tool)
+        def invoker(*_args: object, **kwargs: object) -> object:
+            return describe_health(context, env=_str_kwarg(kwargs, "env"))
+
+        server._register_tool(name, describe_health_tool, invoker)
 
     return {
         "describe_signal_catalog": register_describe_signal_catalog,

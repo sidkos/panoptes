@@ -59,6 +59,8 @@ class _HealthySiblingSource:
     """A tiny healthy fake `Source` emitting one metric, alongside the denied cloudwatch."""
 
     type = "sentry"
+    # Default outage-fetch opt-out (most sources skip fetch when unreachable — F3a).
+    fetch_when_unreachable = False
 
     def __init__(self) -> None:
         self.fetch_calls = 0

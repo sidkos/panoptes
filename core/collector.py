@@ -9,9 +9,15 @@ no single source/env failure aborts a cycle:
 - A source `health()` or `fetch` raising is caught, logged (f-string), and the loop
   CONTINUES to the next source/env — a flaky upstream never stalls the whole run.
 - A source whose `health()` RETURNS `reachable=False` (e.g. a CloudWatch assume-role
-  denial, which the source surfaces as unreachable rather than raising) is skipped for
-  the cycle: its signals must not reach the store. It is recorded as a per-source failure
-  so the throttle + error log treat it like any other failure.
+  denial, which the source surfaces as unreachable rather than raising) is normally
+  skipped for the cycle: its signals must not reach the store. It is recorded as a
+  per-source failure so the throttle + error log treat it like any other failure.
+  The deliberate EXCEPTION is a source that sets `fetch_when_unreachable=True` on the
+  `Source` Protocol (http-health): for it `reachable=False` means "the MONITORED
+  endpoint is down" and its fetch emits the mandated outage signal
+  (`panoptes_health_up=0`) in exactly that state, so the collector still runs the fetch
+  and lets that `0` reach the store (skipping it would blank the overview traffic-light
+  precisely when it must show RED — F3a).
 - A `store.write()` raising (e.g. VM unreachable) is caught per-batch, logged, and
   the loop continues to the next env.
 - Each `fetch` is bounded by that source's `fetch_timeout_seconds` (spec default
@@ -178,12 +184,20 @@ class Collector:
         except Exception as exc:
             self._record_failure(env_name, key, source.type, f"health() failed: {exc}")
             return
-        # An UNREACHABLE source (e.g. a CloudWatch assume-role denial, which the source
-        # surfaces as reachable=False rather than raising) is skipped for this cycle: its
-        # fetch would attempt upstream calls with no usable credentials and its signals
-        # must NOT reach the store. Record it as a failure so the per-source throttle +
-        # error log treat it exactly like a fetch failure (resilience boundary, F2k).
-        if not health.reachable:
+        # An UNREACHABLE source is normally skipped for this cycle: its fetch would
+        # attempt upstream calls with no usable credentials and its signals must NOT
+        # reach the store (e.g. a CloudWatch assume-role denial, surfaced as
+        # reachable=False rather than raising). Record it as a failure so the per-source
+        # throttle + error log treat it exactly like a fetch failure (resilience
+        # boundary, F2k).
+        #
+        # The deliberate EXCEPTION is a source that opts in via
+        # `fetch_when_unreachable=True` (http-health): for it, `reachable=False` means
+        # "the MONITORED endpoint is down" and its fetch is purpose-built to emit the
+        # outage signal (panoptes_health_up=0) in exactly that state. Skipping it would
+        # drop that 0 — leaving the overview traffic-light blank/stale precisely when it
+        # must show RED — so we fall through to the fetch (F3a).
+        if not health.reachable and not source.fetch_when_unreachable:
             self._record_failure(
                 env_name, key, source.type, f"health() reported unreachable: {health.detail}"
             )

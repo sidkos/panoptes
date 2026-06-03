@@ -183,6 +183,30 @@ def test_failure_body_redacts_non_bearer_credentials(leaky_body: str, secret: st
 
 
 @respx.mock
+def test_failure_body_authorization_redaction_stops_at_comma_separator() -> None:
+    """The Authorization-value redaction stops at the comma multi-header separator (F3e).
+
+    The redaction comment documents the rule as stopping at "a comma, the multi-header
+    separator". With a plain `\\S+` the value run swallowed a trailing comma; anchoring it
+    to `[^\\s,]+` makes the documented behavior real, so a comma-separated following header
+    survives intact in the surfaced message (the secret is still fully redacted).
+    """
+    leaky_body = "rejected: Authorization: Bearer secrettoken123, X-Other: keepme denied"
+    respx.get(_URL).mock(return_value=httpx.Response(403, text=leaky_body))
+    client = RestClient()
+
+    with pytest.raises(PanoptesError) as excinfo:
+        client.get_json(_URL, prefix="thing fetch failed", identifier=_URL)
+
+    message = str(excinfo.value)
+    # The credential is fully redacted...
+    assert "secrettoken123" not in message
+    assert "[REDACTED]" in message
+    # ...and the comma separator + the following header survive (not swallowed by `\\S+`).
+    assert ", X-Other: keepme" in message
+
+
+@respx.mock
 def test_failure_body_bearer_redacts_cleanly_without_double_marker() -> None:
     """`Authorization: Bearer x` redacts once, not `[REDACTED] [REDACTED]` (F2b).
 

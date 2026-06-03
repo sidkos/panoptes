@@ -85,6 +85,11 @@ class SentrySource:
 
     type = "sentry"
 
+    # An unreachable sentry source means the API is unreachable / the token is bad, so a
+    # fetch is pointless and its signals must NOT reach the store — keep the collector's
+    # default skip-on-unreachable behavior (F3a).
+    fetch_when_unreachable = False
+
     def __init__(
         self,
         config: ConfigBlock,
