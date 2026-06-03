@@ -239,6 +239,32 @@ def test_get_dashboard_data_unknown_id_raises_capability_error(tmp_path: Path) -
     assert "does-not-exist" in str(excinfo.value)
 
 
+def test_get_dashboard_data_invalid_json_layout_raises_naming_the_id(tmp_path: Path) -> None:
+    """An unparseable dashboard JSON file → a clear CapabilityError naming the dashboard id."""
+    bad_path = tmp_path / "dashboard.json"
+    bad_path.write_text("{ this is not valid json", encoding="utf-8")
+    packs = [DashboardPack(id="broken", tier="core", json_path=bad_path)]
+    config = _build_config(_FakeStore([]), dashboard_packs=packs)
+
+    with pytest.raises(CapabilityError) as excinfo:
+        get_dashboard_data("broken", "dev", QueryContext(config))
+    assert "broken" in str(excinfo.value)
+
+
+def test_get_dashboard_data_non_object_json_layout_raises_naming_the_id(tmp_path: Path) -> None:
+    """A dashboard JSON that is a top-level ARRAY (not an object) → a clear CapabilityError."""
+    array_path = tmp_path / "dashboard.json"
+    array_path.write_text("[1, 2, 3]", encoding="utf-8")
+    packs = [DashboardPack(id="arraydash", tier="core", json_path=array_path)]
+    config = _build_config(_FakeStore([]), dashboard_packs=packs)
+
+    with pytest.raises(CapabilityError) as excinfo:
+        get_dashboard_data("arraydash", "dev", QueryContext(config))
+    message = str(excinfo.value)
+    assert "arraydash" in message
+    assert "JSON object" in message
+
+
 # --- F2a: get_dashboard_data PromQL injection (the F7 sibling sink) ---------------
 
 

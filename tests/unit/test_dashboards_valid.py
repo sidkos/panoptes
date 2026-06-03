@@ -278,6 +278,31 @@ def test_provision_pings_grafana_when_url_configured(tmp_path: Path) -> None:
         assert route.called, "provider must ping the Grafana search API when a url is configured"
 
 
+def test_grafana_ping_failure_message_strips_url_userinfo(tmp_path: Path) -> None:
+    """MAJOR-2: a `user:pass@host` Grafana URL does NOT leak its credential in a ping failure.
+
+    The provisioning-ping identifier is the search endpoint (built from the configured url); a
+    userinfo-bearing url would otherwise surface its credential in the raised error.
+    `_format_failure` strips `user:pass@`.
+    """
+    provisioning_dir = tmp_path / "provisioning"
+    grafana_url = "http://grafana-user:grafsecret@grafana:3000"
+    with respx.mock:
+        respx.get(f"{grafana_url}/api/search").mock(side_effect=httpx.ConnectError("refused"))
+        provider = GrafanaDashboardProvider(
+            {"provisioning_dir": str(provisioning_dir), "url": grafana_url}
+        )
+        try:
+            with pytest.raises(PanoptesError) as excinfo:
+                provider.provision(_core_packs())
+        finally:
+            provider.close()
+    message = str(excinfo.value)
+    assert "grafsecret" not in message, "the URL credential must not leak in the failure message"
+    assert "grafana-user" not in message
+    assert "grafana:3000" in message  # the host is still a non-secret diagnostic
+
+
 # --- negative paths this phase owns ---------------------------------------------
 
 

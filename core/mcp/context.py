@@ -22,6 +22,7 @@ annotations break FastMCP's schema generation for the tool returns that consume 
 from core.config import ResolvedConfig, ResolvedEnvironment, SloConfig
 from core.errors import CapabilityError
 from core.mcp._metric_helpers import (
+    _PROMQL_IDENTIFIER_RE,
     _latest_value,
     _step_seconds_for,
     _window_for,
@@ -102,15 +103,24 @@ class QueryContext:
         cluster snapshots), and `describe_health` simply omits an absent metric.
 
         Args:
-            metric: The gauge metric name (a `panoptes_*` series the store carries).
+            metric: The gauge metric name — a PromQL identifier (`[A-Za-z_][A-Za-z0-9_:]*`).
             env: The environment to scope the read to. It is escaped UNCONDITIONALLY (F7) —
                 a caller must NEVER interpolate `env` into a selector itself.
             window: The trailing window string (default `"15m"`, the prior internal default).
 
         Returns:
             The latest sample value across the resolved series, or `None` when the store has no
-            data OR could not answer PromQL (the `CapabilityError` is swallowed).
+            data OR could not answer PromQL (that `CapabilityError` is swallowed). A non-identifier
+            `metric` is a CONTRACT error and PROPAGATES (it is NOT swallowed to None).
         """
+        # Validate the metric BEFORE the swallow below, so a non-identifier name (a contract
+        # error) PROPAGATES rather than being masked as "no data". The store's passthrough
+        # CapabilityError is the only one this method swallows.
+        if not _PROMQL_IDENTIFIER_RE.match(metric):
+            raise CapabilityError(
+                f"Invalid metric name '{metric}': a metric name must be a PromQL identifier "
+                f"([A-Za-z_][A-Za-z0-9_:]*)."
+            )
         try:
             series = self.read_series(metric, env, window)
         except CapabilityError:
@@ -129,10 +139,14 @@ class QueryContext:
         env is marked down, not silently treated as an empty result.
 
         Like `read_gauge`, it OWNS the F7 escape: `escape_promql_value(env)` is applied
-        unconditionally, so a quote-bearing env stays a single closed selector string.
+        unconditionally, so a quote-bearing env stays a single closed selector string. It is
+        ALSO self-defending on the `metric` NAME: `metric` is spliced UNQUOTED into the
+        selector, so it is validated against the PromQL-identifier regex here (raising a
+        `CapabilityError` on a breakout name) rather than trusting every caller to pre-validate.
+        All current callers pass validated/constant metrics, so this changes no behaviour.
 
         Args:
-            metric: The metric name (a `panoptes_*` series the store carries).
+            metric: The metric name — a PromQL identifier (`[A-Za-z_][A-Za-z0-9_:]*`).
             env: The environment to scope the read to (escaped UNCONDITIONALLY, F7).
             window: The trailing window string (default `"15m"`).
 
@@ -140,9 +154,17 @@ class QueryContext:
             The raw `list[MetricSeries]` the store returned (possibly empty).
 
         Raises:
-            CapabilityError: the store cannot answer PromQL (e.g. a `passthrough` store) — left
-                to PROPAGATE so the caller can mark the env down.
+            CapabilityError: `metric` is not a valid PromQL identifier (rejected before any
+                query), OR the store cannot answer PromQL (e.g. a `passthrough` store) — the
+                latter left to PROPAGATE so the caller can mark the env down.
         """
+        # Self-defending on the unquoted metric name (F7): reject a breakout token before it
+        # reaches the selector, never relying solely on the caller to pre-validate.
+        if not _PROMQL_IDENTIFIER_RE.match(metric):
+            raise CapabilityError(
+                f"Invalid metric name '{metric}': a metric name must be a PromQL identifier "
+                f"([A-Za-z_][A-Za-z0-9_:]*)."
+            )
         # The escape is the security invariant (F7): never interpolate `env` raw.
         expr = f'{metric}{{env="{escape_promql_value(env)}"}}'
         # Go through the `store` property (the single store-access seam), not `_config.store`.

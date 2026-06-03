@@ -244,6 +244,17 @@ def test_health_unreachable_when_endpoint_down_does_not_raise() -> None:
 
 
 @respx.mock
+def test_health_failure_detail_does_not_leak_str_exc() -> None:
+    """A probe exception whose `str()` embeds a sensitive token does NOT reach health.detail."""
+    secret = "super-secret-probe-token-xyz"
+    respx.get(f"{_BASE}/ready").mock(side_effect=httpx.ConnectError(f"refused: {secret}"))
+    health = _source().health()
+    assert health.reachable is False
+    assert secret not in health.detail, "str(exc) must not leak into the loki health detail"
+    assert "ConnectError" in health.detail
+
+
+@respx.mock
 def test_health_reachable_when_endpoint_responds() -> None:
     """A responsive `/ready` (plain text) → `health()` reports reachable=True."""
     respx.get(f"{_BASE}/ready").mock(return_value=httpx.Response(200, text="ready"))

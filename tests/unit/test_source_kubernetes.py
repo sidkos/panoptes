@@ -388,6 +388,21 @@ def test_health_unreachable_when_api_down_does_not_raise() -> None:
     assert "kubernetes" in health.detail.lower()
 
 
+def test_health_failure_detail_does_not_leak_str_exc() -> None:
+    """A probe exception whose `str()` embeds a sensitive token does NOT reach health.detail.
+
+    Mirrors the sentry/cloudwatch leak guards at the kubernetes probe-lambda + source-label
+    layer: the api-error message (which could carry an SA token / endpoint) must NOT surface —
+    only the exception class name appears.
+    """
+    secret = "super-secret-sa-token-xyz"
+    api = _FakeCoreV1Api(raise_on=RuntimeError(f"unauthorized: {secret}"))
+    health = _source(api, env="dev", cluster="c1").health()
+    assert health.reachable is False
+    assert secret not in health.detail, "str(exc) must not leak into the kubernetes health detail"
+    assert "RuntimeError" in health.detail
+
+
 def test_health_reachable_when_api_responds() -> None:
     """A responsive API server → `health()` reports `reachable=True`."""
     api = _FakeCoreV1Api(nodes=[object(), object()])

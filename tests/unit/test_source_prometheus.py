@@ -215,6 +215,23 @@ def test_health_unreachable_when_endpoint_down_does_not_raise() -> None:
 
 
 @respx.mock
+def test_health_failure_detail_does_not_leak_str_exc() -> None:
+    """A probe exception whose `str()` embeds a sensitive token does NOT reach health.detail.
+
+    Mirrors the sentry/cloudwatch leak guards at the prometheus probe-lambda + source-label
+    layer: the failure detail must carry ONLY the exception class name, never the message text
+    (which a transport error could carry a credential/endpoint in).
+    """
+    secret = "super-secret-probe-token-xyz"
+    respx.get(f"{_BASE}/-/healthy").mock(side_effect=httpx.ConnectError(f"refused: {secret}"))
+    health = _source().health()
+    assert health.reachable is False
+    assert secret not in health.detail, "str(exc) must not leak into the prometheus health detail"
+    # Only the underlying transport class name is surfaced.
+    assert "ConnectError" in health.detail
+
+
+@respx.mock
 def test_health_reachable_when_endpoint_responds() -> None:
     """A responsive `/-/healthy` → `health()` reports reachable=True."""
     respx.get(f"{_BASE}/-/healthy").mock(

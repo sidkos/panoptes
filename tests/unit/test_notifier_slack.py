@@ -19,7 +19,10 @@ from core.model import Alert
 from core.notifiers.slack import SlackNotifier
 from core.registry import NOTIFIERS
 
-_WEBHOOK_URL = "https://hooks.slack.test/services/T000/B000/XXXX"
+# The webhook PATH carries a bearer-equivalent token. Use a DISTINCTIVE token so the
+# leak-absence tests can assert it never surfaces in a failure message.
+_WEBHOOK_TOKEN = "SuperSecretWebhookToken123"  # nosec B105 - a synthetic test value, not a real secret
+_WEBHOOK_URL = f"https://hooks.slack.test/services/T000/B000/{_WEBHOOK_TOKEN}"
 
 
 def _alert() -> Alert:
@@ -69,14 +72,20 @@ def test_notify_surfaces_response_body_on_http_error() -> None:
     message = str(excinfo.value)
     # The upstream body (the rejection reason) is surfaced, not just the status code.
     assert "invalid_payload" in message
+    # MAJOR-2: the webhook PATH token (the secret) must NOT appear in the failure message.
+    assert _WEBHOOK_TOKEN not in message, "the webhook token must not leak in the failure message"
+    # A non-secret diagnostic (the host) is still present.
+    assert "hooks.slack.test" in message
 
 
 def test_notify_surfaces_transport_error() -> None:
     """A connection/transport error surfaces as a PanoptesError (never a raw httpx error)."""
     with respx.mock:
         respx.post(_WEBHOOK_URL).mock(side_effect=httpx.ConnectError("refused"))
-        with pytest.raises(PanoptesError):
+        with pytest.raises(PanoptesError) as excinfo:
             _notifier().notify(_alert())
+    # MAJOR-2: the webhook token must NOT leak on the transport-error branch either.
+    assert _WEBHOOK_TOKEN not in str(excinfo.value)
 
 
 def test_missing_webhook_url_fails_fast() -> None:

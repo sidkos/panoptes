@@ -82,3 +82,21 @@ def test_register_core_adapters_is_idempotent(_cold_adapter_import_cache: None) 
     assert _EXPECTED_SOURCE_TYPES.issubset(SOURCES.available())
     assert _EXPECTED_STORE_TYPES.issubset(STORES.available())
     assert _EXPECTED_NOTIFIER_TYPES.issubset(NOTIFIERS.available())
+
+
+def test_core_adapters_are_already_registered_at_test_start() -> None:
+    """REGRESSION (MAJOR-1): the core adapters are present WITHOUT this test registering them.
+
+    The session-scoped autouse `_register_core_adapters_for_the_session` fixture (root conftest)
+    registers the core adapters ONCE before any per-test registry snapshot, so every test —
+    including this one, which calls NO registration itself — observes the populated baseline.
+    This pins the fix for the order-fragility where an in-fixture registration on the FIRST test
+    was wiped by the function-scoped snapshot/restore, leaving later tests with an empty registry
+    (`UnknownAdapterError: ... (none registered)`). If the session fixture regresses, this fails.
+    """
+    # NO register_core_adapters() call here — the session fixture already populated the tables.
+    assert _EXPECTED_SOURCE_TYPES.issubset(SOURCES.available()), (
+        "core source adapters must be registered at test start (session autouse fixture)"
+    )
+    assert _EXPECTED_STORE_TYPES.issubset(STORES.available())
+    assert _EXPECTED_NOTIFIER_TYPES.issubset(NOTIFIERS.available())

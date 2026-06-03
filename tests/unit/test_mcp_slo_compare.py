@@ -253,6 +253,20 @@ def test_get_slo_at_objective_boundary_is_met_with_zero_budget() -> None:
     assert result["error_budget_remaining"] == pytest.approx(0.0)
 
 
+def test_get_slo_rejects_a_non_identifier_query() -> None:
+    """F7: an SLO whose `query` is not a bare metric name is rejected with a clear error.
+
+    `_slo_actual` reads the query via `read_gauge`, which wraps it with an `env=` selector, so a
+    non-identifier query (a full selector / breakout token) would corrupt the selector. The
+    contract is pinned: the SLO query must be a PromQL identifier — a malformed one fails clearly.
+    """
+    slo: SloConfig = {"name": "bad", "objective": 0.99, "query": 'up"} or up{'}
+    config = _config({"dev": _env("dev")}, store=_ValueStore({"dev": 1.0}), slos=[slo])
+    with pytest.raises(CapabilityError) as excinfo:
+        get_slo(QueryContext(config), env="dev", name="bad")
+    assert "query" in str(excinfo.value).lower()
+
+
 def test_get_slo_degenerate_objective_met_reports_full_budget() -> None:
     """A degenerate objective=1.0 (zero-width budget) WITH actual==1.0 → met + full budget 1.0.
 

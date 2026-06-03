@@ -12,7 +12,9 @@ from datetime import UTC, datetime
 import pytest
 from core.mcp._metric_helpers import (
     _DEFAULT_WINDOW_MINUTES,
+    _MAX_WINDOW_MINUTES,
     _latest_value,
+    _window_for,
     _window_minutes,
 )
 from core.model import MetricSeries
@@ -105,3 +107,30 @@ def test_window_minutes_negative_falls_back_to_default_with_warning(
         result = _window_minutes("-5")
     assert result == _DEFAULT_WINDOW_MINUTES
     assert any("-5" in record.getMessage() for record in caplog.records)
+
+
+def test_window_minutes_huge_integer_is_clamped_not_overflow(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """MINOR-3: a client-supplied huge bare-integer window is CLAMPED to the ceiling, never raised.
+
+    `window` is a client-controlled MCP param; an unbounded huge integer would make
+    `TimeWindow.last(minutes=<huge>)` raise `OverflowError` (a DoS over the HTTP face). The
+    parser clamps it to the 7d ceiling with a warning instead.
+    """
+    huge = "9" * 20  # billions of minutes — `timedelta` would overflow at this magnitude.
+    with caplog.at_level(logging.WARNING):
+        result = _window_minutes(huge)
+    assert result == _MAX_WINDOW_MINUTES, "a too-large window must clamp to the ceiling"
+    assert any("clamp" in record.getMessage().lower() for record in caplog.records)
+
+
+def test_window_for_huge_integer_builds_a_window_without_raising() -> None:
+    """The clamp flows through `_window_for`: a huge window builds a TimeWindow, not OverflowError.
+
+    This is the end-to-end DoS guard: `_window_for` (called by compare_envs/query_metric) must
+    not raise on a huge client window — it builds a bounded 7d window via the clamp.
+    """
+    window = _window_for("9" * 20)
+    span_minutes = round((window.end - window.start).total_seconds() / 60)
+    assert span_minutes == _MAX_WINDOW_MINUTES

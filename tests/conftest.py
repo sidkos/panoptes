@@ -24,6 +24,7 @@ singleton identities at import time; replacing the objects would orphan those bi
 from collections.abc import Callable, Iterator
 
 import pytest
+from core.bootstrap import register_core_adapters
 from core.registry import (
     DASHBOARD_PROVIDERS,
     NOTIFIERS,
@@ -32,6 +33,29 @@ from core.registry import (
     ConfigBlock,
     Registry,
 )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _register_core_adapters_for_the_session() -> None:
+    """Populate the plane registries with the core adapters ONCE, before any per-test snapshot.
+
+    Root cause of the order-fragility (MAJOR-1, cycle 3): `register_core_adapters()` registers
+    a `type` only when its module body RUNS, which under Python's import cache happens exactly
+    once per process. A fixture that called it INSIDE a test (e.g. `mcp_http_server`) would —
+    on a cold run where that test is FIRST — register into a table the function-scoped
+    `_isolate_global_registries` had ALREADY snapshotted EMPTY, so teardown would restore the
+    table to empty and wipe the core adapters for every later test (the integration suite then
+    failed when `test_mcp_http_e2e.py` ran in isolation: 2 passed, 4 `UnknownAdapterError`).
+
+    Running registration HERE, in a SESSION-scoped autouse fixture, fixes it structurally:
+    pytest sets up higher-scoped autouse fixtures BEFORE lower-scoped ones, so this runs once
+    before the FIRST function-scoped `_isolate_global_registries` snapshot — every per-test
+    snapshot therefore captures the POPULATED baseline, and the restore preserves it. No
+    integration fixture needs to register adapters itself any more, and single-file +
+    full-suite runs are both stable regardless of order. (`test_bootstrap` still exercises the
+    genuine cold-import registration via its own `_cold_adapter_import_cache` module eviction.)
+    """
+    register_core_adapters()
 
 
 def _restore_table[PlaneT](

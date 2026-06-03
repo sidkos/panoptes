@@ -275,7 +275,16 @@ def _format_failure(prefix: str, identifier: str, exc: httpx.HTTPError) -> str:
     - **no response** (a connection/timeout error such as `httpx.ConnectError`): there is
       nothing to read, so fall back to the exception's own message — and critically, do
       not touch `exc.response` (it is absent and would crash).
+
+    `identifier` is sanitized via `redact_url_userinfo` before interpolation: a caller often
+    passes an endpoint URL there (the VM store / sentry / grafana-ping call sites), and a
+    `https://user:pass@host` URL would otherwise leak its embedded credential into operator
+    logs and the MCP-visible error on EVERY failure (MAJOR-2). Note this strips only `user:pass@`
+    userinfo — a path-embedded token (e.g. a Slack `hooks.slack.com/services/.../<token>` URL)
+    is NOT a URL credential `redact_url_userinfo` can see, so a caller whose identifier IS such a
+    secret must pass a NON-secret identifier instead (SlackNotifier does).
     """
+    safe_identifier = redact_url_userinfo(identifier)
     response = getattr(exc, "response", None)
     if response is not None:
         # Trim first (bound the work + the log), then redact any reflected bearer token /
@@ -283,11 +292,12 @@ def _format_failure(prefix: str, identifier: str, exc: httpx.HTTPError) -> str:
         # into operator logs or the MCP client (F4).
         body = _redact_secrets(response.text[:_BODY_TRIM_CHARS])
         return (
-            f"{prefix} ({identifier}): HTTP {response.status_code}. Upstream response body: {body}"
+            f"{prefix} ({safe_identifier}): HTTP {response.status_code}. "
+            f"Upstream response body: {body}"
         )
     # Connection error — no response object; surface the underlying exception text (also
     # redacted defensively, in case a transport error message carries a reflected header).
-    return f"{prefix} ({identifier}): {_redact_secrets(str(exc))}"
+    return f"{prefix} ({safe_identifier}): {_redact_secrets(str(exc))}"
 
 
 def _redact_secrets(text: str) -> str:

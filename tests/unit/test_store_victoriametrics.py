@@ -500,3 +500,36 @@ def test_query_connection_error_raises_without_response() -> None:
     message = str(excinfo.value)
     assert "boom" in message
     assert "/api/v1/query_range" in message
+
+
+def test_query_failure_message_strips_url_userinfo() -> None:
+    """MAJOR-2: a `user:pass@host` store URL does NOT leak its credential in a query failure."""
+    url = "http://vm-user:vmsecret@victoriametrics:8428"
+    store = VictoriaMetricsStore({"url": url})
+    with respx.mock:
+        respx.get(f"{url}/api/v1/query_range").mock(side_effect=httpx.ConnectError("refused"))
+        with pytest.raises(PanoptesError) as excinfo:
+            store.query(_query())
+    message = str(excinfo.value)
+    assert "vmsecret" not in message, "the URL credential must not leak in the failure message"
+    assert "vm-user" not in message
+    assert "victoriametrics" in message  # the host is still a useful, non-secret diagnostic
+
+
+def test_import_failure_message_strips_url_userinfo() -> None:
+    """MAJOR-2: a `user:pass@host` store URL does NOT leak its credential in an import failure."""
+    url = "http://vm-user:vmsecret@victoriametrics:8428"
+    store = VictoriaMetricsStore({"url": url})
+    sample = MetricSignal(
+        name="panoptes_health_up",
+        value=1.0,
+        timestamp=_FIXED_TIMESTAMP,
+        labels={"env": "dev"},
+    )
+    with respx.mock:
+        respx.post(f"{url}/api/v1/import").mock(return_value=httpx.Response(500, text="boom"))
+        with pytest.raises(PanoptesError) as excinfo:
+            store.write([sample])
+    message = str(excinfo.value)
+    assert "vmsecret" not in message
+    assert "vm-user" not in message

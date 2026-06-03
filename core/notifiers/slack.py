@@ -15,6 +15,8 @@ A failed POST raises a typed `PanoptesError` (carrying the surfaced body) — a 
 failure must stay visible to the caller, never be swallowed.
 """
 
+from urllib.parse import urlsplit
+
 import httpx
 
 from core.model import Alert
@@ -42,6 +44,16 @@ class SlackNotifier:
         """
         # `webhook_url` is mandatory — the Slack incoming-webhook endpoint to POST to.
         self._webhook_url = require_str_field(config, "webhook_url", self.type)
+        # The Slack incoming-webhook URL IS the secret: its PATH carries a bearer-equivalent
+        # token (`hooks.slack.com/services/T.../B.../<SECRET>`). `_format_failure` interpolates
+        # the `identifier` into the surfaced/logged error, and `redact_url_userinfo` strips only
+        # `user:pass@` USERINFO — NOT a path token — so the full URL must NEVER be the identifier
+        # (it would leak the token on every delivery failure, MAJOR-2). Derive a NON-secret
+        # scheme+host identifier ONCE for diagnostics (e.g. `https://hooks.slack.com`); the
+        # secret path is dropped.
+        split = urlsplit(self._webhook_url)
+        host = split.hostname or "slack"
+        self._failure_identifier = f"{split.scheme}://{host}" if split.scheme else host
         self._rest = RestClient(client)
 
     def notify(self, alert: Alert) -> None:
@@ -62,4 +74,7 @@ class SlackNotifier:
 
         # `send` applies raise_for_status + the shared body-surfacing failure formatter, so
         # a rejected webhook is diagnosable in one cycle (the response body names the cause).
-        self._rest.send(_post, prefix="slack webhook post failed", identifier=self._webhook_url)
+        # The identifier is the NON-SECRET scheme+host (NOT the token-bearing full URL).
+        self._rest.send(
+            _post, prefix="slack webhook post failed", identifier=self._failure_identifier
+        )

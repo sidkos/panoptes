@@ -478,3 +478,24 @@ def test_fetch_failure_message_redacts_reflected_bearer_token() -> None:
     message = str(excinfo.value)
     assert _TOKEN not in message, "the raw bearer token must not leak into the error message"
     assert "[REDACTED]" in message
+
+
+@respx.mock
+def test_fetch_failure_message_strips_base_url_userinfo() -> None:
+    """MAJOR-2: a `user:pass@host` base_url does NOT leak its credential in a fetch failure.
+
+    The fetch identifier is the issues URL (built from `base_url`); a userinfo-bearing base_url
+    would otherwise surface its credential in the error. `_format_failure` strips `user:pass@`.
+    """
+    userinfo_base = "https://probe-user:urlsecret@sentry.example"
+    issues_url = f"{userinfo_base}/api/0/projects/{_ORG}/{_PROJECT}/issues/"
+    respx.get(issues_url).mock(side_effect=httpx.ConnectError("refused"))
+    source = SentrySource(
+        {"org": _ORG, "project": _PROJECT, "token": _TOKEN, "env": _ENV, "base_url": userinfo_base}
+    )
+    with pytest.raises(PanoptesError) as excinfo:
+        source.fetch(_WINDOW)
+    message = str(excinfo.value)
+    assert "urlsecret" not in message, "the URL credential must not leak in the failure message"
+    assert "probe-user" not in message
+    assert "sentry.example" in message  # the host is still a non-secret diagnostic

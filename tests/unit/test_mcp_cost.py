@@ -20,6 +20,7 @@ from core.config import (
     ResolvedSource,
 )
 from core.errors import CapabilityError
+from core.mcp._metric_helpers import _DEFAULT_WINDOW_MINUTES
 from core.mcp.context import QueryContext
 from core.mcp.tools_query import get_cost
 from core.model import (
@@ -199,3 +200,38 @@ def test_get_cost_spend_with_no_service_label_is_skipped() -> None:
     # The total includes both; the per_service map carries the labelled one.
     assert breakdown["total"] == pytest.approx(15.0)
     assert breakdown["per_service"].get("AmazonEC2") == 10.0
+
+
+def test_get_cost_window_arg_is_cosmetic_and_does_not_scope_the_read() -> None:
+    """The `window` arg is echoed but NEVER scopes the store read (the gauges are latest).
+
+    Pins the cosmetic-window contract: `get_cost(env, window='30d')` echoes `'30d'` into the
+    result, but the underlying store queries use the reader's DEFAULT window (15m) — the cost
+    gauges are the latest collected snapshot (the source already windowed the CE aggregation).
+    """
+
+    class _WindowRecordingStore:
+        type = "window-recording"
+
+        def __init__(self) -> None:
+            self.queries: list[MetricQuery] = []
+
+        def write(self, signals: list[CanonicalSignal]) -> None:
+            return None
+
+        def query(self, query: MetricQuery) -> list[MetricSeries]:
+            self.queries.append(query)
+            return []
+
+    store = _WindowRecordingStore()
+    breakdown = get_cost(QueryContext(_config(store)), env="dev", window="30d")
+
+    # The `window` is echoed verbatim into the result.
+    assert breakdown["window"] == "30d"
+    # But EVERY store query used the DEFAULT 15m window — the `'30d'` arg did NOT scope it.
+    assert store.queries, "get_cost must query the store for its cost gauges"
+    for query in store.queries:
+        span_minutes = round((query.window.end - query.window.start).total_seconds() / 60)
+        assert span_minutes == _DEFAULT_WINDOW_MINUTES, (
+            "the cost read must use the default window regardless of the cosmetic `window` arg"
+        )

@@ -29,7 +29,6 @@ generation for the nested-`TypedDict` return shapes defined here.
 """
 
 import logging
-import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TypedDict
@@ -38,6 +37,7 @@ from core.config import ResolvedEnvironment, SloConfig
 from core.errors import CapabilityError, PanoptesError
 from core.mcp._metric_helpers import (
     _DEFAULT_WINDOW_MINUTES,
+    _PROMQL_IDENTIFIER_RE,
     _latest_value,
     _step_seconds_for,
     _window_for,
@@ -70,12 +70,9 @@ _LOGGER = logging.getLogger(__name__)
 # server contract — "Accept and respect an `env` argument (or `all`)").
 _ALL_ENVS = "all"
 
-# PromQL identifier pattern for a metric name or a label KEY (F7). Caller-supplied
-# `name`/label-keys are spliced into the selector unquoted, so they MUST be validated as
-# real PromQL identifiers; anything with a `"`/`{`/`}`/`\` (or other breakout char) is
-# rejected rather than corrupting the query. Label VALUES are quoted, so they are ESCAPED
-# (not identifier-validated) before interpolation.
-_PROMQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_:]*$")
+# `_PROMQL_IDENTIFIER_RE` (the metric-name / label-key F7 validator) now lives in
+# `core.mcp._metric_helpers` (the leaf module shared with `context`); it is imported above.
+# Label VALUES are quoted, so they are ESCAPED (not identifier-validated) before interpolation.
 
 # The window-parsing + step + default-window helpers now live in `core.mcp._metric_helpers`
 # (the leaf module that breaks the context↔tools_query cycle); `_DEFAULT_WINDOW_MINUTES`,
@@ -671,13 +668,19 @@ def _sum_latest_per_series(series: list[MetricSeries]) -> float:
 
 
 def get_cost(context: QueryContext, env: str, window: str) -> CostBreakdown:
-    """Render `env`'s cost snapshot over `window` from the stored `panoptes_cost_*` gauges.
+    """Render `env`'s LATEST cost snapshot from the stored `panoptes_cost_*` gauges.
 
     This reads the STORE (two-faces-one-store parity — the Cost dashboard renders the same
     series), NOT a live Cost Explorer call, so the tool needs no CE/budgets client. The
     per-service spend gauges (`panoptes_cost_spend{env, service}`) contribute their latest
     value per service; `total` is the sum across services; `budget_burn` is the latest
     `panoptes_cost_budget_burn{env}` gauge.
+
+    **`window` is COSMETIC** (echoed back in the result, NOT used to scope the read): the cost
+    gauges are the LATEST collected snapshot (the cloudwatch source already aggregates the CE
+    cost window source-side), so the reads always use the reader's default window regardless of
+    the `window` arg. It is accepted for surface symmetry with the other windowed tools + the
+    Cost dashboard's range selector.
 
     No cost data (the env was never collected, or the store is a passthrough that cannot
     answer PromQL) yields a zero/empty breakdown — never a crash or a silent-empty result a
@@ -686,7 +689,8 @@ def get_cost(context: QueryContext, env: str, window: str) -> CostBreakdown:
     Args:
         context: The query context (its `store` answers the cost-gauge queries).
         env: The environment whose cost snapshot to render.
-        window: The cost window string (echoed back; the gauges are the latest collected).
+        window: COSMETIC — echoed into the result; the gauges read are the latest collected,
+            so this does NOT scope the read (the source already windowed the CE aggregation).
 
     Returns:
         A `CostBreakdown` with `total`, `per_service`, and `budget_burn`.
@@ -781,6 +785,18 @@ def get_slo(context: QueryContext, env: str, name: str) -> SloResult:
 
     objective = float(slo.get("objective", 0.0))
     query_expr = slo.get("query") or _DEFAULT_SLO_QUERY
+    # PINNED CONTRACT (F7): the SLO `query` MUST be a bare metric NAME — `_slo_actual` reads it
+    # via `read_gauge`, which WRAPS it with an `env="<env>"` selector (`{query}{{env=...}}`), so a
+    # non-identifier query (a full selector, a breakout token) would corrupt that selector.
+    # Validate it against the same PromQL-identifier regex `query_metric`/`compare_envs` enforce
+    # on their metric — config-trusted, but pinned so a malformed SLO config fails CLEARLY rather
+    # than producing a silently-broken query. (`panoptes_health_up`, the default, passes.)
+    if not _PROMQL_IDENTIFIER_RE.match(query_expr):
+        raise CapabilityError(
+            f"SLO '{name}' has an invalid query '{query_expr}': an SLO query must be a bare "
+            f"metric name (a PromQL identifier [A-Za-z_][A-Za-z0-9_:]*) — `get_slo` wraps it "
+            f"with an `env=` selector."
+        )
     window_str = slo.get("window") or ""
     actual = _slo_actual(context, query_expr, window_str, environment.name)
 

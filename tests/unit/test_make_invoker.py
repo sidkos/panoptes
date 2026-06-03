@@ -109,15 +109,21 @@ def test_make_invoker_forwards_a_dict_param() -> None:
     assert received["filters"] is None
 
 
-def test_make_invoker_calls_a_zero_arg_tool_with_no_kwargs() -> None:
-    """A tool fn with NO parameters is invoked with no kwargs (ignoring any passed args)."""
+def test_make_invoker_calls_a_zero_arg_tool_ignoring_stray_positional_args() -> None:
+    """A zero-param tool fn is invoked with no kwargs, and STRAY positional args are IGNORED.
+
+    The uniform invoker's `(*_args, **kwargs)` shape discards positional args (the documented
+    contract — the invoker is keyword-driven). Passing stray positionals must NOT reach the
+    zero-arg tool fn (which would `TypeError`); they are silently ignored.
+    """
     calls: list[int] = []
 
     def catalog_tool() -> str:
         calls.append(1)
         return "catalog"
 
-    result = _make_invoker(catalog_tool)()
+    # Stray positional args are ignored — the zero-arg tool fn is still called cleanly.
+    result = _make_invoker(catalog_tool)("ignored", 42)
 
     assert result == "catalog"
     assert calls == [1]

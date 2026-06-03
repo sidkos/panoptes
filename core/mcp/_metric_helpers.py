@@ -19,11 +19,20 @@ for the tool returns that transitively consume these helpers.
 """
 
 import logging
+import re
 from datetime import datetime
 
 from core.model import MetricSeries, TimeWindow
 
 _LOGGER = logging.getLogger(__name__)
+
+# PromQL identifier pattern for a metric name or a label KEY (F7). A caller-supplied
+# `name`/label-key is spliced into the selector UNQUOTED, so it MUST be a real PromQL
+# identifier; anything with a `"`/`{`/`}`/`\` (or other breakout char) is rejected rather than
+# corrupting the query. Lives in this leaf module so both `tools_query` (its query_metric /
+# compare_envs / get_slo guards) and `context` (the `read_series`/`read_gauge` self-defending
+# seam) share ONE pattern without a context↔tools_query import cycle.
+_PROMQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_:]*$")
 
 # Default query window for the live-source fetch tools. The MCP `window` argument is a human
 # string (e.g. "15m"); an empty/None/unrecognized window resolves to this trailing default so
@@ -43,6 +52,15 @@ _WINDOW_STRING_TO_MINUTES: dict[str, int] = {
     "1d": 1440,
     "7d": 10080,
 }
+
+# Upper bound (minutes) on a bare-integer window — the 7d ceiling, the largest named window.
+# `window` is a CLIENT-controlled MCP param (compare_envs/query_metric), so an unbounded bare
+# integer like `"9"*20` would build `TimeWindow.last(minutes=<huge>)` whose `timedelta` raises
+# `OverflowError` — NOT a `PanoptesError`, so it escapes `fan_out_over_envs` and crashes the
+# tool over the hosted HTTP face (a client-triggerable DoS). A bare integer above this ceiling
+# is CLAMPED to it (with a warning), so a huge value resolves to a sane window instead of
+# raising.
+_MAX_WINDOW_MINUTES = 10080
 
 # The step floor (seconds) for a range query (F2f). The step is computed as
 # window_seconds / _STEP_TARGET_BUCKETS so a range yields multiple points (never one
@@ -86,6 +104,14 @@ def _window_minutes(window: str) -> int:
     # A bare integer is accepted as minutes (forward-compatible with a fuller parser).
     if normalized.isdigit():
         parsed = int(normalized)
+        if parsed > _MAX_WINDOW_MINUTES:
+            # CLAMP a too-large bare integer to the ceiling rather than building a `timedelta`
+            # that raises `OverflowError` (a client-triggerable crash over the HTTP face).
+            _LOGGER.warning(
+                f"MCP window {window!r} exceeds the {_MAX_WINDOW_MINUTES}-minute maximum; "
+                f"clamping to {_MAX_WINDOW_MINUTES} minutes."
+            )
+            return _MAX_WINDOW_MINUTES
         if parsed > 0:
             return parsed
         # A recognized-but-NON-POSITIVE integer (e.g. "0") — distinct from an unparseable
