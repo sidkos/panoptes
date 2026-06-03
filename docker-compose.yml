@@ -1,16 +1,17 @@
 # Panoptes v0.1 local stack (spec `## Local run & IaC contract`).
 #
-# `docker compose up` brings up the full pipeline on a laptop, pointed at the
-# operator's observed `dev` env: VictoriaMetrics (the metric store) + Grafana (the
-# human face) + the collector (fetch → normalize → store) + the MCP stdio server
-# (the LLM face). Zero cloud cost; the SAME compose file is what the v0.2 Terraform
-# host will run, so local and deployed stacks are identical.
+# `docker compose up --build` brings up the full pipeline on a laptop, pointed at
+# the operator's observed `dev` env: VictoriaMetrics (the metric store) + Grafana
+# (the human face) + the collector (fetch → normalize → store) + the MCP stdio
+# server (the LLM face). Zero cloud cost; the SAME compose file is what the v0.2
+# Terraform host will run, so local and deployed stacks are identical.
 #
-# Risk R1/A8 — zero-build local loop: `collector` and `mcp` run the in-repo source
-# mounted READ-ONLY into a stock `python:3.12-slim` and `pip install .` (non-editable
-# — an editable install can't write egg-info into a `:ro` source tree) at start-up.
-# No published image is needed in v0.1 (a GHCR image is v0.2 distribution), and no
-# Dockerfile is needed because neither service requires a non-base runtime.
+# `collector` and `mcp` share a BAKED image built from the repo `Dockerfile`: it
+# does a build-time `pip install .` (writable context → egg_info succeeds, unlike
+# the old `:ro`-source runtime install) and `COPY core ./core`, so deps + source
+# are in the image. No runtime pip, no source bind mount — restarts are fast and
+# offline. `--build` is needed on first run and after any `core/` edit (Compose
+# rebuilds the changed source layer; the dependency layer stays cached).
 #
 # Consumer-pack injection (spec § Consumer-pack loading): the consumer's pack dir is
 # bind-mounted READ-ONLY at /packs/consumer; `PANOPTES_CONSUMER_PACK` points the MCP
@@ -18,11 +19,19 @@
 # dashboards alongside the core packs. `CONSUMER_PACK_DIR` defaults to the in-repo
 # brand-neutral demo pack (see .env.example); a real consumer points it at its own
 # repo dir. `${CONSUMER_PACK_DIR:?}` fails fast with a clear error if it is unset.
+# The pack is the ONLY thing still mounted into collector/mcp — core code is baked.
 #
 # Secrets (AWS profile/role, Sentry token, health URL) come from the operator's
 # .env — never inlined here. CI is hermetic and does NOT run this compose file; the
 # integration suite spins ephemeral VictoriaMetrics + Grafana containers directly
 # (see tests/integration/conftest.py) with synthetic data only (Risk R10).
+
+# Shared build spec for the two Python services (collector + mcp) — both run the
+# same baked image, so anchor the build block once and merge it into each.
+x-panoptes-build: &panoptes-build
+  build:
+    context: .
+    dockerfile: Dockerfile
 
 services:
   victoriametrics:
@@ -64,21 +73,12 @@ services:
     restart: unless-stopped
 
   collector:
-    image: python:3.12-slim
+    # Baked image (see Dockerfile): deps + core/ source are built in, WORKDIR=/app.
+    <<: *panoptes-build
     depends_on:
       - victoriametrics
-    working_dir: /app
-    # A8: mount the repo source READ-ONLY + install deps at start, then run a
-    # scheduled collector. No Dockerfile/build step — the stock slim image suffices.
-    # The install copies just `core/` + `pyproject.toml` into a WRITABLE /tmp dir and
-    # `pip install`s from there: pip's setuptools backend runs `egg_info` in the build
-    # dir, which CANNOT be the `:ro` /app source tree (that's why a direct
-    # `pip install .`/`-e .` against /app fails with "Cannot update time stamp of
-    # directory 'panoptes.egg-info'"). Deps still resolve from pyproject (no drift).
-    # The service then runs the LIVE mounted source (working_dir=/app puts /app first
-    # on sys.path for `python -m`); the install is only to pull the dependencies.
+    # Only the consumer pack is mounted now — core code lives in the image.
     volumes:
-      - ./:/app:ro
       - ${CONSUMER_PACK_DIR:?Set CONSUMER_PACK_DIR (see .env.example)}:/packs/consumer:ro
     environment:
       PANOPTES_CONFIG: "/packs/consumer/panoptes.yaml"
@@ -92,23 +92,21 @@ services:
       SENTRY_TOKEN: "${SENTRY_TOKEN:-}"
       DEV_HEALTH_URL: "${DEV_HEALTH_URL:-}"
       CONSUMER_PACK_DIR: "${CONSUMER_PACK_DIR}"
-    command:
-      - "/bin/sh"
-      - "-c"
-      - "mkdir -p /tmp/pkg && cp -r /app/core /app/pyproject.toml /tmp/pkg/ && pip install --quiet --no-cache-dir /tmp/pkg && python -m core.collector --config \"$$PANOPTES_CONFIG\""
+    # Clean entrypoint — core is importable from the baked image, no pip preamble.
+    command: ["python", "-m", "core.collector", "--config", "/packs/consumer/panoptes.yaml"]
     restart: unless-stopped
 
   mcp:
-    image: python:3.12-slim
+    # Same baked image as collector (see Dockerfile).
+    <<: *panoptes-build
     depends_on:
       - victoriametrics
-    working_dir: /app
     # The MCP stdio server. stdin_open + tty keep stdio attachable for a local MCP
     # client; it reads PANOPTES_CONFIG + PANOPTES_CONSUMER_PACK (a FILE PATH) from env.
     stdin_open: true
     tty: true
+    # Only the consumer pack is mounted now — core code lives in the image.
     volumes:
-      - ./:/app:ro
       - ${CONSUMER_PACK_DIR:?Set CONSUMER_PACK_DIR (see .env.example)}:/packs/consumer:ro
     environment:
       PANOPTES_CONFIG: "/packs/consumer/panoptes.yaml"
@@ -124,14 +122,10 @@ services:
       SENTRY_TOKEN: "${SENTRY_TOKEN:-}"
       DEV_HEALTH_URL: "${DEV_HEALTH_URL:-}"
       CONSUMER_PACK_DIR: "${CONSUMER_PACK_DIR}"
-    command:
-      # The MCP stdio server's main() self-registers the core adapters (via
-      # core.bootstrap) before resolving PANOPTES_CONFIG, so the config's real `type`
-      # fields build cleanly — no pre-import preamble needed. Reads PANOPTES_CONFIG +
-      # PANOPTES_CONSUMER_PACK from the environment above.
-      - "/bin/sh"
-      - "-c"
-      - "mkdir -p /tmp/pkg && cp -r /app/core /app/pyproject.toml /tmp/pkg/ && pip install --quiet --no-cache-dir /tmp/pkg && python -m core.mcp.server"
+    # The MCP stdio server's main() self-registers the core adapters (via
+    # core.bootstrap) before resolving PANOPTES_CONFIG, so the config's real `type`
+    # fields build cleanly. Reads PANOPTES_CONFIG + PANOPTES_CONSUMER_PACK from env.
+    command: ["python", "-m", "core.mcp.server"]
     restart: unless-stopped
 
 volumes:

@@ -1,0 +1,36 @@
+# Keep the build context minimal and the install boundary clean.
+#
+# examples/ and tests/ are load-bearing exclusions: excluding examples/ makes
+# setuptools `packages.find` resolve only `core*` at build time (the consumer
+# pack is injected at runtime via the compose `:ro` mount, never baked in), and
+# excluding tests/ keeps test-only code out of the runtime image.
+.git
+.github
+.venv
+venv
+env
+__pycache__
+*.py[cod]
+*.egg-info
+build
+dist
+.mypy_cache
+.ruff_cache
+.pytest_cache
+.coverage
+.coverage.*
+htmlcov
+examples
+tests
+docs
+deploy
+scripts
+.env
+.env.*
+!.env.example
+.idea
+.vscode
+*.swp
+.DS_Store
+docker-compose.yml
+Dockerfile

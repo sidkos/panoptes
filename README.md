@@ -51,7 +51,9 @@ in the diagram above is v0.2).
 cp .env.example .env          # then fill in the read-only AWS/Sentry creds + DEV_HEALTH_URL
 
 # 2. Bring up VictoriaMetrics + Grafana + the collector + the MCP server
-docker compose up             # Grafana on :3000, VictoriaMetrics on :8428
+docker compose up --build     # Grafana on :3000, VictoriaMetrics on :8428
+# (--build on first run / after a core/ edit; the image bakes deps, so restarts
+#  are fast and work offline — no per-start pip install)
 
 # 3. Open the single pane
 open http://localhost:3000    # the 3 core dashboards + your injected consumer pack, env-templated
@@ -60,6 +62,21 @@ open http://localhost:3000    # the 3 core dashboards + your injected consumer p
 The **collector** pulls read-only from each configured source (CloudWatch, Sentry,
 an HTTP `/health`) into the shared store; **Grafana** and the **MCP server** are two
 thin readers over that one store, so a human and an LLM see the same data.
+
+### Local stack
+
+`scripts/stack.sh` is a thin, idempotent convenience wrapper over `docker compose`
+for the local proof — it builds the image, polls readiness, and gives one-shot
+status / logs / smoke / query subcommands:
+
+```bash
+bash scripts/stack.sh up        # build + start, seed .env on first run, wait until ready
+bash scripts/stack.sh status    # ps + health probes + last collector logs (exit 0 iff all up)
+bash scripts/stack.sh smoke     # run a single collector cycle (--once)
+bash scripts/stack.sh down      # stop (add -v / --volumes to also drop the vm-data volume)
+```
+
+Run `bash scripts/stack.sh --help` for the full subcommand list.
 
 Register the MCP server with any MCP client (e.g. Claude) by running
 `python -m core.mcp.server` over stdio with `PANOPTES_CONFIG` + (optionally)
