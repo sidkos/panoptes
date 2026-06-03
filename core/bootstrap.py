@@ -20,6 +20,8 @@ import importlib
 # a new core adapter? Add its module here so BOTH entrypoints can build it.
 _CORE_ADAPTER_MODULES = (
     "core.notifiers.logging_notifier",
+    "core.notifiers.slack",
+    "core.notifiers.sns",
     "core.sources.cloudwatch",
     "core.sources.http_health",
     "core.sources.kubernetes",

@@ -44,6 +44,7 @@ from core.model import (
     SourceHealth,
     TimeWindow,
 )
+from core.planes.notifier import Notifier
 from core.planes.source import Source
 
 ConfigBlock = Mapping[str, str | int | bool | list[str]]
@@ -148,6 +149,24 @@ class _FakeNotifier:
 
     def notify(self, alert: Alert) -> None:
         return None
+
+
+def _make_notifier_class(notifier_type: str) -> type[Notifier]:
+    """Build a `Notifier` class reporting a fixed `type` (the v0.2 sns/slack fakes).
+
+    Mirrors `_make_source_class`: the config test must resolve `sns`/`slack` notifiers
+    WITHOUT importing the real Phase-2 adapter modules (which pull in boto3/httpx), so a
+    typed fake registered under each type proves the loader wires them up.
+    """
+
+    class _ConfiguredNotifier(_FakeNotifier):
+        type = notifier_type
+
+        def __init__(self, config: ConfigBlock) -> None:
+            super().__init__(config)
+            self.type = notifier_type
+
+    return _ConfiguredNotifier
 
 
 class _FakeDashboardProvider:
@@ -464,6 +483,62 @@ def test_notifier_missing_type_raises_panoptes_error_naming_field(tmp_path: Path
     with pytest.raises(PanoptesError) as excinfo:
         load_config(config_path, registries=_registries_with_correct_capabilities())
     assert "type" in str(excinfo.value)
+
+
+# --- v0.2: sns / slack notifier resolution ---------------------------------------
+
+
+def _registries_with_v0_2_notifiers() -> PlaneRegistries:
+    """The reference registries PLUS fake `sns` + `slack` notifiers (v0.2 adapters)."""
+    registries = _registries_with_correct_capabilities()
+    registries.notifiers.register("sns")(_make_notifier_class("sns"))
+    registries.notifiers.register("slack")(_make_notifier_class("slack"))
+    return registries
+
+
+def test_config_listing_sns_and_slack_resolves_to_registered_notifiers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A config listing `sns`/`slack` resolves to the registered notifier adapters (v0.2)."""
+    _set_reference_env(monkeypatch)
+    monkeypatch.setenv("ALERT_TOPIC_ARN", "arn:aws:sns:us-east-1:123456789012:panoptes-alerts")
+    monkeypatch.setenv("SLACK_WEBHOOK_URL", "https://hooks.slack.test/services/T/B/X")
+    body = _REFERENCE_YAML.replace(
+        "  notifiers:\n    - type: logging\n",
+        "  notifiers:\n"
+        "    - type: logging\n"
+        "    - type: sns\n"
+        "      topic_arn: ${ALERT_TOPIC_ARN}\n"
+        "    - type: slack\n"
+        "      webhook_url: ${SLACK_WEBHOOK_URL}\n",
+    )
+    config_path = _write_fixture(tmp_path, body)
+    resolved = load_config(config_path, registries=_registries_with_v0_2_notifiers())
+    notifier_types = {notifier.type for notifier in resolved.notifiers}
+    assert {"logging", "sns", "slack"} <= notifier_types
+
+
+def test_unregistered_notifier_type_fails_fast(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unregistered notifier `type` fails fast with a clear `PanoptesError` (v0.2).
+
+    The reference registries do NOT register `sns`, so listing it must raise an
+    `UnknownAdapterError` (a `PanoptesError` subclass) naming the bad type — the same
+    fail-fast contract sources have, applied to the notifier plane.
+    """
+    _set_reference_env(monkeypatch)
+    body = _REFERENCE_YAML.replace(
+        "  notifiers:\n    - type: logging\n",
+        "  notifiers:\n    - type: logging\n    - type: not-a-real-notifier\n",
+    )
+    config_path = _write_fixture(tmp_path, body)
+    with pytest.raises(PanoptesError) as excinfo:
+        # Use the BASE reference registries (sns/slack NOT registered) so the unknown
+        # type genuinely fails — `not-a-real-notifier` is registered nowhere.
+        load_config(config_path, registries=_registries_with_correct_capabilities())
+    assert isinstance(excinfo.value, UnknownAdapterError)
+    assert "not-a-real-notifier" in str(excinfo.value)
 
 
 # --- PlaneRegistries test-isolation seam -----------------------------------------

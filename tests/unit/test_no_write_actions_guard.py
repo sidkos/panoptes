@@ -18,15 +18,23 @@ Design choices (documented per playbook §3.3, Risk R6):
   ``stop_query`` / ``get_query_results`` and (b) Panoptes' own registration
   helpers ``register_tools`` / ``register`` / ``add_tool`` / ``add_source``.
   Those are *never matched in the first place* — they need no suppression.
-* **Suppression allowlist = file I/O only.** ``write_text`` / ``write_bytes``
-  genuinely contain the matched ``write_`` verb and would match; the allowlist
-  suppresses them (the Phase-5 Grafana provider writes JSON to local disk — R6).
-  They are the ONLY allowlist members.
+* **Path-agnostic suppression allowlist = file I/O only.** ``write_text`` /
+  ``write_bytes`` genuinely contain the matched ``write_`` verb and would match; the
+  allowlist suppresses them EVERYWHERE (the Phase-5 Grafana provider writes JSON to
+  local disk — R6). They are the only path-agnostic allowlist members.
+* **Path-SCOPED suppression (v0.2) = ``sns.publish`` in ``core/notifiers/sns.py`` ONLY.**
+  ``publish`` is in the mutation-verb set, but the ``sns`` notifier publishes to a
+  Panoptes-OWNED alert topic — its own channel, NOT an observed system (spec § New
+  notifier adapters, the CRITICAL no-write-guard note). The suppression is therefore
+  PATH-KEYED to ``core/notifiers/sns.py``, so a ``publish`` anywhere ELSE (esp. any
+  ``core/sources/`` file) STILL red-bars. The guard's intent is "no writes to OBSERVED
+  systems"; the alert channel is exempt, by exact file path, with a comment.
 
 Known-miss shapes (explicit blind spots, not silent): raw httpx POST/PUT bodies
-(the sentry / http-health sources use httpx, not boto3); paginator-wrapped
-mutations; dynamic ``getattr(client, verb)(...)`` dispatch; the low-level
-``client.api_call(...)`` escape hatch; and any new AWS verb absent from the set.
+(the sentry / http-health / slack-notifier adapters use httpx, not boto3 — the slack
+webhook is an alert sink, not an observed write); paginator-wrapped mutations; dynamic
+``getattr(client, verb)(...)`` dispatch; the low-level ``client.api_call(...)`` escape
+hatch; and any new AWS verb absent from the set.
 """
 
 import re
@@ -73,15 +81,43 @@ _MUTATION_VERBS = (
 # Method-call shape: `.<prefix><verb><suffix>(`. Trailing `(` is required.
 _MUTATION_RE = re.compile(r"\.([a-z_]*(?:" + "|".join(_MUTATION_VERBS) + r")[a-z_]*)\(")
 
-# The ONLY suppression-allowlist members: file-I/O verbs containing a matched
-# `write_` verb (the Grafana provider writes JSON to disk — Risk R6).
+# Path-AGNOSTIC suppression-allowlist members: file-I/O verbs containing a matched
+# `write_` verb (the Grafana provider writes JSON to disk — Risk R6). Suppressed in EVERY
+# scanned file.
 _ALLOWLISTED_METHODS = frozenset({"write_text", "write_bytes"})
 
+# Path-SCOPED suppression (v0.2): a `(repo-relative posix path, method)` pair is suppressed
+# ONLY in that exact file. `sns.publish` is a legitimate write to Panoptes' OWN alert topic
+# (spec § New notifier adapters — the CRITICAL note), so it is exempt ONLY in
+# `core/notifiers/sns.py`; a `publish(` anywhere else (esp. `core/sources/`) still red-bars.
+# This is intentionally NOT a blanket `publish` allowlist — the file path is the scope.
+_PATH_SCOPED_ALLOW: frozenset[tuple[str, str]] = frozenset({("core/notifiers/sns.py", "publish")})
 
-def _find_mutation_calls(text: str) -> list[str]:
-    """Return matched mutation method names not covered by the allowlist."""
-    methods = [str(match.group(1)) for match in _MUTATION_RE.finditer(text)]
-    return [method for method in methods if method not in _ALLOWLISTED_METHODS]
+
+def _find_mutation_calls(text: str, rel_path: str = "") -> list[str]:
+    """Return matched mutation method names not covered by either allowlist.
+
+    Args:
+        text: The file/snippet text to scan for the call-shape-anchored mutation verbs.
+        rel_path: The file's repo-relative POSIX path (e.g. ``core/notifiers/sns.py``),
+            used to apply the PATH-SCOPED suppression. Defaults to ``""`` so the
+            snippet-only self-tests (which pass no path) get NO path-scoped suppression —
+            a `publish(` snippet with no attributed path is still flagged, which is exactly
+            what the negative self-test asserts.
+
+    A matched method is suppressed when EITHER (a) it is a path-agnostic file-I/O verb
+    (`write_text`/`write_bytes`), OR (b) the `(rel_path, method)` pair is in the
+    path-scoped allowlist. Everything else is returned as an offender.
+    """
+    offenders: list[str] = []
+    for match in _MUTATION_RE.finditer(text):
+        method = str(match.group(1))
+        if method in _ALLOWLISTED_METHODS:
+            continue  # path-agnostic file-I/O suppression (every file).
+        if (rel_path, method) in _PATH_SCOPED_ALLOW:
+            continue  # path-scoped suppression (this exact file only).
+        offenders.append(method)
+    return offenders
 
 
 def _scanned_py_files() -> list[Path]:
@@ -95,8 +131,12 @@ def _scanned_py_files() -> list[Path]:
 def test_no_mutating_call_sites_in_core_or_examples() -> None:
     offenders: list[str] = []
     for path in _scanned_py_files():
-        for method in _find_mutation_calls(path.read_text(encoding="utf-8")):
-            offenders.append(f"{path.relative_to(_REPO_ROOT)}:{method}")
+        # The repo-relative POSIX path keys the path-scoped allowlist (sns.publish is
+        # exempt ONLY in core/notifiers/sns.py); `as_posix()` keeps the separator stable
+        # across platforms so the allowlist literal matches on every OS.
+        rel_path = path.relative_to(_REPO_ROOT).as_posix()
+        for method in _find_mutation_calls(path.read_text(encoding="utf-8"), rel_path):
+            offenders.append(f"{rel_path}:{method}")
     assert not offenders, f"mutating boto3 call site(s) found: {offenders}"
 
 
@@ -137,3 +177,57 @@ def test_self_test_never_matched_by_construction() -> None:
     ]
     for snippet in never_matched:
         assert _MUTATION_RE.search(snippet) is None, f"should NOT match: {snippet}"
+
+
+# --- v0.2: path-scoped sns.publish suppression (load-bearing) --------------------
+
+
+def test_path_scoped_publish_in_sources_is_still_flagged() -> None:
+    """(a) `sns.publish(` attributed to a `core/sources/…` path is STILL flagged.
+
+    The negative case is the whole point of making the suppression path-keyed: a
+    `publish` to an OBSERVED system (anywhere outside `core/notifiers/sns.py`) must
+    red-bar. A `core/sources/` path gets no path-scoped suppression.
+    """
+    offenders = _find_mutation_calls("sns.publish(", "core/sources/evil.py")
+    assert "publish" in offenders, "publish in core/sources/ must NOT be suppressed"
+
+
+def test_path_scoped_publish_in_notifiers_sns_is_suppressed() -> None:
+    """(b) The real `core/notifiers/sns.py` `publish` IS suppressed by the path scope."""
+    offenders = _find_mutation_calls("self._sns().publish(", "core/notifiers/sns.py")
+    assert offenders == [], "sns.publish in core/notifiers/sns.py must be suppressed"
+
+
+def test_path_scoped_publish_with_no_path_is_still_flagged() -> None:
+    """A `publish(` snippet with NO attributed path (the default) is still flagged.
+
+    The snippet-only self-tests pass no path, so an empty `rel_path` must never grant
+    the path-scoped suppression — only the exact `core/notifiers/sns.py` path does.
+    """
+    assert _find_mutation_calls("sns.publish(") == ["publish"]
+
+
+def test_path_scoped_publish_in_other_notifier_file_is_still_flagged() -> None:
+    """`publish` in a DIFFERENT notifier file (not sns.py) still red-bars.
+
+    The scope is the exact file `core/notifiers/sns.py` — not the whole `core/notifiers/`
+    directory — so a stray `publish` in `core/notifiers/slack.py` (or any other) is
+    flagged, proving the allowlist is file-path-keyed, not directory-keyed.
+    """
+    offenders = _find_mutation_calls("client.publish(", "core/notifiers/slack.py")
+    assert "publish" in offenders, "publish outside sns.py must NOT be suppressed"
+
+
+def test_real_sns_notifier_file_is_clean_under_the_path_scope() -> None:
+    """The real shipped `core/notifiers/sns.py` passes the guard via the path scope.
+
+    Reads the ACTUAL file (not a synthetic snippet) and asserts the only mutation match
+    it contains — `publish` — is suppressed because its path is the allowlisted one. If a
+    future edit adds a NON-publish mutation verb to that file, this red-bars (the scope is
+    `publish` only, not a blanket file exemption).
+    """
+    sns_path = _REPO_ROOT / "core" / "notifiers" / "sns.py"
+    rel_path = sns_path.relative_to(_REPO_ROOT).as_posix()
+    offenders = _find_mutation_calls(sns_path.read_text(encoding="utf-8"), rel_path)
+    assert offenders == [], f"core/notifiers/sns.py must be guard-clean; got {offenders}"
