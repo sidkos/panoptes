@@ -27,6 +27,10 @@ jobs:
               - 'tests/**'
               - 'docker-compose.yml'
               - 'pyproject.toml'
+              - 'modules/**'
+              - 'deploy/**'
+              - 'charts/**'
+              - 'Dockerfile'
   ci:
     needs: changes
     uses: ./.github/workflows/ci-checks.yml

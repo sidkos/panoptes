@@ -18,6 +18,12 @@
 #   9. brand-neutrality grep                 -> (local-only invariant; CI has its own)
 # The integration suite maps to the `integration` job and runs via the `integration`
 # mode (Docker-gated), kept out of the default `sca` loop.
+#
+# The hermetic v0.2 IaC + chart gates (the `terraform` + `helm` CI jobs) are NOT part of
+# the default `sca` loop because they need extra binaries (terraform/tflint/helm/
+# kubeconform) the venv does not carry; run them explicitly with the `infra` mode below
+# when those binaries are installed. The two coverage pytest runs deselect the
+# `terraform`/`helm` markers so the default loop never tries to exec a missing binary.
 
 set -euo pipefail
 
@@ -87,7 +93,12 @@ check_brand_neutral() {
   STEP_INDEX=$((STEP_INDEX + 1))
   printf '[%d/%d] %s ... ' "${STEP_INDEX}" "${STEP_TOTAL}" "brand-neutrality (grep -rin fida)"
   local hits
-  hits="$(grep -rin fida core/ tests/ examples/ || true)"
+  # v0.2: the brand grep also covers the distributable IaC + chart surfaces. Generated
+  # trees (`.terraform/` provider plugins) are excluded — they carry vendored tokens we
+  # do not own and would false-positive the gate. Roots that may not exist yet
+  # (modules/, deploy/, charts/) are tolerated by grep's missing-path handling.
+  hits="$(grep -rin --exclude-dir=.terraform fida \
+    core/ tests/ examples/ modules/ deploy/ charts/ 2>/dev/null || true)"
   if [[ -z "${hits}" ]]; then
     printf 'PASS (0s)\n'
   else
@@ -135,10 +146,11 @@ run_sca() {
   run_actionlint_step
   run_step "mypy --strict" "${MYPY}" --strict .
   run_step "pytest (core coverage >= 85%)" \
-    "${PYTEST}" -m "not integration" --cov=core --cov-fail-under=85
+    "${PYTEST}" -m "not integration and not terraform and not helm" \
+    --cov=core --cov-fail-under=85
   run_step "pytest (sources+mcp coverage >= 80%)" \
-    "${PYTEST}" -m "not integration" --cov=core.sources --cov=core.mcp \
-    --cov-append --cov-fail-under=80
+    "${PYTEST}" -m "not integration and not terraform and not helm" \
+    --cov=core.sources --cov=core.mcp --cov-append --cov-fail-under=80
   run_step "boundary guards" \
     "${PYTEST}" tests/unit/test_core_purity_guard.py tests/unit/test_no_write_actions_guard.py
   check_brand_neutral
@@ -183,6 +195,49 @@ run_integration() {
   echo "Integration suite passed."
 }
 
+# --- mode: infra -------------------------------------------------------------------
+# The hermetic IaC + chart gates, mirroring the `terraform` + `helm` CI jobs. Needs the
+# extra binaries (terraform, tflint, helm, kubeconform) installed locally; each half is
+# gated on binary presence so a partial toolchain runs only what it can. NO AWS creds,
+# NO backend, NO cluster — `init -backend=false`/`validate`/`tflint` for Terraform and
+# `helm template | kubeconform -strict` (offline schema validation) for the chart.
+run_infra() {
+  echo "Panoptes pre-commit gate — infra (hermetic terraform + helm; no creds, no cluster)"
+  local ran_any=0
+
+  if command -v terraform >/dev/null 2>&1; then
+    echo "[terraform] fmt -check / init -backend=false / validate ..."
+    terraform -chdir=modules/stack fmt -check -recursive
+    terraform -chdir=modules/stack init -backend=false -input=false
+    terraform -chdir=modules/stack validate
+    if command -v tflint >/dev/null 2>&1; then
+      tflint --chdir=modules/stack
+    else
+      echo "      (tflint not installed — CI enforces it)"
+    fi
+    "${PYTEST}" -m terraform
+    ran_any=1
+  else
+    echo "[terraform] SKIP (terraform not installed — CI enforces it)"
+  fi
+
+  if command -v helm >/dev/null 2>&1 && command -v kubeconform >/dev/null 2>&1; then
+    echo "[helm] lint / template | kubeconform -strict ..."
+    helm lint charts/panoptes
+    helm template charts/panoptes -f charts/panoptes/ci/test-values.yaml | kubeconform -strict -summary
+    "${PYTEST}" -m helm
+    ran_any=1
+  else
+    echo "[helm] SKIP (helm and/or kubeconform not installed — CI enforces them)"
+  fi
+
+  if [[ "${ran_any}" -eq 0 ]]; then
+    echo "No infra toolchain found; nothing ran. Install terraform/tflint/helm/kubeconform."
+  else
+    echo "Infra gate complete."
+  fi
+}
+
 # --- mode: --fix -------------------------------------------------------------------
 # Mutating autofix: format then lint-fix. No tests are run (this only rewrites files).
 run_fix() {
@@ -207,6 +262,10 @@ Modes:
                 coverage pytest runs.
   integration   Docker-gated: assert the >= 5 anti-rot floor, then run
                 `pytest -m integration` (spins VictoriaMetrics + Grafana containers).
+  infra         Hermetic IaC + chart gates (mirrors the CI `terraform` + `helm` jobs):
+                terraform fmt/init -backend=false/validate/tflint + helm lint +
+                helm template | kubeconform -strict. Each half is gated on its binaries
+                being installed. NO AWS creds, NO backend, NO cluster.
   --fix         Mutating autofix only: `ruff format .` then `ruff check --fix .`.
   --help, -h    Show this help.
 
@@ -220,6 +279,7 @@ case "${MODE}" in
   sca) run_sca ;;
   --fast | fast) run_fast ;;
   integration) run_integration ;;
+  infra) run_infra ;;
   --fix | fix) run_fix ;;
   --help | -h | help) usage ;;
   *)

@@ -39,3 +39,10 @@ ignore: |
   .mypy_cache/
   .ruff_cache/
   .pytest_cache/
+  .terraform/
+  # Helm chart TEMPLATES are Go-templated YAML (`{{- ... -}}`), not standalone YAML —
+  # yamllint cannot parse the template directives and would false-error on every chart
+  # template. They are validated instead by `helm lint` + `helm template | kubeconform`
+  # (the hermetic `helm` CI job). The chart's PLAIN YAML (Chart.yaml, values.yaml,
+  # ci/test-values.yaml) stays linted — only the rendered-template sources are skipped.
+  charts/*/templates/

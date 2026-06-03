@@ -1,0 +1,66 @@
+name: 📦 Publish (GHCR)
+# Tag-triggered GHCR build+push SKELETON (Phase 0). The full build/push wiring is
+# finalized in Phase 8 (spec § CI/CD New publish workflow). Until then this workflow:
+#   - triggers ONLY on a `v0.2.*` version tag (immutable-tag discipline — the Helm
+#     `values.image.tag` + the Terraform `image_tag` pin this tag, never a moving ref);
+#   - is `workflow_dispatch`-safe so it can be exercised manually before Phase 8;
+#   - keeps `packages: write` scoped to the publish job ONLY (the single CI write
+#     permission in the whole repo); the top-level grant stays read-only.
+on:
+  push:
+    tags: ['v0.2.*']
+  workflow_dispatch:
+
+# Top-level permissions are read-only; the write grant is job-scoped below so no other
+# job (now or later) inherits package-write.
+permissions: { contents: read }
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish-image:
+    name: 🐳 Build & Push Image
+    runs-on: ubuntu-latest
+    # packages:write is granted to THIS job only — the sole CI write permission.
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+      # Buildx gives a reproducible, cache-aware build of the existing Dockerfile.
+      - uses: docker/setup-buildx-action@v3
+      # Derive the immutable image tags from the git tag. `docker/metadata-action`
+      # emits `ghcr.io/sidkos/panoptes:<version>` (+ `:latest` on a semver tag);
+      # the consumer Helm values / Terraform `image_tag` pin the version tag, never
+      # `:latest` (Risk K11 — no moving-ref drift into the cluster).
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/sidkos/panoptes
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+      # Log in to GHCR with the job-scoped GITHUB_TOKEN (packages:write). On a manual
+      # `workflow_dispatch` run there is no tag to publish, so login + push are skipped
+      # and only the (cache-warming) build runs — the Phase-8 finalize step removes this
+      # skeleton guard once the publish path is fully wired.
+      - name: Log in to GHCR
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build (and push on a version tag)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ startsWith(github.ref, 'refs/tags/') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

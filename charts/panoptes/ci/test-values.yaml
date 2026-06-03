@@ -1,0 +1,11 @@
+# Hermetic CI fixture values for `helm template charts/panoptes -f ci/test-values.yaml`.
+#
+# Mirrors what the `helm` CI job and the `tests/helm/test_chart_render.py` gate render:
+# fully offline, no cluster, no secrets. Phase-0 supplies just enough to render the
+# placeholder ServiceAccount; Phase 7 adds the workload/ingress/IRSA fixtures here.
+serviceAccount:
+  create: true
+  name: "panoptes"
+  # A representative (well-formed but non-live) IRSA role ARN so the Phase-7 annotation
+  # render path is exercised under CI. Schema-valid; points at no real account.
+  irsaRoleArn: "arn:aws:iam::000000000000:role/panoptes-irsa"

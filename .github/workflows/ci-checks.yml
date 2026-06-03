@@ -35,7 +35,7 @@ jobs:
       # Global floor measures core only. examples/ is a test fixture (the demo
       # pack), not shipped core — excluded from the global gate so a fixture
       # coverage dip can neither mask nor inflate the core number.
-      - run: pytest -m "not integration" --cov=core --cov-fail-under=85
+      - run: pytest -m "not integration and not terraform and not helm" --cov=core --cov-fail-under=85
       # Authoritative per-package floor (spec § Tests Coverage mandate): the two
       # areas the design docs single out. This INTENTIONALLY re-executes the full
       # unit suite a second time to recompute coverage scoped to core.sources +
@@ -50,7 +50,7 @@ jobs:
       # --include=` post-step without re-verifying both floors still gate
       # (`coverage combine` + two scoped `coverage report --include=` is the
       # documented v0.2 optimization; the spec warns against doing it in v0.1).
-      - run: pytest -m "not integration" --cov=core.sources --cov=core.mcp --cov-append --cov-fail-under=80
+      - run: pytest -m "not integration and not terraform and not helm" --cov=core.sources --cov=core.mcp --cov-append --cov-fail-under=80
 
   guards:                          # the standalone-purity invariants
     name: 🛡️ Boundary Guards
@@ -59,6 +59,54 @@ jobs:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-panoptes
       - run: pytest tests/unit/test_core_purity_guard.py tests/unit/test_no_write_actions_guard.py
+
+  terraform:                       # hermetic IaC gate — no AWS creds, no backend, no plan
+    name: 🌱 Terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # Pinned setup actions (per the spec's tool-install contract). The terraform
+      # wrapper is disabled so `subprocess` calls in the marked tests see real exit
+      # codes rather than the action's stdout-wrapping shim.
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: '1.9.8', terraform_wrapper: false }
+      - uses: terraform-linters/setup-tflint@v4
+        with: { tflint_version: 'v0.53.0' }
+      # The hermetic pipeline (spec § CI/CD `terraform` job, Risk K3): fmt-check, a
+      # no-backend init+validate (offline — NO state, NO provider auth, NO `plan`),
+      # then tflint. No AWS credentials are configured anywhere in this job.
+      - run: terraform -chdir=modules/stack fmt -check -recursive
+      - run: terraform -chdir=modules/stack init -backend=false -input=false
+      - run: terraform -chdir=modules/stack validate
+      - run: tflint --chdir=modules/stack
+      # Python venv for the marked plan-assertion test (extended in Phase 6). Selecting
+      # `-m terraform` runs ONLY the marked IaC tests against the just-validated module.
+      - uses: ./.github/actions/setup-panoptes
+      - run: pytest -m terraform
+
+  helm:                            # hermetic chart gate — offline schema validation, no cluster
+    name: ⎈ Helm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: azure/setup-helm@v4
+        with: { version: 'v3.16.2' }
+      # kubeconform is fetched from a pinned release tarball (no marketplace action), then
+      # `helm template | kubeconform -strict` validates the rendered manifests' schema
+      # fully OFFLINE — never a `kubectl apply --dry-run=server` (that needs a cluster).
+      - name: Install kubeconform (pinned)
+        run: |
+          curl -fsSL -o kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+          tar -xzf kubeconform.tar.gz kubeconform
+          sudo install -m 0755 kubeconform /usr/local/bin/kubeconform
+          rm -f kubeconform.tar.gz kubeconform
+      - run: helm lint charts/panoptes
+      - run: helm template charts/panoptes -f charts/panoptes/ci/test-values.yaml | kubeconform -strict -summary
+      # Python venv for the marked render-assertion test (extended in Phase 7). Selecting
+      # `-m helm` runs ONLY the marked chart tests against the just-validated chart.
+      - uses: ./.github/actions/setup-panoptes
+      - run: pytest -m helm
 
   integration:                     # compose/testcontainers; marker-gated, opt-in
     name: 🐳 Integration (compose)

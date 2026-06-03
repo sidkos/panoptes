@@ -1,0 +1,12 @@
+apiVersion: v2
+name: panoptes
+description: >-
+  The in-cluster deploy artifact for Panoptes — a standalone, pluggable normalizing
+  meta-layer over your monitoring tools. Phase-0 SKELETON: renders a single
+  ServiceAccount so the hermetic `helm lint` + `helm template | kubeconform -strict`
+  gate passes; the real workloads (store StatefulSet, Grafana/collector/MCP/oauth2-proxy
+  Deployments, ClusterIP Services, the nginx forward-auth Ingress) land in Phase 7.
+type: application
+# Chart version tracks the chart packaging; appVersion tracks the shipped image line.
+version: 0.2.0
+appVersion: "0.2.0"

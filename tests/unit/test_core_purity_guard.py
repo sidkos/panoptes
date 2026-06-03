@@ -40,11 +40,28 @@ from core.registry import STORES
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _CORE = _REPO_ROOT / "core"
 
+# v0.2 extends both controls to the new distributable surfaces (Terraform module, the
+# worked root example, the Helm chart). Brand-neutrality + the structural no-import-of-
+# examples guarantee must hold across IaC + chart text exactly as it does for core/.
+# These roots hold non-Python text (.tf/.yaml/.tpl/.md), so the scan walks ALL files
+# under them (not just *.py) — vacuously green on the Phase-0 skeleton.
+_EXTRA_SCAN_ROOTS = (
+    _REPO_ROOT / "modules",
+    _REPO_ROOT / "deploy",
+    _REPO_ROOT / "charts",
+)
+
 # Generic consumer-domain terms — NO brand literal (the guard is brand-free).
 _BANNED_TOKENS = frozenset({"allocator", "matchmaking", "agones"})
 
 # `from examples ...` / `import examples ...` at any indentation.
 _IMPORT_EXAMPLES = re.compile(r"^\s*(?:from|import)\s+examples\b", re.MULTILINE)
+
+# Suffixes of generated/binary artifacts that may land under the extra scan roots
+# (e.g. `.terraform/` provider plugins after a local `terraform init`, or `__pycache__`).
+# They are not source text and would either be binary-unreadable or carry vendored
+# tokens we do not own — excluded from the text scans below.
+_SKIP_DIR_NAMES = frozenset({".terraform", "__pycache__", ".git"})
 
 # The dotted path the injection hook imports (the in-repo demo pack).
 _PACK_MODULE = "examples.demo-pack.pack"
@@ -56,6 +73,39 @@ _DEMO_ADAPTER = "demo-synthetic"
 
 def _core_py_files() -> list[Path]:
     return sorted(_CORE.rglob("*.py"))
+
+
+def _extra_root_text_files() -> list[Path]:
+    """Return every source-text file under the v0.2 distributable roots.
+
+    Walks ``modules/``, ``deploy/``, ``charts/`` (each may not yet exist on a partial
+    checkout — tolerated) and returns the regular files, skipping generated/vendored
+    trees (`.terraform/`, `__pycache__/`, `.git/`). The structural + brand scans below
+    read these as UTF-8 text; truly binary files are skipped at read time.
+    """
+    files: list[Path] = []
+    for root in _EXTRA_SCAN_ROOTS:
+        if not root.exists():
+            continue
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            if any(part in _SKIP_DIR_NAMES for part in path.parts):
+                continue
+            files.append(path)
+    return files
+
+
+def _read_text_or_empty(path: Path) -> str:
+    """Read a file as UTF-8 text; return ``""`` for binary/undecodable content.
+
+    The extra scan roots may contain non-text artifacts; a binary file carries no
+    source token we authored, so a decode failure is treated as "nothing to scan".
+    """
+    try:
+        return path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError):
+        return ""
 
 
 def _baseline_config() -> ResolvedConfig:
@@ -81,22 +131,34 @@ def _baseline_config() -> ResolvedConfig:
 
 
 def test_core_does_not_import_from_examples() -> None:
+    # v0.2: the structural no-`examples`-import guarantee extends to the distributable
+    # IaC + chart roots. They hold no Python, so the regex matches nothing there —
+    # vacuously green on the skeleton, but the scan is wired for future additions.
+    scanned = _core_py_files() + _extra_root_text_files()
     offenders = [
         str(path.relative_to(_REPO_ROOT))
-        for path in _core_py_files()
-        if _IMPORT_EXAMPLES.search(path.read_text(encoding="utf-8"))
+        for path in scanned
+        if _IMPORT_EXAMPLES.search(_read_text_or_empty(path))
     ]
-    assert not offenders, f"core/ must not import from examples/: {offenders}"
+    assert not offenders, (
+        f"core/ + modules/ + deploy/ + charts/ must not import examples/: {offenders}"
+    )
 
 
 def test_core_contains_no_banned_consumer_tokens() -> None:
+    # v0.2: the brand-free generic-term grep extends to Terraform + Helm + the worked
+    # root example. Brand-neutrality must hold across the distributable surfaces, not
+    # only core/ — a leaked `allocator`/`matchmaking`/`agones` token in a chart value
+    # or a tfvars comment is just as much a consumer-coupling leak.
     hits: list[str] = []
-    for path in _core_py_files():
-        text = path.read_text(encoding="utf-8").lower()
+    for path in _core_py_files() + _extra_root_text_files():
+        text = _read_text_or_empty(path).lower()
         for token in _BANNED_TOKENS:
             if re.search(rf"\b{re.escape(token)}\b", text):
                 hits.append(f"{path.relative_to(_REPO_ROOT)}:{token}")
-    assert not hits, f"banned consumer-domain token(s) in core/: {hits}"
+    assert not hits, (
+        f"banned consumer-domain token(s) in core/ + modules/ + deploy/ + charts/: {hits}"
+    )
 
 
 def test_no_hook_server_equals_core_only_baseline(monkeypatch: pytest.MonkeyPatch) -> None:

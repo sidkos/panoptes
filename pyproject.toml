@@ -66,6 +66,8 @@ ignore_missing_imports = true       # only for deps that ship no type stubs
 addopts = "-ra --strict-markers"
 markers = [
     "integration: requires docker-compose / testcontainers (opt-in, slow)",
+    "terraform: requires the terraform binary; runs the hermetic IaC validate gate (opt-in)",
+    "helm: requires the helm + kubeconform binaries; runs the hermetic chart render gate (opt-in)",
 ]
 testpaths = ["tests"]
 

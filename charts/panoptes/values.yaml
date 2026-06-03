@@ -1,0 +1,22 @@
+# Panoptes Helm chart — default values.
+#
+# Phase-0 SKELETON: only the values the single placeholder ServiceAccount needs are
+# declared. The full surface (image tag, hostname, the GitHub client id/secret +
+# org/team allowlist, the IRSA role ARN, store retention, resource requests, the
+# nginx ingress class) is finalized in Phase 7 alongside the workload templates.
+
+# nameOverride/fullnameOverride let an operator disambiguate multiple installs in one
+# namespace; empty by default so the release name drives resource names.
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # The collector + MCP pods run under this SA. In Phase 7 it carries the
+  # `eks.amazonaws.com/role-arn` IRSA annotation (the home read-role); on the Phase-0
+  # skeleton it is a plain, un-annotated SA so the render is valid offline.
+  create: true
+  name: ""
+  # IRSA role ARN (`eks.amazonaws.com/role-arn`). Empty on the skeleton; wired to the
+  # Terraform module's `irsa_role_arn` output in Phase 7. When empty no annotation is
+  # emitted, keeping the kubeconform-validated manifest schema-clean.
+  irsaRoleArn: ""
