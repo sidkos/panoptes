@@ -287,32 +287,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _register_core_adapters() -> None:
-    """Import the core adapter modules so they self-register on the registries.
-
-    Adapters self-register via their `@REGISTRY.register(...)` decorator at import
-    time, but nothing imports them eagerly (so `flutter test`-style unit runs and the
-    pure config loader never drag in `boto3`/`httpx`). The CLI, however, builds REAL
-    adapters from the config, so it must trigger registration first. Imported lazily
-    inside the entrypoint (not at module scope) to keep the collector module's import
-    graph free of the heavy upstream-SDK dependencies the adapters pull in.
-    """
-    # Imported purely for the registration side-effect (the decorator runs at import
-    # time). `import_module` makes the side-effect-only intent explicit and avoids an
-    # unused-import lint on a bare `import core.stores.victoriametrics`.
-    import importlib
-
-    for module_path in (
-        "core.notifiers.logging_notifier",
-        "core.sources.cloudwatch",
-        "core.sources.http_health",
-        "core.sources.sentry",
-        "core.stores.passthrough",
-        "core.stores.victoriametrics",
-    ):
-        importlib.import_module(module_path)
-
-
 def main(argv: list[str] | None = None) -> None:
     """CLI entrypoint: load config, build a `Collector`, and run.
 
@@ -324,7 +298,11 @@ def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     args = _build_arg_parser().parse_args(argv)
     # Register the core adapters before resolving the config (which builds them).
-    _register_core_adapters()
+    # Shared with core.mcp.server.main via core.bootstrap so the two entrypoints'
+    # adapter sets never drift.
+    from core.bootstrap import register_core_adapters
+
+    register_core_adapters()
     config = load_config(args.config)
     collector = Collector(config)
     _LOGGER.info(

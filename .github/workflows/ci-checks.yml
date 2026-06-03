@@ -56,9 +56,35 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup-panoptes
-      # Phases 0-7 collect zero integration tests; pytest exit code 5 ("no tests
-      # collected") would otherwise red-bar the skeleton. Tolerate exit-5 until
-      # Phase 8 lands real integration tests — then this tolerance is REMOVED
-      # (see § Rollout Phases Phase 8 exit criteria) so an empty integration
-      # collection becomes a failure again and the gate cannot rot to always-green.
-      - run: pytest -m integration || [ $? -eq 5 ]   # testcontainers spins VM+Grafana; Docker preinstalled on ubuntu-latest
+      # Phase-8 re-tightened gate (spec § Rollout Phases Phase 8 exit criteria —
+      # BOTH halves, not a choice):
+      #   (a) the prior `|| [ $? -eq 5 ]` exit-code-5 tolerance is REMOVED, so an
+      #       empty integration collection (exit 5) is a real failure again and the
+      #       gate cannot rot to always-green; and
+      #   (b) an explicit minimum-collected-count assertion: `pytest -m integration`
+      #       must collect >= 5 tests (keyed to the ASSERTION count — collector-to-VM,
+      #       grafana-provisioning, and the three separate test_mcp_stdio_e2e
+      #       functions), so neither an empty collection nor a quiet
+      #       file-consolidation can silently shrink the suite under the floor.
+      #
+      # Mechanism chosen for (b): a `--collect-only -q` count step (parsed for the
+      # "N tests collected" summary). This is the authoritative anti-rot guard and
+      # runs WITHOUT Docker, so a collection regression red-bars fast and clearly,
+      # before the slower container run. (The same floor is ALSO enforced in-suite by
+      # tests/integration/conftest.py::pytest_collection_modifyitems as defense in
+      # depth — belt and suspenders; either tripping fails the job.)
+      - name: Assert integration suite collects >= 5 tests (anti-rot floor)
+        run: |
+          # pytest -q prints either "N tests collected" or, when deselecting,
+          # "N/M tests collected"; match the LEADING count in both forms.
+          summary=$(pytest -m integration --collect-only -q 2>/dev/null \
+            | grep -Eo '[0-9]+(/[0-9]+)? tests? collected' || true)
+          collected=$(printf '%s' "${summary}" | grep -Eo '^[0-9]+' || echo 0)
+          echo "Collected ${collected} integration test(s)."
+          if [ "${collected}" -lt 5 ]; then
+            echo "::error::Integration anti-rot floor: expected >= 5, collected ${collected}."
+            exit 1
+          fi
+      # The real run — exit-5 tolerance REMOVED; testcontainers spins VM+Grafana
+      # (Docker is preinstalled on ubuntu-latest).
+      - run: pytest -m integration

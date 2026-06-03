@@ -1,0 +1,130 @@
+# Panoptes v0.1 local stack (spec `## Local run & IaC contract`).
+#
+# `docker compose up` brings up the full pipeline on a laptop, pointed at the
+# operator's observed `dev` env: VictoriaMetrics (the metric store) + Grafana (the
+# human face) + the collector (fetch → normalize → store) + the MCP stdio server
+# (the LLM face). Zero cloud cost; the SAME compose file is what the v0.2 Terraform
+# host will run, so local and deployed stacks are identical.
+#
+# Risk R1/A8 — zero-build local loop: `collector` and `mcp` run the in-repo source
+# mounted into a stock `python:3.12-slim` and `pip install -e .` at start-up. No
+# published image is needed in v0.1 (a GHCR image is v0.2 distribution), and no
+# Dockerfile is needed because neither service requires a non-base runtime.
+#
+# Consumer-pack injection (spec § Consumer-pack loading): the consumer's pack dir is
+# bind-mounted READ-ONLY at /packs/consumer; `PANOPTES_CONSUMER_PACK` points the MCP
+# server at the mounted pack.py, and the Grafana provisioning globs /packs/consumer's
+# dashboards alongside the core packs. `CONSUMER_PACK_DIR` defaults to the in-repo
+# brand-neutral demo pack (see .env.example); a real consumer points it at its own
+# repo dir. `${CONSUMER_PACK_DIR:?}` fails fast with a clear error if it is unset.
+#
+# Secrets (AWS profile/role, Sentry token, health URL) come from the operator's
+# .env — never inlined here. CI is hermetic and does NOT run this compose file; the
+# integration suite spins ephemeral VictoriaMetrics + Grafana containers directly
+# (see tests/integration/conftest.py) with synthetic data only (Risk R10).
+
+services:
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.103.0
+    command:
+      - "--storageDataPath=/storage"
+      - "--retentionPeriod=${VM_RETENTION:-15d}"
+    ports:
+      - "${VM_HOST_PORT:-8428}:8428"
+    volumes:
+      # Named volume so metric data survives a `docker compose down` (without -v).
+      - vm-data:/storage
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana-oss:11.2.0
+    depends_on:
+      - victoriametrics
+    ports:
+      - "${GRAFANA_HOST_PORT:-3000}:3000"
+    environment:
+      # Resolved inside the provisioning YAMLs (datasource.yaml -> ${VM_URL},
+      # dashboards.yaml -> ${PANOPTES_PROVISIONING_DIR}). The datasource targets the
+      # in-network VictoriaMetrics Prometheus-compatible endpoint.
+      VM_URL: "http://victoriametrics:8428"
+      PANOPTES_PROVISIONING_DIR: "/var/lib/grafana/dashboards"
+      # Read-only monitoring surface: no anonymous-org edit, no sign-up.
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      # Core provisioning config (datasource + dashboards provider definitions).
+      - ./core/dashboards/provisioning/datasource.yaml:/etc/grafana/provisioning/datasources/panoptes.yaml:ro
+      - ./core/dashboards/provisioning/dashboards.yaml:/etc/grafana/provisioning/dashboards/panoptes.yaml:ro
+      # Tier-1 core dashboard packs (errors-sentry / logs / overview).
+      - ./core/dashboards:/var/lib/grafana/dashboards/core:ro
+      # Tier-2 injected consumer pack (the demo by default) — its dashboards/**.json
+      # is globbed by Grafana's file provider alongside the core packs. This is the
+      # mount-injection path the integration test proves.
+      - ${CONSUMER_PACK_DIR:?Set CONSUMER_PACK_DIR (see .env.example)}:/var/lib/grafana/dashboards/consumer:ro
+    restart: unless-stopped
+
+  collector:
+    image: python:3.12-slim
+    depends_on:
+      - victoriametrics
+    working_dir: /app
+    # A8: mount the repo source + editable-install at start, then run one scheduled
+    # collector. No Dockerfile/build step — the stock slim image is sufficient.
+    volumes:
+      - ./:/app:ro
+      - ${CONSUMER_PACK_DIR:?Set CONSUMER_PACK_DIR (see .env.example)}:/packs/consumer:ro
+    environment:
+      PANOPTES_CONFIG: "/packs/consumer/panoptes.yaml"
+      # Observed-env read credentials + endpoints come from the operator's .env.
+      AWS_REGION: "${AWS_REGION:-}"
+      AWS_PROFILE: "${AWS_PROFILE:-}"
+      PANOPTES_ASSUME_ROLE_ARN: "${PANOPTES_ASSUME_ROLE_ARN:-}"
+      PANOPTES_EXTERNAL_ID: "${PANOPTES_EXTERNAL_ID:-}"
+      SENTRY_ORG: "${SENTRY_ORG:-}"
+      SENTRY_PROJECT: "${SENTRY_PROJECT:-}"
+      SENTRY_TOKEN: "${SENTRY_TOKEN:-}"
+      DEV_HEALTH_URL: "${DEV_HEALTH_URL:-}"
+      CONSUMER_PACK_DIR: "${CONSUMER_PACK_DIR}"
+    command:
+      - "/bin/sh"
+      - "-c"
+      - "pip install --quiet --no-cache-dir -e . && python -m core.collector --config \"$$PANOPTES_CONFIG\""
+    restart: unless-stopped
+
+  mcp:
+    image: python:3.12-slim
+    depends_on:
+      - victoriametrics
+    working_dir: /app
+    # The MCP stdio server. stdin_open + tty keep stdio attachable for a local MCP
+    # client; it reads PANOPTES_CONFIG + PANOPTES_CONSUMER_PACK (a FILE PATH) from env.
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./:/app:ro
+      - ${CONSUMER_PACK_DIR:?Set CONSUMER_PACK_DIR (see .env.example)}:/packs/consumer:ro
+    environment:
+      PANOPTES_CONFIG: "/packs/consumer/panoptes.yaml"
+      # The consumer pack is mounted as a single importable file; the server loads it
+      # via importlib.util.spec_from_file_location (spec § Consumer-pack loading).
+      PANOPTES_CONSUMER_PACK: "/packs/consumer/pack.py"
+      AWS_REGION: "${AWS_REGION:-}"
+      AWS_PROFILE: "${AWS_PROFILE:-}"
+      PANOPTES_ASSUME_ROLE_ARN: "${PANOPTES_ASSUME_ROLE_ARN:-}"
+      PANOPTES_EXTERNAL_ID: "${PANOPTES_EXTERNAL_ID:-}"
+      SENTRY_ORG: "${SENTRY_ORG:-}"
+      SENTRY_PROJECT: "${SENTRY_PROJECT:-}"
+      SENTRY_TOKEN: "${SENTRY_TOKEN:-}"
+      DEV_HEALTH_URL: "${DEV_HEALTH_URL:-}"
+      CONSUMER_PACK_DIR: "${CONSUMER_PACK_DIR}"
+    command:
+      # The MCP stdio server's main() self-registers the core adapters (via
+      # core.bootstrap) before resolving PANOPTES_CONFIG, so the config's real `type`
+      # fields build cleanly — no pre-import preamble needed. Reads PANOPTES_CONFIG +
+      # PANOPTES_CONSUMER_PACK from the environment above.
+      - "/bin/sh"
+      - "-c"
+      - "pip install --quiet --no-cache-dir -e . && python -m core.mcp.server"
+    restart: unless-stopped
+
+volumes:
+  vm-data:

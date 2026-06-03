@@ -365,8 +365,13 @@ def main() -> None:
     """
     from pathlib import Path
 
+    from core.bootstrap import register_core_adapters
     from core.config import load_config
 
+    # Register the core adapters before resolving the config (which builds REAL
+    # adapters from its `type` fields) — mirrors core.collector.main. Without this a
+    # config naming `http-health`/`victoriametrics` would raise UnknownAdapterError.
+    register_core_adapters()
     config_path = os.environ.get("PANOPTES_CONFIG", "panoptes.yaml")
     config = load_config(Path(config_path))
     build_server(config).run()
