@@ -25,6 +25,7 @@ _CORE_ADAPTER_MODULES = (
     "core.sources.cloudwatch",
     "core.sources.http_health",
     "core.sources.kubernetes",
+    "core.sources.loki",
     "core.sources.prometheus",
     "core.sources.sentry",
     "core.stores.passthrough",
