@@ -1,0 +1,20 @@
+{{- /*
+The Panoptes config ConfigMap mounted at /config/panoptes.yaml on the collector + MCP pods.
+
+Carries ONLY the NON-SECRET config structure (`.Values.config.raw`): the in-cluster store
+URL, the dashboard packs, the HTTP MCP transport. SECRET-bearing values (Sentry token, Slack
+webhook, the alert topic ARN, the assume-role ARN, the GitHub client secret) are NEVER
+inlined here — they are injected into the collector + MCP pods as env vars via
+`envFrom: secretRef` (the `.Values.config.secretRefName` Secret) and `${VAR}`-interpolated by
+the config loader. So this ConfigMap is safe to render in plaintext (no secrets in it).
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "panoptes.fullname" . }}-config
+  labels:
+    {{- include "panoptes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: config
+data:
+  panoptes.yaml: |
+    {{- .Values.config.raw | nindent 4 }}

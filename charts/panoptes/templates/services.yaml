@@ -1,0 +1,78 @@
+{{- /*
+ClusterIP Services for every workload — NEVER LoadBalancer/NodePort.
+
+THE anonymous-bypass guard (decision #5): the MCP Service is `ClusterIP`, reachable only
+from inside the cluster — the nginx ingress (oauth2-proxy-gated) is the SOLE public path. A
+LoadBalancer/NodePort MCP Service would be an anonymous bypass of the GitHub gate. Every
+Service here is ClusterIP for the same reason: nothing is publicly reachable except through
+the gated ingress.
+*/ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "panoptes.fullname" . }}-mcp
+  labels:
+    {{- include "panoptes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mcp
+spec:
+  # ClusterIP ONLY — the anonymous-bypass guard. The MCP face is reached solely through the
+  # GitHub-gated nginx ingress; a LoadBalancer/NodePort would bypass the auth gate.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: {{ include "panoptes.name" . }}
+    app.kubernetes.io/component: mcp
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "panoptes.fullname" . }}-grafana
+  labels:
+    {{- include "panoptes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grafana
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: {{ include "panoptes.name" . }}
+    app.kubernetes.io/component: grafana
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "panoptes.fullname" . }}-victoriametrics
+  labels:
+    {{- include "panoptes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: victoriametrics
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: {{ include "panoptes.name" . }}
+    app.kubernetes.io/component: victoriametrics
+  ports:
+    - name: http
+      port: 8428
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "panoptes.fullname" . }}-oauth2-proxy
+  labels:
+    {{- include "panoptes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: oauth2-proxy
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: {{ include "panoptes.name" . }}
+    app.kubernetes.io/component: oauth2-proxy
+  ports:
+    - name: http
+      port: 4180
+      targetPort: http

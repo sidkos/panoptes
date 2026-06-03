@@ -120,6 +120,36 @@ class _FastMcpAdapter:
         """
         self._mcp.run(transport="streamable-http", host=host, port=port)
 
+    def register_health_route(self) -> None:
+        """Register the unauthenticated `GET /healthz` liveness route on the HTTP app.
+
+        `/healthz` returns `{"status": "ok"}` (200) and carries NO signal data — it is the
+        ONLY unauthenticated route (spec § MCP HTTP face): the nginx ingress exempts it from
+        forward-auth so the kubelet liveness probe + the ingress can confirm the server is up
+        WITHOUT a token. Registered via FastMCP 3.4.0's `custom_route`, which mounts a
+        Starlette route on the HTTP app the streamable-HTTP transport serves. The handler is
+        async because Starlette routes are async; it touches no config/store/tool — it cannot
+        leak observability data.
+        """
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse, Response
+
+        @self._mcp.custom_route("/healthz", methods=["GET"])
+        async def _healthz(_request: Request) -> Response:
+            """The liveness probe — a bare status object, no signal data, no auth."""
+            return JSONResponse({"status": "ok"})
+
+    def http_app(self) -> object:
+        """Return the rendered Starlette HTTP app (the streamable-HTTP transport's ASGI app).
+
+        Exposed so a SYNC test can drive `/healthz` (+ the MCP routes) with Starlette's
+        `TestClient` without binding a socket. The return is typed `object` because the
+        Starlette app type is part of the `FastMCP[Any]` boundary this adapter confines —
+        the caller (a TestClient) consumes it as an ASGI callable, needing no concrete type.
+        """
+        app: object = self._mcp.http_app()
+        return app
+
 
 # The v0.2-listed-but-unimplemented tools. Listing one is NOT a resolve failure —
 # the server registers it as a call-time "not available" stub. All are read-shaped names,
@@ -238,6 +268,14 @@ class PanoptesMcpServer:
         """
         self.mcp.run_http(host, port)
 
+    def http_app(self) -> object:
+        """Return the Starlette HTTP app the streamable-HTTP transport serves.
+
+        Exposed so a SYNC test can drive `/healthz` + the MCP routes via Starlette's
+        `TestClient` without binding a socket. Delegates to the adapter.
+        """
+        return self.mcp.http_app()
+
 
 def _configured_tool_names(config: ResolvedConfig) -> list[str]:
     """The tool names the config lists, defaulting to the full v0.1 set when omitted.
@@ -276,6 +314,12 @@ def build_server(
 
     mcp: FastMCP[object] = FastMCP("panoptes")
     server = PanoptesMcpServer(config, _FastMcpAdapter(mcp))
+
+    # Register the unauthenticated `/healthz` liveness route on the HTTP app (spec § MCP
+    # HTTP face). It is harmless on the stdio face (custom routes only surface on the HTTP
+    # app) and is the single route the nginx ingress exempts from forward-auth — so it is
+    # wired here, on the SAME server, for both faces (two faces, one server).
+    server.mcp.register_health_route()
 
     # Build the small `QueryContext` seam ONCE from the resolved config and bind it
     # into every tool wrapper, so the tools depend on the context interface — not the

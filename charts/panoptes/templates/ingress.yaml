@@ -1,0 +1,96 @@
+{{- /*
+The GitHub-gated nginx ingress (decision #3/#5) + the unauthenticated /healthz exemption.
+
+TWO Ingress objects, on purpose, so the auth boundary is unambiguous in the rendered config:
+
+1. The GATED Ingress carries the nginx forward-auth annotations
+   (`nginx.ingress.kubernetes.io/auth-url` + `auth-signin`) pointing at oauth2-proxy, plus a
+   cert-manager TLS annotation (`cert-manager.io/cluster-issuer` — Let's Encrypt, decision
+   #3). EVERY application path (the MCP HTTP face, Grafana) is behind it → every external
+   request is GitHub-org-gated before reaching a ClusterIP Service.
+
+2. The /healthz Ingress routes ONLY `/healthz` and carries NO forward-auth annotation — the
+   single UNAUTHENTICATED route (spec § MCP HTTP face): the kubelet liveness probe + the
+   ingress can confirm liveness without a token. /healthz returns `{"status":"ok"}` with no
+   signal data, so exempting it leaks nothing.
+
+The TLS block (cert-manager-issued) covers the hostname on both.
+*/ -}}
+{{- $fullname := include "panoptes.fullname" . -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "panoptes.labels" . | nindent 4 }}
+  annotations:
+    # nginx forward-auth → oauth2-proxy (the GitHub org/team gate). EVERY path on this
+    # Ingress is checked against oauth2-proxy's /oauth2/auth before reaching a backend.
+    nginx.ingress.kubernetes.io/auth-url: "https://{{ .Values.hostname }}/oauth2/auth"
+    nginx.ingress.kubernetes.io/auth-signin: "https://{{ .Values.hostname }}/oauth2/start?rd=$escaped_request_uri"
+    # cert-manager issues + renews the TLS cert for the hostname (Let's Encrypt, NOT ACM).
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.clusterIssuer | quote }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  tls:
+    - hosts:
+        - {{ .Values.hostname }}
+      secretName: {{ $fullname }}-tls
+  rules:
+    - host: {{ .Values.hostname }}
+      http:
+        paths:
+          # The MCP HTTP face — GitHub-gated (the auth-url above checks every request).
+          - path: /mcp
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullname }}-mcp
+                port:
+                  number: 8080
+          # Grafana — GitHub-gated.
+          - path: /grafana
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullname }}-grafana
+                port:
+                  number: 3000
+          # The oauth2-proxy endpoints (the gate's own /oauth2/* callback) — required for the
+          # forward-auth sign-in flow; oauth2-proxy itself terminates these.
+          - path: /oauth2
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullname }}-oauth2-proxy
+                port:
+                  number: 4180
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullname }}-healthz
+  labels:
+    {{- include "panoptes.labels" . | nindent 4 }}
+  annotations:
+    # NO forward-auth annotation here — /healthz is the single UNAUTHENTICATED liveness path.
+    # cert-manager still issues TLS for the hostname.
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.clusterIssuer | quote }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  tls:
+    - hosts:
+        - {{ .Values.hostname }}
+      secretName: {{ $fullname }}-tls
+  rules:
+    - host: {{ .Values.hostname }}
+      http:
+        paths:
+          # The ONLY unauthenticated route — the MCP liveness probe. No forward-auth.
+          - path: /healthz
+            pathType: Exact
+            backend:
+              service:
+                name: {{ $fullname }}-mcp
+                port:
+                  number: 8080

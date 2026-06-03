@@ -117,7 +117,12 @@ jobs:
           tar -xzf kubeconform.tar.gz kubeconform
           sudo install -m 0755 kubeconform /usr/local/bin/kubeconform
           rm -f kubeconform.tar.gz kubeconform
-      - run: helm lint charts/panoptes
+      # Lint WITH the CI fixture values: values.schema.json requires a non-empty
+      # oauth2Proxy.githubOrg (the fail-closed GitHub gate), and the default values.yaml
+      # ships githubOrg: "" so a deploy MUST supply it — so a bare `helm lint` would fail the
+      # schema. Linting against a valid install (the CI fixture) is the right hermetic check;
+      # the empty-org-fails-closed case is asserted by the marked render test below.
+      - run: helm lint charts/panoptes -f charts/panoptes/ci/test-values.yaml
       - run: helm template charts/panoptes -f charts/panoptes/ci/test-values.yaml | kubeconform -strict -summary
       # Python venv for the marked render-assertion test (extended in Phase 7). Selecting
       # `-m helm` runs ONLY the marked chart tests against the just-validated chart.

@@ -1,0 +1,61 @@
+{{- /*
+The single-node VictoriaMetrics store — EXACTLY one replica + one PVC.
+
+A one-node store is the deliberate cost-disciplined choice (spec § hosting model — single-
+node store, no HA/multi-node). `replicas: 1` is fixed (not a value) so the single-node
+posture can never be widened by a values override; persistent storage is a PVC declared via
+volumeClaimTemplates. The store is reached only in-cluster (its Service is ClusterIP).
+*/ -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "panoptes.fullname" . }}-victoriametrics
+  labels:
+    {{- include "panoptes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: victoriametrics
+spec:
+  serviceName: {{ include "panoptes.fullname" . }}-victoriametrics
+  # EXACTLY one replica — the single-node store (no HA, cost discipline).
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "panoptes.name" . }}
+      app.kubernetes.io/component: victoriametrics
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "panoptes.name" . }}
+        app.kubernetes.io/component: victoriametrics
+    spec:
+      # The VM store talks only to the collector/Grafana over HTTP — it needs no K8s API
+      # token, so the SA token is NOT automounted (token blast-radius reduction).
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "panoptes.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: victoriametrics
+          image: {{ .Values.victoriametrics.image | quote }}
+          # Base container hardening (drop ALL caps + no privilege escalation). NOTE:
+          # `readOnlyRootFilesystem` is intentionally NOT set — VM writes its TSDB to
+          # /storage, which is the PVC-backed volume below (the only writable path).
+          securityContext:
+            {{- include "panoptes.containerSecurityContext" . | nindent 12 }}
+          args:
+            - "--storageDataPath=/storage"
+            - "--retentionPeriod={{ .Values.victoriametrics.retention }}"
+          ports:
+            - name: http
+              containerPort: 8428
+          volumeMounts:
+            - name: storage
+              mountPath: /storage
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: storage
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.victoriametrics.storageSize }}

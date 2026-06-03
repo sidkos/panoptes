@@ -1,0 +1,68 @@
+{{- /*
+The collector Deployment — runs the GHCR image's collector loop under the IRSA-annotated SA.
+
+Runs `python -m core.collector` (the per-cycle fetch → store → alert loop). It runs under
+the FIXED `panoptes-collector` ServiceAccount, so its pod assumes the SA-scoped IRSA role
+via the projected SA token — the ONLY credential path (no mounted static AWS keys; observed
+access is read-only via IRSA). The image is the pinned immutable GHCR tag.
+*/ -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "panoptes.fullname" . }}-collector
+  labels:
+    {{- include "panoptes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "panoptes.name" . }}
+      app.kubernetes.io/component: collector
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "panoptes.name" . }}
+        app.kubernetes.io/component: collector
+    spec:
+      # The IRSA-annotated collector SA — the pod's credential path (no mounted keys). The
+      # collector NEEDS the projected SA token (IRSA + the kubernetes source), so token
+      # automount stays ON here.
+      serviceAccountName: {{ include "panoptes.collectorServiceAccountName" . }}
+      securityContext:
+        {{- include "panoptes.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: collector
+          image: {{ include "panoptes.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- include "panoptes.containerSecurityContext" . | nindent 12 }}
+            # The python collector tolerates a read-only root FS (its only writes are to /tmp,
+            # an emptyDir below) — so observed access cannot tamper with the image.
+            readOnlyRootFilesystem: true
+          command: ["python", "-m", "core.collector"]
+          args: ["--config", "/config/panoptes.yaml", "--poll-interval-seconds", "60"]
+          env:
+            - name: PANOPTES_CONFIG
+              value: /config/panoptes.yaml
+          # Secret-bearing values (SENTRY_TOKEN, SLACK_WEBHOOK_URL, ALERT_TOPIC_ARN,
+          # PANOPTES_ASSUME_ROLE_ARN, …) come from the referenced Secret as env vars — NEVER
+          # inlined. The config loader `${VAR}`-interpolates them.
+          envFrom:
+            - secretRef:
+                name: {{ .Values.config.secretRefName }}
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "panoptes.fullname" . }}-config
+        # A writable scratch dir so the read-only root FS does not break /tmp writes.
+        - name: tmp
+          emptyDir: {}

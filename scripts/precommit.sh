@@ -223,7 +223,10 @@ run_infra() {
 
   if command -v helm >/dev/null 2>&1 && command -v kubeconform >/dev/null 2>&1; then
     echo "[helm] lint / template | kubeconform -strict ..."
-    helm lint charts/panoptes
+    # Lint WITH the CI fixture values: values.schema.json requires a non-empty
+    # oauth2Proxy.githubOrg (the fail-closed GitHub gate); the default values.yaml ships it
+    # empty so a bare `helm lint` fails the schema. Lint against a valid install fixture.
+    helm lint charts/panoptes -f charts/panoptes/ci/test-values.yaml
     helm template charts/panoptes -f charts/panoptes/ci/test-values.yaml | kubeconform -strict -summary
     "${PYTEST}" -m helm
     ran_any=1

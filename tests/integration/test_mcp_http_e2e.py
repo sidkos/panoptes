@@ -35,6 +35,7 @@ from .conftest import (
     DASHBOARD_QUERY_STEP_SECONDS,
     VictoriaMetricsHandle,
     _HttpServerHandle,
+    forward_auth_gate,
     make_import_line,
     now_utc,
 )
@@ -124,6 +125,63 @@ def test_http_transport_carries_proxy_identity_header_for_audit(
     # The tool answers normally — the proxy header rides along (server does not reject it).
     health = client.call_tool_data("describe_health", {"env": _ENV})
     assert health["env"] == _ENV
+
+
+def test_forward_auth_gate_rejects_request_without_identity_header() -> None:
+    """The SIMULATED nginx forward-auth gate rejects a request lacking the proxy identity.
+
+    The server validates no token (the gate is the ingress); this asserts the GATE'S BEHAVIOR
+    at the test layer: the simulated nginx `auth-url` subrequest REJECTS a request whose
+    oauth2-proxy `X-Auth-Request-User` header is absent (a 401 before the upstream is ever
+    reached). With NO identity header the gate denies — exactly what the nginx forward-auth
+    annotations (asserted in the Helm render test) enforce in production. This is a pure
+    in-memory check of the gate function, so it needs no live server fixture.
+    """
+    # No identity header → the simulated forward-auth gate denies the request.
+    assert forward_auth_gate({}) is False
+    # And a stray non-identity header does not satisfy the gate either.
+    assert forward_auth_gate({"User-Agent": "kubelet"}) is False
+
+
+def test_forward_auth_gate_admits_request_with_valid_identity_and_reaches_a_tool(
+    mcp_http_server: _HttpServerHandle,
+) -> None:
+    """WITH a valid oauth2-proxy identity header the gate admits + the tool answers end-to-end.
+
+    The simulated gate ADMITS a request carrying a valid `X-Auth-Request-User` header, and the
+    request then reaches a real tool over the streamable-HTTP transport (the server logs the
+    identity for audit). This is the positive half of the gate behavior — reject-without /
+    admit-with — paired with the rejection test above.
+    """
+    identity_headers = {
+        "X-Auth-Request-User": "octocat",
+        "X-Auth-Request-Email": "octocat@example.com",
+    }
+    # The simulated forward-auth gate ADMITS the request (the identity is present).
+    assert forward_auth_gate(identity_headers) is True
+    # Admitted → the request reaches a real tool over the transport, carrying the identity.
+    client = mcp_http_server.client(headers=identity_headers)
+    health = client.call_tool_data("describe_health", {"env": _ENV})
+    assert health["env"] == _ENV
+
+
+def test_healthz_answers_without_auth_and_returns_no_signal_data(
+    mcp_http_server: _HttpServerHandle,
+) -> None:
+    """`GET /healthz` answers WITHOUT auth and returns NO signal data, over the real transport.
+
+    The single unauthenticated route: the kubelet liveness probe + the ingress check it with
+    no token (the ingress exempts /healthz from forward-auth). It returns `{"status":"ok"}`
+    and must leak no metric/tool/config data. Hit it directly over HTTP with no auth header.
+    """
+    response = mcp_http_server.get_healthz()
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {"status": "ok"}
+    # No signal data leaked — the body is exactly the bare status.
+    rendered = response.text.lower()
+    for forbidden in ("metric", "panoptes_", "series", "token", "arn"):
+        assert forbidden not in rendered, f"/healthz leaked a signal-ish token {forbidden!r}"
 
 
 def _last_value_from_query_metric(result: dict[str, object]) -> float:

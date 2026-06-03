@@ -1,0 +1,85 @@
+{{- /*
+The oauth2-proxy Deployment — the GitHub auth gate (decision #5).
+
+Runs the `github` provider with the org/team allowlist from values; the nginx ingress's
+forward-auth (`auth-url`/`auth-signin`) points at this proxy, so every gated request is
+checked against the GitHub org/team before reaching a workload. The client id + org/team are
+non-secret values; the client SECRET + cookie secret come from a referenced Secret
+(`oauth2Proxy.existingSecretName`) — never an inlined literal. On success oauth2-proxy injects
+`X-Auth-Request-User`/`X-Auth-Request-Email` headers the MCP server logs for audit.
+*/ -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "panoptes.fullname" . }}-oauth2-proxy
+  labels:
+    {{- include "panoptes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: oauth2-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "panoptes.name" . }}
+      app.kubernetes.io/component: oauth2-proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "panoptes.name" . }}
+        app.kubernetes.io/component: oauth2-proxy
+    spec:
+      # oauth2-proxy talks only to GitHub + the nginx forward-auth subrequest — it needs no
+      # K8s API token, so the SA token is NOT automounted (token blast-radius reduction).
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "panoptes.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: oauth2-proxy
+          image: {{ .Values.oauth2Proxy.image | quote }}
+          securityContext:
+            {{- include "panoptes.containerSecurityContext" . | nindent 12 }}
+            # oauth2-proxy tolerates a read-only root FS (it holds no on-disk state).
+            readOnlyRootFilesystem: true
+          args:
+            - "--provider=github"
+            # FAIL-CLOSED org allowlist: `required` ABORTS the render when githubOrg is
+            # empty. An empty `--github-org=` would DISABLE the GitHub org allowlist in
+            # oauth2-proxy v7.7.1 (its `hasOrgAndTeamAccess` returns ALLOW when Org==""),
+            # so combined with `--email-domain=*` the gate would admit ANY GitHub user.
+            # Requiring a non-empty org makes mis-configuration a deploy-time failure, not a
+            # silent open gate. (values.schema.json enforces minLength 1 at lint/install too.)
+            - "--github-org={{ required "oauth2Proxy.githubOrg is required — an empty org disables the GitHub allowlist and admits any GitHub user" .Values.oauth2Proxy.githubOrg }}"
+            {{- with .Values.oauth2Proxy.githubTeam }}
+            - "--github-team={{ . }}"
+            {{- end }}
+            - "--client-id={{ .Values.oauth2Proxy.githubClientId }}"
+            - "--http-address=0.0.0.0:4180"
+            - "--reverse-proxy=true"
+            - "--upstream=static://202"
+            # `--email-domain=*` is correct GitHub-provider practice ONCE org enforcement is
+            # guaranteed above: GitHub does not expose a verified email domain to gate on;
+            # the org/team allowlist is the access boundary, not the email domain.
+            - "--email-domain=*"
+            # `--set-xauthrequest=true` injects the `X-Auth-Request-User`/`-Email` identity
+            # headers downstream (the MCP server logs them for audit; the integration gate
+            # simulation keys on `X-Auth-Request-User`). Removing this would silently break
+            # both the audit trail and the identity-header contract.
+            - "--set-xauthrequest=true"
+          env:
+            # The client SECRET + cookie secret come from the referenced Secret — never
+            # inlined. The Secret is created out-of-band (operator/sealed-secret); the chart
+            # references it by NAME only.
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.oauth2Proxy.existingSecretName }}
+                  key: client-secret
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.oauth2Proxy.existingSecretName }}
+                  key: cookie-secret
+          ports:
+            - name: http
+              containerPort: 4180
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

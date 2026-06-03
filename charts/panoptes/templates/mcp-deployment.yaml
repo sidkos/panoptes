@@ -1,0 +1,86 @@
+{{- /*
+The MCP Deployment — serves the streamable-HTTP face under the IRSA-annotated MCP SA.
+
+Runs `python -m core.mcp.server` with `mcp.transport: http` (the hosted face). Its pod runs
+under the FIXED `panoptes-mcp` ServiceAccount → the SA-scoped IRSA role (the only credential
+path). The MCP server validates NO token — the GitHub auth gate is the nginx ingress +
+oauth2-proxy (the MCP Service is ClusterIP; the ingress is the only public path). The
+container exposes the HTTP port the ClusterIP Service fronts; `/healthz` is the liveness
+probe path the ingress exempts from forward-auth.
+*/ -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "panoptes.fullname" . }}-mcp
+  labels:
+    {{- include "panoptes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "panoptes.name" . }}
+      app.kubernetes.io/component: mcp
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "panoptes.name" . }}
+        app.kubernetes.io/component: mcp
+    spec:
+      # The IRSA-annotated MCP SA — the pod's credential path (no mounted keys). The MCP pod
+      # NEEDS the projected SA token (IRSA), so token automount stays ON here.
+      serviceAccountName: {{ include "panoptes.mcpServiceAccountName" . }}
+      securityContext:
+        {{- include "panoptes.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: mcp
+          image: {{ include "panoptes.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- include "panoptes.containerSecurityContext" . | nindent 12 }}
+            # The python MCP server tolerates a read-only root FS (writes only to /tmp).
+            readOnlyRootFilesystem: true
+          command: ["python", "-m", "core.mcp.server"]
+          env:
+            - name: PANOPTES_CONFIG
+              value: /config/panoptes.yaml
+            - name: PANOPTES_MCP_HOST
+              value: "0.0.0.0"
+            - name: PANOPTES_MCP_PORT
+              value: "8080"
+          # Secret-bearing values come from the referenced Secret as env vars — never inlined.
+          envFrom:
+            - secretRef:
+                name: {{ .Values.config.secretRefName }}
+          ports:
+            - name: http
+              containerPort: 8080
+          # The liveness/readiness probes hit the unauthenticated /healthz route (no token —
+          # the kubelet probe carries none; the ingress exempts /healthz from forward-auth).
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "panoptes.fullname" . }}-config
+        # A writable scratch dir so the read-only root FS does not break /tmp writes.
+        - name: tmp
+          emptyDir: {}

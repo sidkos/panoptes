@@ -1,0 +1,90 @@
+# The HOSTED Panoptes config (the EKS deploy face — spec § hosting model).
+#
+# This is the shape the Helm chart mounts: `dev` is live; `stage`/`prod` are
+# wired-but-inert (`enabled: false`) disabled stubs that light up with a flag flip + a
+# non-empty role list (decision #6), no code change. The MCP runs the HTTP transport
+# (GitHub-gated at the nginx ingress + oauth2-proxy — the server validates no token). Every
+# secret/endpoint is `${VAR}`-interpolated from the pod environment — NEVER inlined.
+panoptes:
+  environments:
+    dev:
+      enabled: true
+      sources:
+        - type: cloudwatch
+          region: ${AWS_REGION}
+          namespace: AWS/ApplicationELB
+          metric_names: [RequestCount, HTTPCode_Target_5XX_Count]
+          log_groups: [/demo/dev/app]
+          # Read-only AWS via the IRSA base identity assuming the per-env read-role.
+          assume_role_arn: ${PANOPTES_ASSUME_ROLE_ARN}
+        - type: sentry
+          org: ${SENTRY_ORG}
+          project: ${SENTRY_PROJECT}
+          token: ${SENTRY_TOKEN}
+        - type: http-health
+          url: ${DEV_HEALTH_URL}
+        # The kubernetes source: reads a cluster's nodes/pods/events into derived gauges +
+        # Warning-event incidents. `cluster` distinguishes an observed cluster from
+        # Panoptes' own self-observed one (the label keeps the two apart in the store).
+        - type: kubernetes
+          cluster: ${DEV_OBSERVED_CLUSTER}
+    stage:
+      # Disabled stub: parses but builds NO live adapters until flipped on (decision #6).
+      enabled: false
+      sources:
+        - type: http-health
+          url: ${STAGE_HEALTH_URL}
+    prod:
+      enabled: false
+      sources: []
+  store:
+    type: victoriametrics
+    # In-cluster store Service (ClusterIP); the chart names it `<release>-victoriametrics`.
+    url: http://panoptes-victoriametrics:8428
+    retention: 15d
+  notifiers:
+    - type: logging
+    - type: sns
+      topic_arn: ${ALERT_TOPIC_ARN}
+    - type: slack
+      webhook_url: ${SLACK_WEBHOOK_URL}
+  dashboards:
+    provider: grafana
+    env_variable: true
+    # The hosted core packs: the v0.1 trio + the v0.2 kubernetes + slo packs.
+    core_packs: [errors-sentry, logs, overview, kubernetes, slo]
+    consumer_pack:
+      path: ${CONSUMER_PACK_DIR}
+  slos:
+    - name: health-uptime
+      objective: 0.99
+      # The optional v0.2 query/window: the availability gauge over a 24h window.
+      query: panoptes_health_up
+      window: 24h
+  alerts:
+    # A declarative alert rule: fire when crashlooping containers exceed 0 for 3 cycles.
+    - name: crashloop-detected
+      expr: panoptes_k8s_pods_crashloop
+      comparison: gt
+      threshold: 0
+      for_cycles: 3
+      severity: critical
+      envs: [dev]
+      labels:
+        team: platform
+    # An availability SLO-burn alert across every enabled env.
+    - name: availability-degraded
+      expr: panoptes_health_up
+      comparison: lt
+      threshold: 0.99
+      severity: warning
+      envs: [all]
+  mcp:
+    # The HOSTED face: HTTP transport, GitHub SSO at the nginx ingress (decision #5). The
+    # server holds no IdP secret + validates no token — `auth: sso` documents that the gate
+    # is the ingress + oauth2-proxy, not the server.
+    transport: http
+    auth: sso
+    tools: [describe_signal_catalog, list_dashboards, get_dashboard_data,
+            query_metric, search_incidents, search_logs, describe_health,
+            get_cluster_state, get_slo, compare_envs]

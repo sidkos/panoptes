@@ -1,11 +1,26 @@
 # Hermetic CI fixture values for `helm template charts/panoptes -f ci/test-values.yaml`.
 #
-# Mirrors what the `helm` CI job and the `tests/helm/test_chart_render.py` gate render:
-# fully offline, no cluster, no secrets. Phase-0 supplies just enough to render the
-# placeholder ServiceAccount; Phase 7 adds the workload/ingress/IRSA fixtures here.
-serviceAccount:
-  create: true
-  name: "panoptes"
-  # A representative (well-formed but non-live) IRSA role ARN so the Phase-7 annotation
-  # render path is exercised under CI. Schema-valid; points at no real account.
-  irsaRoleArn: "arn:aws:iam::000000000000:role/panoptes-irsa"
+# Mirrors what the `helm` CI job + `tests/helm/test_chart_render.py` render: fully offline,
+# no cluster, no LIVE secrets. The values below are well-formed but non-live (an example
+# IRSA ARN, a placeholder hostname/org/client-id) so the render path is fully exercised +
+# kubeconform-validated without touching any real resource. No secret VALUE is inlined — the
+# oauth2-proxy client secret comes from a (referenced, non-rendered) Secret name.
+image:
+  # A pinned non-live tag so the IMMUTABLE-tag render path is exercised (never `:latest`).
+  tag: "v0.2.0"
+
+hostname: panoptes.test.example
+
+ingress:
+  className: nginx
+  clusterIssuer: letsencrypt-staging
+
+# A representative (well-formed but non-live) IRSA role ARN so the collector + MCP SA
+# annotation render path is exercised under CI. Schema-valid; points at no real account.
+irsaRoleArn: "arn:aws:iam::000000000000:role/panoptes-irsa"
+
+oauth2Proxy:
+  githubOrg: "example-org"
+  githubTeam: "platform"
+  githubClientId: "Iv1.0000000000000000"
+  existingSecretName: "panoptes-oauth2-proxy"

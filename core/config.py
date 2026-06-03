@@ -137,6 +137,10 @@ class McpConfig(TypedDict, total=False):
 
     transport: str
     tools: list[str]
+    # `sso` documents that the hosted HTTP face is GitHub-gated at the nginx ingress +
+    # oauth2-proxy (decision #5). It is informational — the server holds no IdP secret and
+    # validates no token; the gate is the ingress, not the server. Parsed-but-not-acted-on.
+    auth: str
 
 
 class AlertRuleConfig(TypedDict, total=False):

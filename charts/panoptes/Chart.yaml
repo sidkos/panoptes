@@ -2,10 +2,11 @@ apiVersion: v2
 name: panoptes
 description: >-
   The in-cluster deploy artifact for Panoptes — a standalone, pluggable normalizing
-  meta-layer over your monitoring tools. Phase-0 SKELETON: renders a single
-  ServiceAccount so the hermetic `helm lint` + `helm template | kubeconform -strict`
-  gate passes; the real workloads (store StatefulSet, Grafana/collector/MCP/oauth2-proxy
-  Deployments, ClusterIP Services, the nginx forward-auth Ingress) land in Phase 7.
+  meta-layer over your monitoring tools. Renders the single-node VictoriaMetrics store
+  StatefulSet, the Grafana/collector/MCP/oauth2-proxy Deployments, ClusterIP-only Services
+  (the MCP Service is ClusterIP — the anonymous-bypass guard), the IRSA-annotated
+  collector + MCP ServiceAccounts, and the GitHub-gated nginx forward-auth Ingress
+  (oauth2-proxy + cert-manager TLS) with an unauthenticated /healthz liveness path.
 type: application
 # Chart version tracks the chart packaging; appVersion tracks the shipped image line.
 version: 0.2.0

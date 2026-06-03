@@ -627,6 +627,16 @@ class _HttpServerHandle:
         # FastMCP's streamable-HTTP transport serves the MCP endpoint under `/mcp/`.
         return _HttpMcpClient(url=f"{self.base_url}/mcp/", headers=headers)
 
+    def get_healthz(self) -> httpx.Response:
+        """GET the unauthenticated `/healthz` liveness route directly (sync, no auth header).
+
+        `/healthz` is the single unauthenticated route — the kubelet probe carries no token,
+        and the nginx ingress exempts it from forward-auth. Returns the raw httpx response so
+        a test can assert the status + the no-signal-data body.
+        """
+        with httpx.Client(timeout=5.0) as client:
+            return client.get(f"{self.base_url}/healthz")
+
 
 @pytest.fixture
 def mcp_http_server(
@@ -779,3 +789,30 @@ DASHBOARD_QUERY_STEP_SECONDS = _DASHBOARD_QUERY_STEP_SECONDS
 def now_utc() -> datetime:
     """The current UTC time (single seam so a test's fixed timestamp is consistent)."""
     return datetime.now(UTC)
+
+
+# --- Simulated nginx forward-auth gate (the boundary the server does NOT enforce) ----
+#
+# The MCP server validates NO token (spec § Authorization Rules) — the GitHub gate is the
+# nginx ingress + oauth2-proxy, which is NOT running in this in-process test. So the gate is
+# SIMULATED at the test layer: `forward_auth_gate` is what the nginx `auth-url` forward-auth
+# subrequest does — it rejects a request whose oauth2-proxy identity header is absent (a
+# 401, as the ingress would, BEFORE the request ever reaches the upstream), and admits one
+# carrying a valid `X-Auth-Request-User` header. The Helm render test asserts the real nginx
+# annotations; this asserts the gate's BEHAVIOR (reject-without / admit-with) end to end.
+
+# The identity header oauth2-proxy injects on a successful GitHub auth (set via
+# `--set-xauthrequest=true`). Its presence is what the simulated gate keys on.
+_OAUTH2_PROXY_IDENTITY_HEADER = "X-Auth-Request-User"
+
+
+def forward_auth_gate(headers: Mapping[str, str]) -> bool:
+    """Simulate the nginx forward-auth gate: admit iff the oauth2-proxy identity is present.
+
+    Returns True when the request carries a non-empty `X-Auth-Request-User` header (the
+    oauth2-proxy-injected identity after a successful GitHub auth), else False — exactly the
+    nginx `auth-url` subrequest decision (401 when absent, proceed when present). The server
+    itself never checks this; the ingress (here simulated) is the boundary.
+    """
+    identity = headers.get(_OAUTH2_PROXY_IDENTITY_HEADER, "")
+    return bool(identity)

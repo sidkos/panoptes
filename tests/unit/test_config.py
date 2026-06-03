@@ -636,6 +636,109 @@ def test_alert_missing_required_field_fails_fast(
     assert "threshold" in str(excinfo.value)
 
 
+# --- v0.2: the HOSTED config (examples/demo-pack/panoptes.hosted.yaml) ------------
+
+# The shipped hosted config the Helm chart mounts (the EKS deploy face).
+_HOSTED_CONFIG = (
+    Path(__file__).resolve().parents[2] / "examples" / "demo-pack" / "panoptes.hosted.yaml"
+)
+
+
+def _registries_for_hosted_config() -> PlaneRegistries:
+    """Registries covering EVERY adapter type the hosted config references.
+
+    Built from the isolation seam with fake adapter classes for the hosted source types
+    (cloudwatch / sentry / http-health / kubernetes), the notifiers (logging / sns / slack),
+    the store, and the grafana provider — so the hosted config resolves WITHOUT importing the
+    real boto3/httpx/kubernetes-backed adapters. The fake source capabilities are omitted
+    from `provides:` in the hosted config, so any capability set resolves.
+    """
+    registries = PlaneRegistries.empty()
+    registries.sources.register("cloudwatch")(
+        _make_source_class({SignalKind.METRIC, SignalKind.LOG})
+    )
+    registries.sources.register("sentry")(
+        _make_source_class({SignalKind.INCIDENT, SignalKind.METRIC})
+    )
+    registries.sources.register("http-health")(_make_source_class({SignalKind.METRIC}))
+    registries.sources.register("kubernetes")(
+        _make_source_class({SignalKind.METRIC, SignalKind.INCIDENT})
+    )
+    registries.stores.register("victoriametrics")(_FakeStore)
+    registries.notifiers.register("logging")(_FakeNotifier)
+    registries.notifiers.register("sns")(_make_notifier_class("sns"))
+    registries.notifiers.register("slack")(_make_notifier_class("slack"))
+    registries.dashboard_providers.register("grafana")(_FakeDashboardProvider)
+    return registries
+
+
+def _set_hosted_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Set every `${VAR}` the hosted config interpolates (non-live placeholder values)."""
+    monkeypatch.setenv("AWS_REGION", "eu-west-1")
+    monkeypatch.setenv(
+        "PANOPTES_ASSUME_ROLE_ARN", "arn:aws:iam::111122223333:role/PanoptesReadRole-dev"
+    )
+    monkeypatch.setenv("SENTRY_ORG", "acme")
+    monkeypatch.setenv("SENTRY_PROJECT", "backend")
+    monkeypatch.setenv("SENTRY_TOKEN", "tok")
+    monkeypatch.setenv("DEV_HEALTH_URL", "https://dev.example/health")
+    monkeypatch.setenv("STAGE_HEALTH_URL", "https://stage.example/health")
+    monkeypatch.setenv("DEV_OBSERVED_CLUSTER", "observed-dev")
+    monkeypatch.setenv("CONSUMER_PACK_DIR", "/packs/consumer")
+    monkeypatch.setenv("ALERT_TOPIC_ARN", "arn:aws:sns:eu-west-1:111122223333:panoptes-alerts")
+    monkeypatch.setenv("SLACK_WEBHOOK_URL", "https://hooks.slack.test/x")
+
+
+def test_hosted_config_resolves(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shipped hosted config resolves to a full `ResolvedConfig`."""
+    _set_hosted_env(monkeypatch)
+    resolved = load_config(_HOSTED_CONFIG, registries=_registries_for_hosted_config())
+    assert isinstance(resolved, ResolvedConfig)
+    # dev is live with its sources built; the kubernetes source is among them.
+    dev_source_types = {rs.source.type for rs in resolved.environments["dev"].sources}
+    assert "kubernetes" in dev_source_types
+    # All three notifiers resolved (logging + sns + slack).
+    assert {n.type for n in resolved.notifiers} >= {"logging", "sns", "slack"}
+
+
+def test_hosted_config_stage_and_prod_are_disabled_stubs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`stage`/`prod` are `enabled:false` stubs — they build NO live adapters (decision #6)."""
+    _set_hosted_env(monkeypatch)
+    resolved = load_config(_HOSTED_CONFIG, registries=_registries_for_hosted_config())
+    assert resolved.environments["stage"].enabled is False
+    assert resolved.environments["stage"].sources == []
+    assert resolved.environments["prod"].enabled is False
+    assert resolved.environments["prod"].sources == []
+
+
+def test_hosted_config_mcp_transport_is_http(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The hosted config's `mcp.transport: http` (+ `auth: sso`) parses."""
+    _set_hosted_env(monkeypatch)
+    resolved = load_config(_HOSTED_CONFIG, registries=_registries_for_hosted_config())
+    assert resolved.mcp["transport"] == "http"
+    # `auth: sso` is parsed-but-informational (the gate is the ingress, not the server).
+    assert resolved.mcp.get("auth") == "sso"
+
+
+def test_hosted_config_alerts_and_slos_resolve(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The hosted config's `alerts:` + `slos:` blocks resolve to typed objects."""
+    _set_hosted_env(monkeypatch)
+    resolved = load_config(_HOSTED_CONFIG, registries=_registries_for_hosted_config())
+    # The alert rules parsed (the crashloop + availability rules).
+    alert_names = {rule.name for rule in resolved.alerts}
+    assert {"crashloop-detected", "availability-degraded"} <= alert_names
+    crashloop = next(rule for rule in resolved.alerts if rule.name == "crashloop-detected")
+    assert crashloop.comparison is Comparison.GT
+    assert crashloop.for_cycles == 3
+    # The SLO carries the optional v0.2 query/window.
+    slo = resolved.slos[0]
+    assert slo["name"] == "health-uptime"
+    assert slo.get("query") == "panoptes_health_up"
+    assert slo.get("window") == "24h"
+
+
 # --- PlaneRegistries test-isolation seam -----------------------------------------
 #
 # `PlaneRegistries.empty()` is the documented canonical seam for obtaining a fully

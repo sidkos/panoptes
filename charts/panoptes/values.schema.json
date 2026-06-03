@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "Panoptes Helm chart values",
+  "description": "Schema validated by `helm lint`/`helm install`. The load-bearing constraint is the NON-EMPTY oauth2Proxy.githubOrg: an empty org disables the GitHub allowlist (oauth2-proxy v7.7.1 admits any user when Org==''), so the schema rejects it at lint/install time, complementing the template's `required` fail-closed guard.",
+  "type": "object",
+  "properties": {
+    "oauth2Proxy": {
+      "type": "object",
+      "required": ["githubOrg"],
+      "properties": {
+        "githubOrg": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The GitHub org allowlist — the access boundary. MUST be non-empty; an empty org disables the allowlist and admits any GitHub user."
+        },
+        "githubTeam": { "type": "string" },
+        "githubClientId": { "type": "string" },
+        "existingSecretName": { "type": "string", "minLength": 1 },
+        "image": { "type": "string", "minLength": 1 }
+      }
+    },
+    "image": {
+      "type": "object",
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string" },
+        "pullPolicy": { "type": "string" }
+      }
+    },
+    "ingress": {
+      "type": "object",
+      "properties": {
+        "className": { "type": "string", "minLength": 1 },
+        "clusterIssuer": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

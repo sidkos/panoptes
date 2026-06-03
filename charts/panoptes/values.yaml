@@ -1,22 +1,108 @@
-# Panoptes Helm chart — default values.
+# Panoptes Helm chart — default values (the hosted deploy surface).
 #
-# Phase-0 SKELETON: only the values the single placeholder ServiceAccount needs are
-# declared. The full surface (image tag, hostname, the GitHub client id/secret +
-# org/team allowlist, the IRSA role ARN, store retention, resource requests, the
-# nginx ingress class) is finalized in Phase 7 alongside the workload templates.
+# Secrets (the GitHub client secret, the Slack webhook) come from VALUES at install time —
+# never inlined in a committed template. The CI render fixture (ci/test-values.yaml) supplies
+# hermetic non-live values so `helm template | kubeconform -strict` passes offline.
 
 # nameOverride/fullnameOverride let an operator disambiguate multiple installs in one
 # namespace; empty by default so the release name drives resource names.
 nameOverride: ""
 fullnameOverride: ""
 
-serviceAccount:
-  # The collector + MCP pods run under this SA. In Phase 7 it carries the
-  # `eks.amazonaws.com/role-arn` IRSA annotation (the home read-role); on the Phase-0
-  # skeleton it is a plain, un-annotated SA so the render is valid offline.
-  create: true
-  name: ""
-  # IRSA role ARN (`eks.amazonaws.com/role-arn`). Empty on the skeleton; wired to the
-  # Terraform module's `irsa_role_arn` output in Phase 7. When empty no annotation is
-  # emitted, keeping the kubeconform-validated manifest schema-clean.
-  irsaRoleArn: ""
+# The GHCR image the collector + MCP run. `tag` is an IMMUTABLE release tag (never `:latest`
+# — Risk K11; the Terraform module's `image_tag` pins the same value).
+image:
+  repository: ghcr.io/sidkos/panoptes
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# The public hostname the nginx ingress fronts (TLS via cert-manager + Let's Encrypt).
+hostname: panoptes.example.com
+
+# The nginx ingress class + the cert-manager cluster-issuer that issues the TLS cert.
+ingress:
+  className: nginx
+  clusterIssuer: letsencrypt-prod
+
+# The IRSA role ARN the collector + MCP ServiceAccounts are annotated with
+# (`eks.amazonaws.com/role-arn`) — the Terraform module's `irsa_role_arn` output. Their
+# pods assume the SA-scoped role; this is the ONLY credential path (no mounted static keys).
+irsaRoleArn: ""
+
+# oauth2-proxy GitHub provider config (decision #5). The client id/org/team are non-secret;
+# the client secret comes from a referenced Secret (never an inlined literal).
+oauth2Proxy:
+  githubOrg: ""
+  githubTeam: ""
+  githubClientId: ""
+  # The name of an existing Secret holding the GitHub client secret + the cookie secret.
+  # The chart references it by name — it never inlines the secret VALUE.
+  existingSecretName: panoptes-oauth2-proxy
+  image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.1
+
+# The single-node VictoriaMetrics store: one replica, one PVC, a retention window.
+victoriametrics:
+  image: victoriametrics/victoria-metrics:v1.103.0
+  retention: 15d
+  storageSize: 10Gi
+
+# Grafana: the read-only dashboard face (provisioned core + injected packs).
+grafana:
+  image: grafana/grafana-oss:11.2.0
+
+# Default resource requests/limits applied to the workloads (small — cost discipline).
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# Workload hardening (applied to every pod + container). The pod runs non-root with the
+# RuntimeDefault seccomp profile; every container drops ALL Linux capabilities and forbids
+# privilege escalation. `readOnlyRootFilesystem` is set per-workload below (the python
+# collector/mcp tolerate it; grafana + VM need a writable data path, backed by a PVC/emptyDir).
+securityContext:
+  pod:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  container:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: ["ALL"]
+
+# The Panoptes config the collector + MCP read at /config/panoptes.yaml. The NON-SECRET
+# structure is rendered into a ConfigMap (config.yaml below); SECRET-bearing values
+# (tokens, webhooks, ARNs) are injected via `envFrom` from a referenced Secret — NEVER
+# inlined into the ConfigMap. The config here is the in-cluster store URL + the hosted MCP
+# transport; a richer per-deploy config can override `config.raw` wholesale.
+config:
+  # The name of an existing Secret whose keys are exported as env vars into the collector +
+  # MCP pods (SLACK_WEBHOOK_URL, SENTRY_TOKEN, ALERT_TOPIC_ARN, PANOPTES_ASSUME_ROLE_ARN,
+  # etc.). The chart references it by NAME only — it never inlines a secret literal.
+  secretRefName: panoptes-app-secrets
+  # The rendered panoptes config (mounted read-only at /config/panoptes.yaml). Secrets are
+  # `${VAR}`-interpolated from the envFrom Secret above, never inlined here.
+  raw: |
+    panoptes:
+      environments:
+        dev:
+          enabled: true
+          sources:
+            - type: http-health
+              url: http://panoptes-mcp:8080/healthz
+      store:
+        type: victoriametrics
+        url: http://panoptes-victoriametrics:8428
+        retention: 15d
+      notifiers:
+        - type: logging
+      dashboards:
+        provider: grafana
+        env_variable: true
+        core_packs: [errors-sentry, logs, overview, kubernetes, slo]
+      mcp:
+        transport: http
+        auth: sso
