@@ -1,0 +1,41 @@
+# Panoptes YAML lint config — mirrors FIDA's static-analysis discipline for the YAML
+# surface (GitHub workflows, the composite action, docker-compose, and the
+# provisioning / consumer-pack YAMLs). Wired into both `scripts/precommit.sh` and the
+# `lint-type` CI job so a malformed workflow (e.g. the `${{ }}`-in-flow-mapping bug that
+# previously broke CI) red-bars before it can merge.
+extends: default
+
+rules:
+  # 140 is a soft ceiling: the provisioning comments and compose command strings run
+  # long and wrapping them hurts readability more than it helps. Warn, don't fail.
+  line-length: {max: 140, level: warning}
+  # None of our YAML uses an explicit `---` start marker (GitHub workflows, compose,
+  # and the provisioning/consumer YAMLs all open directly with a top-level key), so the
+  # default "missing document start" error is pure noise here.
+  document-start: disable
+  # `on:`, `true`/`false`-as-keys etc. are idiomatic in GitHub Actions; flag but don't
+  # block (an actual boolean typo still surfaces as a warning for review).
+  truthy: {level: warning}
+  # The GitHub workflows + composite action use spaced flow mappings
+  # (`{ type: boolean, default: false }`) consistently — readable, idiomatic Actions
+  # style. Allow exactly one space inside braces so that house style passes while a
+  # genuinely malformed `{key:val}` / `{  key  }` still fails.
+  braces: {min-spaces-inside: 0, max-spaces-inside: 1}
+  # Match `braces` for flow sequences (`[ a, b ]`) so list literals are equally free to
+  # use the single-space house style.
+  brackets: {min-spaces-inside: 0, max-spaces-inside: 1}
+  # These stay hard errors — they catch real, mergeable mistakes. (`trailing-spaces`
+  # takes no options, so its level is set via the mapping form; it is already an error
+  # in `default` but pinned here for intent.)
+  trailing-spaces: {level: error}
+  indentation: {spaces: 2}
+
+# Generated / vendored / cache trees carry their own (often non-conforming) YAML and
+# are not ours to lint.
+ignore: |
+  .venv/
+  htmlcov/
+  *.egg-info/
+  .mypy_cache/
+  .ruff_cache/
+  .pytest_cache/

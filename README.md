@@ -80,8 +80,9 @@ python3.12 -m venv .venv && source .venv/bin/activate
 pip install -e '.[dev]'
 pytest -m "not integration"   # fast unit suite (mocked upstreams)
 pytest -m integration         # the compose/testcontainers suite (needs Docker)
-ruff check . && ruff format --check . && mypy --strict .
 ```
+
+Run `./scripts/precommit.sh` before pushing — it mirrors the full CI gate locally.
 
 The build is specified end-to-end in
 [`docs/specs/v0.1_core_local_proof.md`](docs/specs/v0.1_core_local_proof.md) (the

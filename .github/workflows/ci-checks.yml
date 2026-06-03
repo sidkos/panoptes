@@ -14,6 +14,17 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
       - run: mypy --strict .
+      # YAML lint runs after the Python gate. yamllint is installed via the
+      # `.[dev]` extra in setup-panoptes, so it is on PATH here.
+      - run: yamllint .
+      # actionlint catches GitHub-Actions-specific defects that yamllint cannot — the
+      # `${{ }}`-in-flow-mapping bug class that previously broke CI, deprecated action
+      # node versions, and shellcheck of every `run:` block. Pinned download-and-run
+      # (no marketplace action pull); the script fetches the matching release binary.
+      - name: actionlint (workflow static analysis)
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7
+          ./actionlint -color
 
   unit:                            # fast; the coverage gate
     name: 🧪 Unit
