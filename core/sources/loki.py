@@ -43,7 +43,6 @@ from datetime import UTC, datetime
 
 import httpx
 
-from core.errors import PanoptesError
 from core.model import (
     CanonicalSignal,
     LogLevel,
@@ -54,6 +53,7 @@ from core.model import (
 )
 from core.registry import SOURCES, ConfigBlock
 from core.rest import RestClient
+from core.sources.probe import probe_health
 from core.validation import require_str_field, require_str_list_field
 
 # The mandatory env label every signal carries; the source's value is authoritative.
@@ -136,39 +136,29 @@ class LokiSource:
         return signals
 
     def health(self) -> SourceHealth:
-        """Probe reachability via a cheap `GET /ready`, catching any error (no raise).
+        """Probe reachability via a cheap `GET /ready`, delegating to the probe seam.
 
-        Loki exposes `/ready` as a trivial readiness endpoint (plain text "ready"). An
-        unreachable endpoint (connection refused, timeout, a non-2xx) is CAUGHT and surfaced
-        as `reachable=False` — it does NOT propagate, so the collector's per-source
-        try/continue boundary keeps the rest of the cycle running. The `detail` is a GENERIC
-        summary (exception class only), never a verbatim `str(exc)` that could echo a
-        token/endpoint through the MCP-visible `describe_health` rollup (F4 discipline).
+        Loki exposes `/ready` as a trivial readiness endpoint (plain text "ready"). The
+        no-raise + no-`str(exc)`-leak discipline lives in `core.sources.probe.probe_health`:
+        any failure becomes `reachable=False` with a generic class-name-only detail (never a
+        verbatim `str(exc)` that could echo a token/endpoint through the MCP-visible
+        `describe_health` rollup), so this method is just the label + the probe lambda.
         """
-        checked_at = datetime.now(UTC)
-        try:
-            # `/ready` returns plain text ("ready"), not JSON — so use the raw `send`
-            # (raise_for_status + body-surfacing) rather than `get_json` (which would try to
-            # `.json()`-decode the text body and fail spuriously).
-            ready_url = f"{self._url}/ready"
-            self._rest.send(
-                lambda http: http.get(ready_url),
+
+        # `/ready` returns plain text ("ready"), not JSON — so use the raw `send`
+        # (raise_for_status + body-surfacing) rather than `get_json` (which would try to
+        # `.json()`-decode the text body and fail spuriously).
+        def _probe() -> object:
+            return self._rest.send(
+                lambda http: http.get(f"{self._url}/ready"),
                 prefix="loki health probe failed",
                 identifier=self._url,
             )
-        except PanoptesError as exc:
-            return SourceHealth(
-                reachable=False,
-                detail=(
-                    f"loki endpoint unreachable "
-                    f"(auth/transport error: {type(exc.__cause__ or exc).__name__})"
-                ),
-                checked_at=checked_at,
-            )
-        return SourceHealth(
-            reachable=True,
-            detail=f"loki endpoint reachable ({self._url})",
-            checked_at=checked_at,
+
+        return probe_health(
+            "loki endpoint",
+            _probe,
+            success_detail_factory=lambda _result: f"loki endpoint reachable ({self._url})",
         )
 
     def _scrape(self, query: str, window: TimeWindow) -> object:

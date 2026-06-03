@@ -55,6 +55,7 @@ from core.model import (
 from core.registry import SOURCES, ConfigBlock
 from core.rest import RestClient
 from core.sources._config import require_str_field
+from core.sources.probe import probe_health
 
 # Derived-metric name (spec `## Data Model` — `panoptes_` prefix avoids PromQL
 # collisions with native upstream metric names).
@@ -138,29 +139,23 @@ class SentrySource:
         return signals
 
     def health(self) -> SourceHealth:
-        """Probe reachability by issuing the same issues GET and reporting the result.
+        """Probe reachability by issuing the same issues GET, delegating to the probe seam.
 
-        On failure the detail is a GENERIC transport/auth summary (the exception class
-        name), NOT a verbatim `str(exc)` (F4): the surfaced `health().detail` reaches the
-        MCP client, and a header-reflecting upstream could otherwise echo the bearer token
-        through the exception body. The shared `_format_failure` redaction is the primary
-        defense; this keeps `detail` generic as defense-in-depth (the body is never
-        surfaced through health at all).
+        The no-raise + no-`str(exc)`-leak discipline lives in
+        `core.sources.probe.probe_health`: a transport/auth failure becomes `reachable=False`
+        with a generic class-name-only detail (NOT a verbatim `str(exc)` (F4) — a
+        header-reflecting upstream could otherwise echo the bearer token through the exception
+        body). The shared `_format_failure` redaction is the primary defense; the seam keeps
+        `detail` generic as defense-in-depth (the body is never surfaced through health at
+        all). On success the reachable detail reports the issue count.
         """
-        checked_at = datetime.now(UTC)
-        try:
-            issues = self._get_issues()
-        except PanoptesError as exc:
-            return SourceHealth(
-                reachable=False,
-                detail=f"sentry {self._org}/{self._project} unreachable "
-                f"(auth/transport error: {type(exc.__cause__ or exc).__name__})",
-                checked_at=checked_at,
-            )
-        return SourceHealth(
-            reachable=True,
-            detail=f"sentry {self._org}/{self._project} returned {len(issues)} issue(s)",
-            checked_at=checked_at,
+        return probe_health(
+            f"sentry {self._org}/{self._project}",
+            self._get_issues,
+            success_detail_factory=lambda issues: (
+                f"sentry {self._org}/{self._project} returned "
+                f"{len(issues) if isinstance(issues, list) else 0} issue(s)"
+            ),
         )
 
     def _issues_url(self) -> str:

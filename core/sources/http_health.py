@@ -114,7 +114,15 @@ class HttpHealthSource:
         ]
 
     def health(self) -> SourceHealth:
-        """Trivial reachability probe: reuse `_probe` and report up/down + latency."""
+        """Trivial reachability probe: reuse `_probe` and report up/down + latency.
+
+        DELIBERATELY hand-written — the documented EXCEPTION to the concentrated
+        `core.sources.probe.probe_health` seam. Unlike every other source, http-health must
+        NOT convert its transport error to `reachable=False` via the seam: down IS its signal
+        (`fetch` emits `panoptes_health_up=0` in exactly that state), and its `detail` carries
+        the measured latency (which the generic seam has no place for). So it keeps its own
+        up/down branching via `_probe` rather than delegating.
+        """
         up_value, latency_ms, timestamp = self._probe()
         reachable = up_value == 1.0
         detail = (

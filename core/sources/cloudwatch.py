@@ -63,6 +63,7 @@ from core.sources._config import (
     require_str_field,
     require_str_list_field,
 )
+from core.sources.probe import probe_health
 from core.validation import optional_int_field
 
 if TYPE_CHECKING:
@@ -264,38 +265,22 @@ class CloudWatchSource:
         """Resolve credentials (assume-role if configured) as the reachability probe.
 
         Credential resolution is the reachability concern for an AWS source, so the
-        assume-role attempt lives here. An `AssumeRole` denial (expired/denied) is
-        caught and surfaced as `reachable=False` with a clear auth message — it does
-        NOT propagate, so the collector's per-source try/continue boundary keeps the
-        rest of the cycle running.
+        assume-role attempt lives here. The no-raise + no-`str(exc)`-leak discipline lives in
+        `core.sources.probe.probe_health`: an `AssumeRole` denial (or any transport/auth
+        failure) becomes `reachable=False` with a generic class-name-only detail (never a
+        verbatim `str(ClientError/BotoCoreError)`, which can echo the role ARN / account id /
+        external id into the MCP-visible `describe_health` rollup, F3c). The seam's broad
+        `except Exception` UNIFIES what was previously a two-branch
+        `(ClientError, BotoCoreError)` + `PanoptesError` catch — all credential-resolution
+        failures funnel to the same leak-free summary. The `source_label` carries "credential"
+        so the detail reads `"cloudwatch credential resolution unreachable (...)"`.
         """
-        checked_at = datetime.now(UTC)
-        try:
-            self._resolve_credentials()
-        except (ClientError, BotoCoreError) as exc:
-            # Mirror SentrySource.health(): the surfaced `detail` reaches the MCP-visible
-            # `describe_health` rollup, and a raw `str(ClientError/BotoCoreError)` can echo
-            # the role ARN / account id / external id. Report only a GENERIC auth/transport
-            # summary (exception class + region), never the verbatim message (F3c).
-            return SourceHealth(
-                reachable=False,
-                detail=f"cloudwatch credential resolution failed "
-                f"(auth/transport error: {type(exc).__name__}, region {self._region})",
-                checked_at=checked_at,
-            )
-        except PanoptesError as exc:
-            # Same defense-in-depth: a PanoptesError raised during credential resolution
-            # is summarized by class name, not its (potentially detail-bearing) message.
-            return SourceHealth(
-                reachable=False,
-                detail=f"cloudwatch credential resolution failed "
-                f"(auth/transport error: {type(exc.__cause__ or exc).__name__})",
-                checked_at=checked_at,
-            )
-        return SourceHealth(
-            reachable=True,
-            detail=f"cloudwatch credentials resolved for region {self._region}",
-            checked_at=checked_at,
+        return probe_health(
+            "cloudwatch credential resolution",
+            self._resolve_credentials,
+            success_detail_factory=lambda _result: (
+                f"cloudwatch credentials resolved for region {self._region}"
+            ),
         )
 
     def _resolve_credentials(self) -> None:

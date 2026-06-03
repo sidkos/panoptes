@@ -51,6 +51,7 @@ from core.model import (
     TimeWindow,
 )
 from core.registry import SOURCES, ConfigBlock
+from core.sources.probe import probe_health
 from core.validation import require_str_field
 
 # Derived-metric names (spec § Data Model — the `panoptes_` prefix avoids PromQL
@@ -150,35 +151,23 @@ class KubernetesSource:
         return signals
 
     def health(self) -> SourceHealth:
-        """Probe reachability by issuing the same `list_node` read.
+        """Probe reachability by issuing the same `list_node` read, delegating to the seam.
 
-        An unreachable API server (bad/expired SA token, transport error) is CAUGHT and
-        surfaced as `reachable=False` — it does NOT propagate, so the collector's
-        per-source try/continue boundary keeps the rest of the cycle running. The `detail`
-        is a GENERIC summary (exception class + cluster), never a verbatim `str(exc)` that
-        could echo a token/endpoint through the MCP-visible `describe_health` rollup (F3c,
-        the cloudwatch/sentry discipline).
+        The no-raise + no-`str(exc)`-leak discipline lives in
+        `core.sources.probe.probe_health`. The kubernetes client surfaces failures as
+        `ApiException`, `urllib3` transport errors, or socket errors depending on the failure
+        mode; the seam's broad `except Exception` converts ANY of them to `reachable=False`
+        with a generic class-name-only detail (never a verbatim `str(exc)` that could echo a
+        token/endpoint through the MCP-visible `describe_health` rollup, F3c) rather than
+        letting one crash the collector cycle. On success the detail reports the node count.
         """
-        checked_at = datetime.now(UTC)
-        try:
-            nodes = self._api().list_node().items
-        except Exception as exc:
-            # Catch broadly on purpose: the kubernetes client surfaces failures as
-            # `ApiException`, `urllib3` transport errors, or socket errors depending on the
-            # failure mode; reachability must convert ANY of them to `reachable=False`
-            # rather than letting one crash the collector cycle. The detail stays generic.
-            return SourceHealth(
-                reachable=False,
-                detail=(
-                    f"kubernetes cluster '{self._cluster}' unreachable "
-                    f"(auth/transport error: {type(exc).__name__})"
-                ),
-                checked_at=checked_at,
-            )
-        return SourceHealth(
-            reachable=True,
-            detail=f"kubernetes cluster '{self._cluster}' returned {len(nodes)} node(s)",
-            checked_at=checked_at,
+        return probe_health(
+            f"kubernetes cluster '{self._cluster}'",
+            lambda: self._api().list_node().items,
+            success_detail_factory=lambda nodes: (
+                f"kubernetes cluster '{self._cluster}' returned "
+                f"{len(nodes) if isinstance(nodes, list) else 0} node(s)"
+            ),
         )
 
     def _base_labels(self) -> dict[str, str]:
