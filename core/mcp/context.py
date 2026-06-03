@@ -21,7 +21,13 @@ annotations break FastMCP's schema generation for the tool returns that consume 
 
 from core.config import ResolvedConfig, ResolvedEnvironment, SloConfig
 from core.errors import CapabilityError
-from core.model import DashboardPack, SignalKind
+from core.mcp._metric_helpers import (
+    _latest_value,
+    _step_seconds_for,
+    _window_for,
+    escape_promql_value,
+)
+from core.model import DashboardPack, MetricQuery, MetricSeries, SignalKind
 from core.planes.source import Source
 from core.planes.store import Store
 
@@ -81,6 +87,69 @@ class QueryContext:
     def store(self) -> Store:
         """The resolved metric store (answers `query_metric` / dashboard PromQL)."""
         return self._config.store
+
+    def read_gauge(self, metric: str, env: str, window: str = "15m") -> float | None:
+        """Read one `env`-scoped gauge from the store, returning its latest scalar (or None).
+
+        Concentrates the gauge-read sequence the MCP tools repeated: escape `env`, build the
+        `env`-scoped selector, query the store, and pick the latest value. A store that cannot
+        answer PromQL (a `passthrough` store → `CapabilityError`) is SWALLOWED to `None` so the
+        calling tool (`get_cluster_state` / `get_cost` / `get_slo` / `describe_health`) stays
+        answerable from the store's "no data" rather than crashing into the MCP surface.
+
+        Returns `None`, NEVER an invented `0.0`, when there is no data — so a caller chooses
+        `read_gauge(...) or 0.0` only where a zero default is the intended semantic (the cost /
+        cluster snapshots), and `describe_health` simply omits an absent metric.
+
+        Args:
+            metric: The gauge metric name (a `panoptes_*` series the store carries).
+            env: The environment to scope the read to. It is escaped UNCONDITIONALLY (F7) —
+                a caller must NEVER interpolate `env` into a selector itself.
+            window: The trailing window string (default `"15m"`, the prior internal default).
+
+        Returns:
+            The latest sample value across the resolved series, or `None` when the store has no
+            data OR could not answer PromQL (the `CapabilityError` is swallowed).
+        """
+        try:
+            series = self.read_series(metric, env, window)
+        except CapabilityError:
+            # A passthrough store cannot answer — the gauge read is "no data" (None), so the
+            # calling tool reports unreachable/zero rather than raising into the MCP surface.
+            return None
+        return _latest_value(series)
+
+    def read_series(self, metric: str, env: str, window: str = "15m") -> list[MetricSeries]:
+        """Read one `env`-scoped metric from the store, returning its raw series list.
+
+        The series-returning sibling of `read_gauge` for callers that need the full per-label
+        series (the per-namespace `pod_restarts_total` sum, the per-service `panoptes_cost_spend`
+        map, the `compare_envs` per-env comparison). Unlike `read_gauge`, it PROPAGATES a
+        `CapabilityError` — `compare_envs`'s fan-out depends on a per-env outage surfacing so the
+        env is marked down, not silently treated as an empty result.
+
+        Like `read_gauge`, it OWNS the F7 escape: `escape_promql_value(env)` is applied
+        unconditionally, so a quote-bearing env stays a single closed selector string.
+
+        Args:
+            metric: The metric name (a `panoptes_*` series the store carries).
+            env: The environment to scope the read to (escaped UNCONDITIONALLY, F7).
+            window: The trailing window string (default `"15m"`).
+
+        Returns:
+            The raw `list[MetricSeries]` the store returned (possibly empty).
+
+        Raises:
+            CapabilityError: the store cannot answer PromQL (e.g. a `passthrough` store) — left
+                to PROPAGATE so the caller can mark the env down.
+        """
+        # The escape is the security invariant (F7): never interpolate `env` raw.
+        expr = f'{metric}{{env="{escape_promql_value(env)}"}}'
+        return self._config.store.query(
+            MetricQuery(
+                expr=expr, window=_window_for(window), step_seconds=_step_seconds_for(window)
+            )
+        )
 
     @property
     def dashboard_packs(self) -> list[DashboardPack]:

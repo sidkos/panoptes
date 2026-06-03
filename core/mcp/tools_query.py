@@ -32,11 +32,17 @@ import logging
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
 from typing import TypedDict
 
 from core.config import ResolvedEnvironment, SloConfig
 from core.errors import CapabilityError, PanoptesError
+from core.mcp._metric_helpers import (
+    _DEFAULT_WINDOW_MINUTES,
+    _latest_value,
+    _step_seconds_for,
+    _window_for,
+    escape_promql_value,
+)
 from core.mcp.context import QueryContext
 from core.model import (
     IncidentSignal,
@@ -47,6 +53,16 @@ from core.model import (
     TimeWindow,
 )
 from core.planes.source import Source
+
+# Re-export the canonical PromQL escape + window helpers so the PUBLIC import path
+# `from core.mcp.tools_query import escape_promql_value` keeps working for consumer packs (the
+# demo/fleet/pipeline packs depend on it), AND the back-compat private paths
+# `from core.mcp.tools_query import _window_for / _DEFAULT_WINDOW_MINUTES` keep resolving for the
+# existing tools_query tests. These symbols now LIVE in `core.mcp._metric_helpers` (the leaf
+# module that breaks the context↔tools_query import cycle); listing them in `__all__` marks them
+# as explicitly re-exported (so `mypy --strict` recognizes the re-export). New code imports from
+# `_metric_helpers` directly.
+__all__ = ["_DEFAULT_WINDOW_MINUTES", "_window_for", "escape_promql_value"]
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -61,31 +77,11 @@ _ALL_ENVS = "all"
 # (not identifier-validated) before interpolation.
 _PROMQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_:]*$")
 
-# Default query window for the live-source fetch tools. The MCP `window` argument is
-# a human string (e.g. "15m"); an empty/None/unrecognized window resolves to this
-# trailing default so a tool always has a bounded fetch.
-_DEFAULT_WINDOW_MINUTES = 15
-
-# The known human window strings → trailing minutes (F2f). The previous `_window_for`
-# hard-returned 15m for EVERY input, so `window="24h"` silently gave 15m. These cover the
-# common cadences; a bare integer is interpreted as minutes; anything else falls back to
-# the default WITH the value surfaced (explicit, never silent).
-_WINDOW_STRING_TO_MINUTES: dict[str, int] = {
-    "15m": 15,
-    "30m": 30,
-    "1h": 60,
-    "6h": 360,
-    "24h": 1440,
-    "1d": 1440,
-    "7d": 10080,
-}
-
-# The step floor (seconds) for a range query (F2f). The step is computed as
-# window_seconds / _STEP_TARGET_BUCKETS so a range yields multiple points (never one
-# degenerate bucket), then clamped to at least this floor so a tiny window cannot ask the
-# store for an absurdly fine grid.
-_STEP_TARGET_BUCKETS = 60
-_MIN_STEP_SECONDS = 15
+# The window-parsing + step + default-window helpers now live in `core.mcp._metric_helpers`
+# (the leaf module that breaks the context↔tools_query cycle); `_DEFAULT_WINDOW_MINUTES`,
+# `_window_for`, and `_step_seconds_for` are imported from there above. They are also
+# re-exported (back-compat) so the existing tools_query tests that import `_window_for` /
+# `_DEFAULT_WINDOW_MINUTES` keep resolving.
 
 # The key derived health metrics `describe_health` surfaces (F2g — spec § MCP server:
 # `describe_health -> HealthRollup` = per-source reachability + "key derived metrics" +
@@ -310,73 +306,6 @@ def fan_out_over_envs[ResultT](
             detail = exc.detail if isinstance(exc, CapabilityError) else str(exc)
             results.append(FanOutResult(env=environment.name, data=None, error=detail))
     return results
-
-
-def escape_promql_value(value: str) -> str:
-    """Escape a value for a double-quoted PromQL label-matcher string (F7 / F2d).
-
-    Backslash is escaped FIRST so the quote-escape's own backslash is not re-doubled, then
-    the double quote. This keeps a value like `a"b` a single closed string (`"a\\"b"`)
-    instead of breaking out of the selector (cross-env read / corrupted query).
-
-    This is the canonical PromQL value-escape primitive (F2d): it is PUBLIC so every
-    caller that interpolates a value into a quoted PromQL string — `query_metric` here,
-    `get_dashboard_data`'s `$env` substitution, and the demo consumer pack — reuses ONE
-    implementation rather than hand-copying the two `.replace(...)` calls (a copy that can
-    drift and miss the backslash-first ordering).
-    """
-    return value.replace("\\", "\\\\").replace('"', '\\"')
-
-
-def _window_minutes(window: str) -> int:
-    """Parse the MCP `window` string into trailing minutes (F2f).
-
-    Recognizes the common cadence strings (`"15m"`, `"30m"`, `"1h"`, `"6h"`, `"24h"`/
-    `"1d"`, `"7d"`) and a bare integer (interpreted as minutes). An empty/None window
-    resolves to the default. An UNRECOGNIZED window is handled EXPLICITLY: it falls back
-    to the default AND logs a warning surfacing the offending value — never the old
-    silent-15m-for-everything behavior that made `window="24h"` quietly mean 15m.
-    """
-    normalized = window.strip().lower() if window else ""
-    if not normalized:
-        return _DEFAULT_WINDOW_MINUTES
-    known = _WINDOW_STRING_TO_MINUTES.get(normalized)
-    if known is not None:
-        return known
-    # A bare integer is accepted as minutes (forward-compatible with a fuller parser).
-    if normalized.isdigit():
-        parsed = int(normalized)
-        if parsed > 0:
-            return parsed
-    # Unrecognized — fall back to the default, but surface the value so the operator
-    # knows their window was not honored (explicit, not silent).
-    _LOGGER.warning(
-        f"Unrecognized MCP window {window!r}; falling back to the default "
-        f"{_DEFAULT_WINDOW_MINUTES}-minute window."
-    )
-    return _DEFAULT_WINDOW_MINUTES
-
-
-def _window_for(window: str) -> TimeWindow:
-    """Resolve the MCP `window` string to a trailing `TimeWindow` (F2f).
-
-    Delegates to `_window_minutes` (which now genuinely PARSES the window rather than
-    ignoring it) and returns a trailing window of that many minutes ending 'now'.
-    """
-    return TimeWindow.last(minutes=_window_minutes(window))
-
-
-def _step_seconds_for(window: str) -> int:
-    """Compute a sane range step (seconds) that is strictly sub-window (F2f).
-
-    The old `query_metric` used `step == window`, producing a single degenerate bucket.
-    This divides the window into `_STEP_TARGET_BUCKETS` points, then clamps the step to a
-    `_MIN_STEP_SECONDS` floor so a small window cannot request an absurdly fine grid. The
-    result is always strictly less than the window span, so a range yields multiple points.
-    """
-    window_seconds = _window_minutes(window) * 60
-    step = window_seconds // _STEP_TARGET_BUCKETS
-    return max(_MIN_STEP_SECONDS, step)
 
 
 def _fetch_incidents(
@@ -665,49 +594,45 @@ def get_cluster_state(context: QueryContext, env: str) -> ClusterState:
     # with a clear error rather than silently returning an unreachable snapshot.
     environment = context.require_env(env)
 
-    node_series = _k8s_query(context, _K8S_NODE_COUNT, environment.name)
-    pending_series = _k8s_query(context, _K8S_PODS_PENDING, environment.name)
-    crashloop_series = _k8s_query(context, _K8S_PODS_CRASHLOOP, environment.name)
-    restarts_series = _k8s_query(context, _K8S_POD_RESTARTS_TOTAL, environment.name)
+    # The three cluster-wide gauges are single-value scalars → `read_gauge` (which owns the
+    # F7 escape, swallows a passthrough store's CapabilityError to None, and folds to the
+    # latest value). `None` means "no data for this gauge".
+    node_count = context.read_gauge(_K8S_NODE_COUNT, environment.name)
+    pods_pending = context.read_gauge(_K8S_PODS_PENDING, environment.name)
+    pods_crashloop = context.read_gauge(_K8S_PODS_CRASHLOOP, environment.name)
+    # `pod_restarts_total` is PER-NAMESPACE — the per-namespace sum (+ the cluster label) need
+    # the full series, so read it via `read_series`. `read_series` PROPAGATES a CapabilityError,
+    # but this tool must stay answerable on a passthrough store, so swallow it locally (the same
+    # "report unreachable, never crash" contract the cluster-wide gauges get for free).
+    try:
+        restarts_series = context.read_series(_K8S_POD_RESTARTS_TOTAL, environment.name)
+    except CapabilityError:
+        restarts_series = []
 
-    # The cluster is reachable in the store's eyes iff ANY k8s gauge produced a series for
-    # the env. A passthrough store yields empty lists for all four (the CapabilityError is
-    # swallowed in `_k8s_query`), so it reads as unreachable — never a crash.
-    all_series = node_series + pending_series + crashloop_series + restarts_series
-    reachable = bool(all_series)
+    # The cluster is reachable in the store's eyes iff ANY k8s gauge produced data for the env:
+    # a non-None cluster-wide gauge value, OR a non-empty per-namespace restart series. A
+    # passthrough store yields None for the three (swallowed) + an empty restarts list, so it
+    # reads as unreachable — never a crash.
+    reachable = (
+        node_count is not None
+        or pods_pending is not None
+        or pods_crashloop is not None
+        or bool(restarts_series)
+    )
 
     return ClusterState(
         env=environment.name,
-        # The cluster name is carried on every k8s gauge's labels; read it from the first
-        # series that has one (empty string when nothing was collected).
-        cluster=_cluster_label(all_series),
-        node_count=_latest_value(node_series) or 0.0,
-        pods_pending=_latest_value(pending_series) or 0.0,
-        pods_crashloop=_latest_value(crashloop_series) or 0.0,
+        # The cluster name is carried on every k8s gauge's labels; read it from the per-
+        # namespace restart series (empty string when nothing was collected).
+        cluster=_cluster_label(restarts_series),
+        node_count=node_count or 0.0,
+        pods_pending=pods_pending or 0.0,
+        pods_crashloop=pods_crashloop or 0.0,
         # pod_restarts_total is per-namespace: sum the latest value of EACH namespace series
         # so the snapshot reports the cluster-wide restart total.
         pod_restarts_total=_sum_latest_per_series(restarts_series),
         reachable=reachable,
     )
-
-
-def _k8s_query(context: QueryContext, metric_name: str, env: str) -> list[MetricSeries]:
-    """Query one `panoptes_k8s_*` gauge scoped to `env`, swallowing a passthrough error.
-
-    Returns the resolved series (possibly empty — empty is a legitimate "not collected"
-    answer). A `passthrough` store that cannot answer PromQL raises `CapabilityError`,
-    which is swallowed here so `get_cluster_state` reports the cluster unreachable rather
-    than crashing — health/state must stay answerable, never raise into the MCP surface.
-    The env name is escaped defensively (F7 discipline) even though it is a validated env.
-    """
-    expr = f'{metric_name}{{env="{escape_promql_value(env)}"}}'
-    window = TimeWindow.last(minutes=_DEFAULT_WINDOW_MINUTES)
-    try:
-        return context.store.query(
-            MetricQuery(expr=expr, window=window, step_seconds=_step_seconds_for("15m"))
-        )
-    except CapabilityError:
-        return []
 
 
 def _cluster_label(series: list[MetricSeries]) -> str:
@@ -764,8 +689,17 @@ def get_cost(context: QueryContext, env: str, window: str) -> CostBreakdown:
     # fails with a clear error rather than silently returning a zero snapshot.
     environment = context.require_env(env)
 
-    spend_series = _cost_query(context, _COST_SPEND, environment.name)
-    burn_series = _cost_query(context, _COST_BUDGET_BURN, environment.name)
+    # COST ASYMMETRY (load-bearing — do NOT regress): the per-service SPEND needs the FULL
+    # series (one per `{env, service}`) to build the per-service map, so it reads via
+    # `read_series`; the BUDGET BURN is a single env-scoped scalar, so it reads via
+    # `read_gauge`. `read_series` propagates a CapabilityError, but `get_cost` must report
+    # zeros (never crash) on a passthrough store, so swallow it locally for the spend read —
+    # `read_gauge` already swallows it to None for the burn.
+    try:
+        spend_series = context.read_series(_COST_SPEND, environment.name)
+    except CapabilityError:
+        spend_series = []
+    budget_burn = context.read_gauge(_COST_BUDGET_BURN, environment.name)
 
     per_service, total = _per_service_spend(spend_series)
     return CostBreakdown(
@@ -773,25 +707,8 @@ def get_cost(context: QueryContext, env: str, window: str) -> CostBreakdown:
         window=window,
         total=total,
         per_service=per_service,
-        budget_burn=_latest_value(burn_series) or 0.0,
+        budget_burn=budget_burn or 0.0,
     )
-
-
-def _cost_query(context: QueryContext, metric_name: str, env: str) -> list[MetricSeries]:
-    """Query one `panoptes_cost_*` gauge scoped to `env`, swallowing a passthrough error.
-
-    Mirrors `_k8s_query`: returns the resolved series (empty when not collected); a
-    passthrough store that cannot answer PromQL raises `CapabilityError`, swallowed here so
-    `get_cost` reports zeros rather than crashing into the MCP surface.
-    """
-    expr = f'{metric_name}{{env="{escape_promql_value(env)}"}}'
-    window = TimeWindow.last(minutes=_DEFAULT_WINDOW_MINUTES)
-    try:
-        return context.store.query(
-            MetricQuery(expr=expr, window=window, step_seconds=_step_seconds_for("15m"))
-        )
-    except CapabilityError:
-        return []
 
 
 def _per_service_spend(series: list[MetricSeries]) -> tuple[dict[str, float], float]:
@@ -881,26 +798,12 @@ def _find_slo(context: QueryContext, name: str) -> SloConfig:
 def _slo_actual(context: QueryContext, query_expr: str, window_str: str, env: str) -> float:
     """Run the SLO's query scoped to `env` and return the latest value (0.0 when no data).
 
-    The configured `query` is wrapped with an `env="<env>"` matcher so the attainment is
-    measured for the target env only (metrics carry their own `env` label). A store that
-    cannot answer (passthrough → `CapabilityError`) or has no data reports `0.0` — a missing
-    measurement is the worst-case attainment, never a crash into the MCP surface.
+    The configured `query` is the metric selector; `read_gauge` wraps it with the `env=`
+    matcher (owning the F7 escape), runs it over `window_str`, swallows a passthrough store's
+    `CapabilityError` to None, and folds to the latest value. A missing measurement (None) is
+    coerced to `0.0` — the worst-case attainment — never a crash into the MCP surface.
     """
-    # Scope the metric to the env. The query is the metric selector; append the env matcher.
-    expr = f'{query_expr}{{env="{escape_promql_value(env)}"}}'
-    try:
-        series = context.store.query(
-            MetricQuery(
-                expr=expr,
-                window=_window_for(window_str),
-                step_seconds=_step_seconds_for(window_str),
-            )
-        )
-    except CapabilityError:
-        # A passthrough store cannot answer — treat as no measurement (0.0 attainment).
-        return 0.0
-    latest = _latest_value(series)
-    return latest if latest is not None else 0.0
+    return context.read_gauge(query_expr, env, window_str) or 0.0
 
 
 def _error_budget_remaining(objective: float, actual: float) -> float:
@@ -950,14 +853,10 @@ def compare_envs(context: QueryContext, metric: str, window: str) -> EnvComparis
         )
 
     def _fetch_one(environment: ResolvedEnvironment) -> list[MetricSeries]:
-        # Scope the metric to this env (metrics carry their own `env` label); the store
-        # raises a CapabilityError for a per-env outage, which the fan-out marks per-env.
-        expr = f'{metric}{{env="{escape_promql_value(environment.name)}"}}'
-        return context.store.query(
-            MetricQuery(
-                expr=expr, window=_window_for(window), step_seconds=_step_seconds_for(window)
-            )
-        )
+        # `read_series` scopes the metric to this env (owning the F7 escape) and PROPAGATES a
+        # CapabilityError for a per-env outage — which the fan-out catches + marks per-env (the
+        # propagate-not-swallow contract `read_series` provides exactly for this site).
+        return context.read_series(metric, environment.name, window)
 
     per_env: dict[str, list[MetricSeries]] = {}
     errors: dict[str, str] = {}
@@ -1062,39 +961,16 @@ def _health_metrics_for_env(
     reachability alone (the rollup's mandatory promise must not depend on a metric store).
     """
     metrics: list[HealthMetricInfo] = []
-    window = TimeWindow.last(minutes=_DEFAULT_WINDOW_MINUTES)
     for metric_name in _KEY_HEALTH_METRICS:
-        # The env name is a declared, validated env (require_env already ran for the
-        # single-env path; enabled_envs for the aggregate) — but escape defensively so a
-        # future label-bearing env can never corrupt the selector (F7 discipline).
-        expr = f'{metric_name}{{env="{escape_promql_value(environment.name)}"}}'
+        # `read_series` scopes each metric to this env (owning the F7 escape). It PROPAGATES a
+        # CapabilityError, but this enrichment is best-effort — a passthrough store that cannot
+        # answer must leave health answerable from reachability alone — so swallow it here and
+        # return whatever metrics were collected so far (the prior stop-the-loop semantic).
         try:
-            series = context.store.query(
-                MetricQuery(expr=expr, window=window, step_seconds=_step_seconds_for("15m"))
-            )
+            series = context.read_series(metric_name, environment.name)
         except CapabilityError:
-            # A non-metric (passthrough) store cannot answer — health is still answerable
-            # from reachability, so drop the metric enrichment rather than failing.
             return metrics
         latest = _latest_value(series)
         if latest is not None:
             metrics.append(HealthMetricInfo(env=environment.name, name=metric_name, value=latest))
     return metrics
-
-
-def _latest_value(series: list[MetricSeries]) -> float | None:
-    """The most recent sample value across a metric's series, or None if there is none.
-
-    `describe_health` surfaces a single scalar per key metric, so this picks the latest
-    point across the returned series (each series is one label-set; for a single-env
-    `env`-scoped health gauge there is typically one). Returns None when there is no data,
-    so the caller omits the metric rather than inventing a 0.0.
-    """
-    latest_timestamp: datetime | None = None
-    latest_value: float | None = None
-    for one_series in series:
-        for timestamp, value in one_series.points:
-            if latest_timestamp is None or timestamp >= latest_timestamp:
-                latest_timestamp = timestamp
-                latest_value = value
-    return latest_value
