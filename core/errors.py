@@ -50,6 +50,23 @@ class MissingEnvVarError(PanoptesError):
         )
 
 
+class CapabilityMismatchError(PanoptesError):
+    """Raised when a source's declared `provides:` disagrees with `capabilities()`.
+
+    A config-time fail-fast: `capabilities()` is authoritative, so a declared
+    `provides:` token set that does not match it — or an unknown `provides:` token —
+    is an operator error the loader surfaces by name. Subclasses `PanoptesError` (not
+    stdlib `ValueError`) so a caller wrapping `load_config` in `except PanoptesError`
+    catches a config mismatch alongside every other deliberate Panoptes error, rather
+    than having it escape the family (spec ADAPTERS §3 — fail fast within the
+    `PanoptesError` hierarchy).
+    """
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+        super().__init__(detail)
+
+
 class CapabilityError(PanoptesError):
     """Raised when a required source/capability is not configured or available.
 

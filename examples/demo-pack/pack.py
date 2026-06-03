@@ -128,7 +128,11 @@ def get_demo_signal(store: _StoreLike, env: str, window: str) -> DemoSignal:
     Returns:
         A `DemoSignal` with the per-series latest values + a roll-up sample count.
     """
-    expr = f'{_DEMO_METRIC}{{env="{env}"}}'
+    # Escape the env for the double-quoted PromQL string so a value containing a quote /
+    # backslash cannot break out of the selector (F7 — mirrors the core query_metric
+    # hardening; backslash first, then the double quote).
+    escaped_env = env.replace("\\", "\\\\").replace('"', '\\"')
+    expr = f'{_DEMO_METRIC}{{env="{escaped_env}"}}'
     metric_query = MetricQuery(
         expr=expr,
         window=TimeWindow.last(minutes=_DEFAULT_WINDOW_MINUTES),

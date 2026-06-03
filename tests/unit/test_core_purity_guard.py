@@ -28,6 +28,7 @@ lands in Phase 7.
 
 import importlib
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -126,11 +127,21 @@ def test_injection_is_purely_additive_at_the_tool_level(monkeypatch: pytest.Monk
 def test_synthetic_adapter_is_an_addition_to_a_pre_import_baseline() -> None:
     """The pack's synthetic adapter appears on the core registry only as an ADDITION."""
     baseline_adapters = set(STORES.available())
-    importlib.import_module(_PACK_MODULE)
+    # Reload if already cached so the `@STORES.register(...)` decorator re-runs (the root
+    # conftest rolls back the registration after every test, and Python's import cache
+    # would otherwise skip the module body on a second import — F8).
+    if _PACK_MODULE in sys.modules:
+        importlib.reload(sys.modules[_PACK_MODULE])
+    else:
+        importlib.import_module(_PACK_MODULE)
     after_adapters = set(STORES.available())
 
     assert baseline_adapters <= after_adapters, "importing the pack must not drop core adapters"
-    # The pack adds its synthetic adapter (and only consumer-owned additions) — core's
-    # own registered store types are unchanged.
-    assert _DEMO_ADAPTER in after_adapters - baseline_adapters or _DEMO_ADAPTER in baseline_adapters
-    assert _DEMO_ADAPTER in after_adapters, "the synthetic adapter must be registered"
+    # The pack adds its synthetic adapter as a GENUINE addition to the pre-import baseline.
+    # The root conftest's per-test registry reset guarantees `demo-synthetic` is NOT
+    # pre-registered, so the strict additive form holds regardless of test order (F8 —
+    # the prior `... or _DEMO_ADAPTER in baseline_adapters` escape silently weakened to a
+    # no-op whenever a sibling test imported the pack first).
+    assert _DEMO_ADAPTER in after_adapters - baseline_adapters, (
+        "the synthetic adapter must appear ONLY as an addition to the pre-import baseline"
+    )

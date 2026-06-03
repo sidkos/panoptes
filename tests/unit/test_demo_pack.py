@@ -80,9 +80,19 @@ def _consumer_pack_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 
 def _import_pack() -> object:
-    """Import the demo pack module by its hyphenated path (mirrors the hook's import)."""
-    import importlib
+    """Import the demo pack module by its hyphenated path (mirrors the hook's import).
 
+    The root conftest rolls back the pack's `@STORES.register("demo-synthetic")` after
+    every test (F8 isolation). Python's import cache, however, means a second
+    `import_module` would NOT re-run the module body (and so would NOT re-register). So if
+    the module is already cached, RELOAD it to re-execute the registration decorator —
+    making this helper register the synthetic adapter every call, regardless of order.
+    """
+    import importlib
+    import sys
+
+    if _PACK_MODULE in sys.modules:
+        return importlib.reload(sys.modules[_PACK_MODULE])
     return importlib.import_module(_PACK_MODULE)
 
 

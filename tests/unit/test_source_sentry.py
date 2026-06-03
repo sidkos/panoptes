@@ -119,18 +119,29 @@ def test_issues_normalize_to_exact_incident_signals() -> None:
 
 
 @respx.mock
-def test_derived_count_metric_has_exact_labels() -> None:
+def test_derived_count_metric_is_per_level_with_exact_labels() -> None:
+    """The derived count gauge is emitted PER LEVEL (F6) — one series per distinct level.
+
+    The two-issue fixture has one `error` + one `warning`, so two gauges are emitted,
+    each with the EXACT `{env, level, project}` label set carrying the ACTUAL level value
+    (never the misleading `level="all"` aggregate, which broke the dashboard's
+    `sum by (level)` panel).
+    """
     respx.get(_ISSUES_URL).mock(return_value=httpx.Response(200, json=_ISSUES_PAYLOAD))
 
     signals = _source().fetch(_WINDOW)
 
     metrics = [s for s in signals if isinstance(s, MetricSignal)]
-    assert len(metrics) == 1
-    count_metric = metrics[0]
-    assert count_metric.name == "panoptes_sentry_incident_count"
-    assert count_metric.value == 2.0
-    # Exact derived-metric label set (spec): {env, level, project}.
-    assert count_metric.labels == {"env": _ENV, "level": "all", "project": _PROJECT}
+    # One gauge per distinct level (error + warning), never a single `level="all"`.
+    assert {m.name for m in metrics} == {"panoptes_sentry_incident_count"}
+    by_level = {m.labels["level"]: m for m in metrics}
+    assert set(by_level) == {"error", "warning"}
+    assert by_level["error"].value == 1.0
+    assert by_level["error"].labels == {"env": _ENV, "level": "error", "project": _PROJECT}
+    assert by_level["warning"].value == 1.0
+    assert by_level["warning"].labels == {"env": _ENV, "level": "warning", "project": _PROJECT}
+    # No misleading aggregate level label is emitted.
+    assert "all" not in by_level
 
 
 @respx.mock
@@ -266,9 +277,13 @@ def test_default_base_url_used_when_not_configured() -> None:
 
     signals = source.fetch(_WINDOW)
 
-    # Only the derived count metric (zero issues) — proves the default endpoint was hit.
+    # Zero issues → no per-level gauge is emitted (F6: gauges are per distinct level, and
+    # with no issues there is no level to count). The successful empty fetch + no incident
+    # signals proves the default endpoint was hit.
     metrics = [s for s in signals if isinstance(s, MetricSignal)]
-    assert metrics[0].value == 0.0
+    assert metrics == []
+    incidents = [s for s in signals if isinstance(s, IncidentSignal)]
+    assert incidents == []
 
 
 @respx.mock
@@ -360,4 +375,36 @@ def test_health_unreachable_on_error() -> None:
     health = _source().health()
 
     assert health.reachable is False
-    assert "boom" in health.detail
+    # The detail no longer carries a verbatim upstream body (which could include a
+    # reflected token); it is a generic transport/auth-failure summary (F4).
+    assert "unreachable" in health.detail.lower()
+
+
+@respx.mock
+def test_health_detail_does_not_leak_reflected_bearer_token() -> None:
+    """A reflected `Authorization: Bearer <token>` in the upstream body must NOT reach
+    the surfaced `health().detail` (F4). `health()` maps a transport/auth failure to a
+    generic 'unreachable' summary rather than a verbatim body that could include the
+    bearer token."""
+    leaky_body = f"echoing request: Authorization: Bearer {_TOKEN} was rejected"
+    respx.get(_ISSUES_URL).mock(return_value=httpx.Response(401, text=leaky_body))
+
+    health = _source().health()
+
+    assert health.reachable is False
+    assert _TOKEN not in health.detail, "the bearer token must not leak into health detail"
+
+
+@respx.mock
+def test_fetch_failure_message_redacts_reflected_bearer_token() -> None:
+    """A reflected bearer token in a non-429 failure body is REDACTED in the surfaced
+    PanoptesError message (F4 — the shared `_format_failure` redaction)."""
+    leaky_body = f"Authorization: Bearer {_TOKEN} — invalid"
+    respx.get(_ISSUES_URL).mock(return_value=httpx.Response(401, text=leaky_body))
+
+    with pytest.raises(PanoptesError) as excinfo:
+        _source().fetch(_WINDOW)
+
+    message = str(excinfo.value)
+    assert _TOKEN not in message, "the raw bearer token must not leak into the error message"
+    assert "[REDACTED]" in message

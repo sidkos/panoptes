@@ -366,6 +366,210 @@ def test_env_all_fan_out_partial_result_marks_down_env() -> None:
     assert by_env["stage"]["incidents"] == []
 
 
+# --- F1: query_metric / describe_health env="all" --------------------------------
+
+
+def test_query_metric_env_all_omits_env_matcher_and_returns_across_env_series() -> None:
+    """`query_metric(env="all")` builds a selector with NO `env=` matcher (F1).
+
+    `name{env="all"}` would query a literal label value no signal carries → silent
+    empty. Instead the across-env query drops the `env=` matcher entirely so it
+    returns series across ALL envs (metrics already carry their own `env` label).
+    """
+    captured: list[str] = []
+
+    class _RecordingStore:
+        type = "recording"
+
+        def write(self, signals: list[CanonicalSignal]) -> None:
+            return None
+
+        def query(self, query: MetricQuery) -> list[MetricSeries]:
+            captured.append(query.expr)
+            return [
+                MetricSeries(
+                    metric="panoptes_health_up",
+                    labels={"env": "dev", "url": "https://dev/health"},
+                    points=[(_now(), 1.0)],
+                ),
+                MetricSeries(
+                    metric="panoptes_health_up",
+                    labels={"env": "stage", "url": "https://stage/health"},
+                    points=[(_now(), 0.0)],
+                ),
+            ]
+
+    config = _dev_only_config(store=_RecordingStore())
+    result = query_metric(
+        QueryContext(config), env="all", name="panoptes_health_up", window="15m", filters=None
+    )
+    assert captured, "the store query was executed"
+    expr = captured[0]
+    # No `env=` matcher at all — the across-env query must NOT pin env to a literal.
+    assert "env=" not in expr
+    assert 'env="all"' not in expr
+    # The across-env series come back (both dev + stage).
+    assert {series.labels["env"] for series in result} == {"dev", "stage"}
+
+
+def test_query_metric_env_all_with_filters_keeps_filters_drops_env() -> None:
+    """`env="all"` still applies caller filters — only the `env=` matcher is dropped."""
+    captured: list[str] = []
+
+    class _RecordingStore:
+        type = "recording"
+
+        def write(self, signals: list[CanonicalSignal]) -> None:
+            return None
+
+        def query(self, query: MetricQuery) -> list[MetricSeries]:
+            captured.append(query.expr)
+            return []
+
+    config = _dev_only_config(store=_RecordingStore())
+    query_metric(
+        QueryContext(config),
+        env="all",
+        name="panoptes_health_up",
+        window="15m",
+        filters={"url": "https://x/health"},
+    )
+    expr = captured[0]
+    assert "env=" not in expr
+    assert 'url="https://x/health"' in expr
+
+
+def test_describe_health_env_all_aggregates_across_envs() -> None:
+    """`describe_health(env="all")` aggregates per-env source health + incident counts (F1).
+
+    The previous behavior fell through to `require_env("all")` → a misleading
+    "unknown env" CapabilityError. Now it returns a HealthRollup with env="all", the
+    UNION of per-env source-health entries (each carrying its env), and the SUM of
+    open incident counts across envs.
+    """
+    config = _config(
+        {
+            "dev": ResolvedEnvironment(
+                name="dev",
+                enabled=True,
+                sources=[
+                    _resolved_source(
+                        "sentry",
+                        {SignalKind.INCIDENT, SignalKind.METRIC},
+                        signals=[_incident("dev")],
+                    ),
+                ],
+            ),
+            "stage": ResolvedEnvironment(
+                name="stage",
+                enabled=True,
+                sources=[
+                    _resolved_source(
+                        "sentry",
+                        {SignalKind.INCIDENT, SignalKind.METRIC},
+                        signals=[_incident("stage"), _incident("stage")],
+                    ),
+                ],
+            ),
+        }
+    )
+    rollup = describe_health(QueryContext(config), env="all")
+    assert rollup["env"] == "all"
+    # open incidents summed across envs (1 + 2 = 3).
+    assert rollup["open_incident_count"] == 3
+    # union of per-env source-health entries, each carrying its identifiable env.
+    envs_seen = {source["env"] for source in rollup["sources"]}
+    assert envs_seen == {"dev", "stage"}
+
+
+# --- F7: PromQL injection hardening ----------------------------------------------
+
+
+def _selector_recording_config() -> tuple[ResolvedConfig, list[str]]:
+    """A dev-only config whose store records every executed PromQL expr."""
+    captured: list[str] = []
+
+    class _RecordingStore:
+        type = "recording"
+
+        def write(self, signals: list[CanonicalSignal]) -> None:
+            return None
+
+        def query(self, query: MetricQuery) -> list[MetricSeries]:
+            captured.append(query.expr)
+            return []
+
+    return _dev_only_config(store=_RecordingStore()), captured
+
+
+def test_query_metric_escapes_filter_value_quotes() -> None:
+    """A filter value containing a `"` is ESCAPED, not allowed to break out (F7)."""
+    config, captured = _selector_recording_config()
+    query_metric(
+        QueryContext(config),
+        env="dev",
+        name="panoptes_health_up",
+        window="15m",
+        filters={"url": 'a"b'},
+    )
+    expr = captured[0]
+    # The embedded quote is backslash-escaped — the selector value stays a single closed
+    # string instead of breaking out into an empty/garbage selector.
+    assert r'url="a\"b"' in expr
+
+
+def test_query_metric_escapes_backslash_in_filter_value() -> None:
+    """A backslash in a filter value is escaped first (F7 — order matters)."""
+    config, captured = _selector_recording_config()
+    query_metric(
+        QueryContext(config),
+        env="dev",
+        name="panoptes_health_up",
+        window="15m",
+        filters={"path": r"a\b"},
+    )
+    assert r'path="a\\b"' in captured[0]
+
+
+def test_query_metric_rejects_unknown_env() -> None:
+    """An env not in the config (and not the `all` sentinel) is rejected (F7)."""
+    config, _ = _selector_recording_config()
+    with pytest.raises(CapabilityError):
+        query_metric(
+            QueryContext(config),
+            env="prod-typo",
+            name="panoptes_health_up",
+            window="15m",
+            filters=None,
+        )
+
+
+def test_query_metric_rejects_bogus_metric_name() -> None:
+    """A metric name with PromQL-breaking characters is rejected with a clear error (F7)."""
+    config, _ = _selector_recording_config()
+    with pytest.raises(CapabilityError):
+        query_metric(
+            QueryContext(config),
+            env="dev",
+            name="panoptes_health_up}",
+            window="15m",
+            filters=None,
+        )
+
+
+def test_query_metric_rejects_bogus_filter_label_key() -> None:
+    """A filter label KEY that is not a valid PromQL identifier is rejected (F7)."""
+    config, _ = _selector_recording_config()
+    with pytest.raises(CapabilityError):
+        query_metric(
+            QueryContext(config),
+            env="dev",
+            name="panoptes_health_up",
+            window="15m",
+            filters={'url"=="': "x"},
+        )
+
+
 # --- v0.2 stub tools -------------------------------------------------------------
 
 

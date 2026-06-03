@@ -116,6 +116,29 @@ def test_failure_body_is_trimmed_to_shared_budget() -> None:
 
 
 @respx.mock
+def test_failure_body_redacts_bearer_token() -> None:
+    """A reflected `Authorization: Bearer <token>` in the body is REDACTED (F4).
+
+    A Sentry/proxy that echoes request headers into its error body would otherwise
+    land the raw bearer token in operator logs AND the surfaced PanoptesError. The
+    `_format_failure` body must replace the token with `[REDACTED]`.
+    """
+    leaky_body = "rejected request with header Authorization: Bearer secrettoken123 — denied"
+    respx.get(_URL).mock(return_value=httpx.Response(403, text=leaky_body))
+    client = RestClient()
+
+    with pytest.raises(PanoptesError) as excinfo:
+        client.get_json(_URL, prefix="thing fetch failed", identifier=_URL)
+
+    message = str(excinfo.value)
+    assert "secrettoken123" not in message, "the raw bearer token must not leak"
+    assert "[REDACTED]" in message
+    # The surrounding diagnostic context (status + the non-secret prose) survives.
+    assert "403" in message
+    assert "denied" in message
+
+
+@respx.mock
 def test_send_returns_response_on_2xx() -> None:
     # `send` is the generic seam used by adapters whose request shape is not a plain
     # GET (a POST with a content body, or a two-step Retry-After flow): it applies
@@ -164,6 +187,47 @@ def test_send_connection_error_raises_without_response() -> None:
     message = str(excinfo.value)
     assert "refused" in message
     assert _URL in message
+
+
+@respx.mock
+def test_get_json_read_timeout_raises_panoptes_error_not_hang() -> None:
+    """A read-timeout on a GET surfaces a PanoptesError (F5) rather than hanging.
+
+    httpx raises `ReadTimeout` (an `httpx.HTTPError` with no `.response`); the shared
+    `send` must wrap it in a PanoptesError via `_format_failure`.
+    """
+    respx.get(_URL).mock(side_effect=httpx.ReadTimeout("upstream too slow"))
+    client = RestClient()
+
+    with pytest.raises(PanoptesError) as excinfo:
+        client.get_json(_URL, prefix="thing fetch failed", identifier=_URL)
+
+    message = str(excinfo.value)
+    assert "thing fetch failed" in message
+    assert _URL in message
+
+
+def test_default_client_has_a_bounded_timeout() -> None:
+    """The RestClient's default httpx client carries a NON-None concrete timeout (F5).
+
+    Without a bounded timeout a hung upstream stalls the collector's per-source fetch
+    worker thread, which then blocks the `ThreadPoolExecutor` teardown at cycle end.
+    A default-constructed RestClient must therefore bound every request: the underlying
+    client's default timeout is concrete (not `httpx.Timeout(None)`).
+    """
+    client = RestClient()
+    timeout = client.http.timeout
+    # Every phase of the request is bounded (no None component).
+    assert timeout.connect is not None
+    assert timeout.read is not None
+    assert timeout.write is not None
+    assert timeout.pool is not None
+
+
+def test_constructor_timeout_override_is_applied() -> None:
+    """An explicit `default_timeout` overrides the built-in default on the client (F5)."""
+    client = RestClient(default_timeout=5.0)
+    assert client.http.timeout.read == 5.0
 
 
 def test_injected_client_is_used() -> None:

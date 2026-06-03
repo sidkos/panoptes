@@ -28,7 +28,7 @@ from typing import TypedDict, cast
 
 import yaml
 
-from core.errors import MissingEnvVarError, PanoptesError
+from core.errors import CapabilityMismatchError, MissingEnvVarError, PanoptesError
 from core.model import DashboardPack, SignalKind
 from core.planes.dashboard import DashboardProvider
 from core.planes.notifier import Notifier
@@ -314,7 +314,9 @@ def _reconcile_capabilities(source_type: str, declared: list[str], actual: set[S
     for token in declared:
         kind = _PROVIDES_TO_KIND.get(token)
         if kind is None:
-            raise ValueError(
+            # A config-time error within the PanoptesError hierarchy (NOT stdlib
+            # ValueError, which would escape a caller's `except PanoptesError`).
+            raise CapabilityMismatchError(
                 f"Source '{source_type}' declares unknown capability '{token}' in "
                 f"provides:; valid capabilities are {sorted(_PROVIDES_TO_KIND.keys())}."
             )
@@ -322,7 +324,7 @@ def _reconcile_capabilities(source_type: str, declared: list[str], actual: set[S
     if declared_kinds != actual:
         declared_repr = sorted(kind.value for kind in declared_kinds)
         actual_repr = sorted(kind.value for kind in actual)
-        raise ValueError(
+        raise CapabilityMismatchError(
             f"Source '{source_type}': declared provides {declared_repr} does not match "
             f"the adapter's capabilities() {actual_repr} (capabilities() is authoritative)."
         )
@@ -437,7 +439,9 @@ def load_config(path: Path, registries: PlaneRegistries | None = None) -> Resolv
     Raises:
         MissingEnvVarError: a referenced `${VAR}` is unset.
         UnknownAdapterError: a config block names an unregistered adapter `type`.
-        ValueError: a source's `provides:` disagrees with its `capabilities()`.
+        CapabilityMismatchError: a source's `provides:` disagrees with its
+            `capabilities()` (or declares an unknown `provides:` token) — raised
+            within the `PanoptesError` hierarchy, never stdlib `ValueError`.
     """
     active_registries = registries if registries is not None else _default_registries()
 

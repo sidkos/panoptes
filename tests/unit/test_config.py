@@ -28,7 +28,12 @@ from core.config import (
     ResolvedConfig,
     load_config,
 )
-from core.errors import MissingEnvVarError, PanoptesError, UnknownAdapterError
+from core.errors import (
+    CapabilityMismatchError,
+    MissingEnvVarError,
+    PanoptesError,
+    UnknownAdapterError,
+)
 from core.model import (
     Alert,
     CanonicalSignal,
@@ -272,8 +277,12 @@ def test_provides_capabilities_mismatch_fails_fast(
     # Override http-health to report a capability set that disagrees with the
     # fixture's `provides: [metric]` (it now claims LOG, not METRIC).
     registries.sources.register("http-health")(_make_source_class({SignalKind.LOG}))
-    with pytest.raises(ValueError) as excinfo:
+    # A provides/capabilities mismatch must raise within the PanoptesError hierarchy
+    # (CapabilityMismatchError) — NOT stdlib ValueError, which would escape a caller's
+    # `except PanoptesError` handler (F3).
+    with pytest.raises(PanoptesError) as excinfo:
         load_config(config_path, registries=registries)
+    assert isinstance(excinfo.value, CapabilityMismatchError)
     message = str(excinfo.value)
     assert "http-health" in message
     assert "metric" in message.lower() or "capab" in message.lower()

@@ -53,6 +53,9 @@ _METRIC_LABELS: dict[str, frozenset[str]] = {
 # is the leading identifier; the brace body holds `label op value` filters.
 _METRIC_REF_RE = re.compile(r"\b(panoptes_[a-z_]+)\b(?:\s*\{([^}]*)\})?")
 _LABEL_KEY_RE = re.compile(r"([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:=|!=|=~|!~)")
+# A PromQL aggregation grouping clause: `by (label, ...)` (e.g. `sum by (project, env)`).
+# The captured body is the comma-separated grouping label list.
+_BY_CLAUSE_RE = re.compile(r"\bby\s*\(([^)]*)\)")
 # Grafana template-variable interpolation (e.g. `env="$env"`) — always allowed.
 _TEMPLATE_VAR = "env"
 
@@ -138,6 +141,39 @@ def test_core_dashboard_references_only_known_metrics_and_labels(pack_id: str) -
                     f"(emits {sorted(_METRIC_LABELS[metric_name])})"
                 )
         assert matched_metric, f"{pack_id}: expr {expr!r} references no panoptes_* metric"
+
+
+@pytest.mark.parametrize("pack_id", _CORE_PACK_IDS)
+def test_core_dashboard_grouping_labels_are_emitted_by_the_metric(pack_id: str) -> None:
+    """Every `by (...)` grouping label is a label the grouped metric actually emits (F6).
+
+    A `sum by (level) (metric{...})` panel can only render a real per-label breakdown if
+    `level` is a label `metric` emits — otherwise the grouping collapses to a single
+    constant-labeled series (exactly the bug F6 fixed in the sentry source). This guard
+    catches a future grouping-on-a-non-emitted-label drift at test time.
+    """
+    for expr in _panel_exprs(_load_core_json(pack_id)):
+        grouping_labels: set[str] = set()
+        for by_clause in _BY_CLAUSE_RE.finditer(expr):
+            for raw_label in by_clause.group(1).split(","):
+                label = raw_label.strip()
+                if label:
+                    grouping_labels.add(label)
+        if not grouping_labels:
+            continue
+        # The expr references exactly one panoptes metric family; group against its labels.
+        metric_names = {match.group(1) for match in _METRIC_REF_RE.finditer(expr)}
+        metric_names &= set(_METRIC_LABELS)
+        assert metric_names, f"{pack_id}: expr {expr!r} groups but references no known metric"
+        for metric_name in metric_names:
+            emitted = _METRIC_LABELS[metric_name]
+            for label in grouping_labels:
+                if label == _TEMPLATE_VAR:
+                    continue  # the env template variable is always a valid grouping key
+                assert label in emitted, (
+                    f"{pack_id}: expr {expr!r} groups {metric_name!r} by label {label!r} "
+                    f"which it never emits (emits {sorted(emitted)})"
+                )
 
 
 # --- provider sync + injection --------------------------------------------------

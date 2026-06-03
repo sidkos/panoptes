@@ -36,6 +36,7 @@ still an explicit constructor seam: an adapter that wants to inject its own clie
 test that wants explicit control) passes one through, and `RestClient` threads it down.
 """
 
+import re
 from collections.abc import Callable, Mapping
 
 import httpx
@@ -47,6 +48,20 @@ from core.errors import PanoptesError
 # the SINGLE shared budget the four adapters previously each declared for themselves.
 _BODY_TRIM_CHARS = 800
 
+# Default per-request transport timeout (seconds). Every httpx call the RestClient makes
+# is bounded by this unless the caller overrides it, so a hung upstream can never stall a
+# request indefinitely — and the collector's per-source fetch worker thread always
+# terminates instead of blocking the `ThreadPoolExecutor` teardown (F5).
+_DEFAULT_TIMEOUT_SECONDS = 30.0
+
+# Redaction patterns for the surfaced upstream body (F4). A Sentry/proxy that reflects
+# request headers into its error body could otherwise land the bearer token in operator
+# logs AND the MCP client. We replace any `Bearer <token>` and any echoed `Authorization`
+# header value with a constant marker BEFORE surfacing the (already trimmed) body.
+_BEARER_RE = re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]+")
+_AUTH_HEADER_RE = re.compile(r"(?i)(authorization)\s*[:=]\s*\S+")
+_REDACTED = "[REDACTED]"
+
 
 class RestClient:
     """A thin, shared wrapper over `httpx.Client` with one-place failure surfacing.
@@ -56,15 +71,28 @@ class RestClient:
     their transport to it, keeping only their own URL/request/parse logic.
     """
 
-    def __init__(self, client: httpx.Client | None = None) -> None:
-        """Accept an optional injected httpx client; default to a fresh one.
+    def __init__(
+        self,
+        client: httpx.Client | None = None,
+        *,
+        default_timeout: float = _DEFAULT_TIMEOUT_SECONDS,
+    ) -> None:
+        """Accept an optional injected httpx client; default to a fresh, time-bounded one.
 
         Under `respx` the default `httpx.Client()` is intercepted globally, so production
         code can pass none and tests need not inject one — the seam exists for explicit
         control (an adapter threading its own injected client, or a test wanting a
         specific client instance).
+
+        `default_timeout` (seconds) bounds EVERY request the client makes unless a
+        per-call timeout overrides it (F5): a no-timeout httpx call against a hung
+        upstream would otherwise stall the collector's per-source fetch worker thread and
+        block the `ThreadPoolExecutor` teardown at cycle end. The bound is applied to the
+        constructed default client; an injected client keeps its own configured timeout
+        (the injector owns it).
         """
-        self._client = client if client is not None else httpx.Client()
+        self._default_timeout = default_timeout
+        self._client = client if client is not None else httpx.Client(timeout=default_timeout)
 
     @property
     def http(self) -> httpx.Client:
@@ -100,7 +128,12 @@ class RestClient:
         """
 
         def _call(http: httpx.Client) -> httpx.Response:
-            return http.get(url, params=params, headers=headers, timeout=_resolve_timeout(timeout))
+            # A caller-supplied timeout overrides the client default; otherwise defer to
+            # the client's own (bounded) default by not passing a per-request timeout — so
+            # `None` never unbounds the request (F5).
+            if timeout is not None:
+                return http.get(url, params=params, headers=headers, timeout=timeout)
+            return http.get(url, params=params, headers=headers)
 
         response = self.send(_call, prefix=prefix, identifier=identifier)
         return response.json()
@@ -143,17 +176,6 @@ class RestClient:
         return response
 
 
-def _resolve_timeout(timeout: float | None) -> httpx.Timeout | float:
-    """Map an optional caller timeout to httpx's `timeout=` argument.
-
-    `None` defers to httpx's own default (the adapters that don't time-bound a request
-    pass none); a concrete value is forwarded verbatim so a probe can bound its wait.
-    """
-    if timeout is None:
-        return httpx.Timeout(None)
-    return timeout
-
-
 def _format_failure(prefix: str, identifier: str, exc: httpx.HTTPError) -> str:
     """Build a diagnosable failure message, appending the upstream body when present.
 
@@ -168,9 +190,25 @@ def _format_failure(prefix: str, identifier: str, exc: httpx.HTTPError) -> str:
     """
     response = getattr(exc, "response", None)
     if response is not None:
-        body = response.text[:_BODY_TRIM_CHARS]
+        # Trim first (bound the work + the log), then redact any reflected bearer token /
+        # Authorization header value so a header-echoing upstream can never leak a secret
+        # into operator logs or the MCP client (F4).
+        body = _redact_secrets(response.text[:_BODY_TRIM_CHARS])
         return (
             f"{prefix} ({identifier}): HTTP {response.status_code}. Upstream response body: {body}"
         )
-    # Connection error — no response object; surface the underlying exception text.
-    return f"{prefix} ({identifier}): {exc}"
+    # Connection error — no response object; surface the underlying exception text (also
+    # redacted defensively, in case a transport error message carries a reflected header).
+    return f"{prefix} ({identifier}): {_redact_secrets(str(exc))}"
+
+
+def _redact_secrets(text: str) -> str:
+    """Replace reflected bearer tokens / Authorization header values with a marker (F4).
+
+    A `Bearer <token>` becomes `Bearer [REDACTED]`; an echoed `Authorization: <value>`
+    (or `Authorization=<value>`) header has its value replaced. Applied to any surfaced
+    upstream body so a header-reflecting upstream cannot leak the request's own secret.
+    """
+    redacted = _BEARER_RE.sub(f"Bearer {_REDACTED}", text)
+    redacted = _AUTH_HEADER_RE.sub(rf"\1: {_REDACTED}", redacted)
+    return redacted

@@ -1,12 +1,14 @@
-"""The `sentry` source — Sentry issues into incident signals + a derived gauge.
+"""The `sentry` source — Sentry issues into incident signals + per-level gauges.
 
 `fetch` GETs `/api/0/projects/{org}/{project}/issues/` (filtered by `environment`),
-normalizing each returned issue into an `IncidentSignal`, and additionally derives a
-`panoptes_sentry_incident_count` gauge `MetricSignal` so a Grafana rate panel can be
-rendered from the store (spec `## Data Model` → Derived metrics, Open Question 4).
+normalizing each returned issue into an `IncidentSignal`, and additionally derives one
+`panoptes_sentry_incident_count` gauge `MetricSignal` PER DISTINCT level so a Grafana
+`sum by (level)` breakdown panel renders from the store (spec `## Data Model` → Derived
+metrics, Open Question 4). A single `level="all"` aggregate would collapse that panel to
+one mislabeled series, so the gauge is emitted per level (F6).
 
 Capability set: `{INCIDENT, METRIC}` — `incident` is native (one per issue), `metric`
-is the single derived count gauge.
+is the per-level derived count gauge.
 
 Three REST-client behaviors the spec mandates:
 
@@ -121,17 +123,34 @@ class SentrySource:
         """
         issues = self._get_issues()
         timestamp = datetime.now(UTC)
-        incidents: list[CanonicalSignal] = [self._to_incident(issue) for issue in issues]
-        incidents.append(self._derive_count(len(issues), timestamp))
-        return incidents
+        normalized = [self._to_incident(issue) for issue in issues]
+        signals: list[CanonicalSignal] = list(normalized)
+        # Emit one `panoptes_sentry_incident_count` gauge PER DISTINCT level (F6) so the
+        # dashboard's `sum by (level)` panel renders a real per-level breakdown. A single
+        # `level="all"` aggregate would collapse that panel to one mislabeled series.
+        signals.extend(self._derive_per_level_counts(normalized, timestamp))
+        return signals
 
     def health(self) -> SourceHealth:
-        """Probe reachability by issuing the same issues GET and reporting the result."""
+        """Probe reachability by issuing the same issues GET and reporting the result.
+
+        On failure the detail is a GENERIC transport/auth summary (the exception class
+        name), NOT a verbatim `str(exc)` (F4): the surfaced `health().detail` reaches the
+        MCP client, and a header-reflecting upstream could otherwise echo the bearer token
+        through the exception body. The shared `_format_failure` redaction is the primary
+        defense; this keeps `detail` generic as defense-in-depth (the body is never
+        surfaced through health at all).
+        """
         checked_at = datetime.now(UTC)
         try:
             issues = self._get_issues()
         except PanoptesError as exc:
-            return SourceHealth(reachable=False, detail=str(exc), checked_at=checked_at)
+            return SourceHealth(
+                reachable=False,
+                detail=f"sentry {self._org}/{self._project} unreachable "
+                f"(auth/transport error: {type(exc.__cause__ or exc).__name__})",
+                checked_at=checked_at,
+            )
         return SourceHealth(
             reachable=True,
             detail=f"sentry {self._org}/{self._project} returned {len(issues)} issue(s)",
@@ -222,20 +241,34 @@ class SentrySource:
             labels={"env": self._env, "level": level.value, "project": self._project},
         )
 
-    def _derive_count(self, issue_count: int, timestamp: datetime) -> MetricSignal:
-        """Derive the `panoptes_sentry_incident_count` gauge over the returned issues.
+    def _derive_per_level_counts(
+        self, incidents: list[IncidentSignal], timestamp: datetime
+    ) -> list[MetricSignal]:
+        """Derive one `panoptes_sentry_incident_count` gauge PER DISTINCT level (F6).
 
-        Exact label set `{env, level, project}` (spec Derived-metric table). The
-        `level` label is `all` because this gauge counts issues across every level in
-        the feed — a per-level breakdown panel reads the native incidents, while this
-        gauge powers the aggregate rate panel.
+        Groups the normalized incidents by their `IncidentLevel` and emits one gauge per
+        level present, each with the exact label set `{env, level, project}` carrying the
+        ACTUAL level value (e.g. `error`, `warning`). This is what makes the dashboard's
+        `sum by (level)` breakdown panel render a real per-level series — a single
+        `level="all"` aggregate could only ever render one mislabeled `all` series.
+
+        With zero issues no level is present, so no gauge is emitted (an absent series is
+        the correct "nothing to count" answer for a per-level breakdown).
         """
-        return MetricSignal(
-            name=_METRIC_INCIDENT_COUNT,
-            value=float(issue_count),
-            timestamp=timestamp,
-            labels={"env": self._env, "level": "all", "project": self._project},
-        )
+        counts_by_level: dict[str, int] = {}
+        for incident in incidents:
+            level_value = incident.level.value
+            counts_by_level[level_value] = counts_by_level.get(level_value, 0) + 1
+        # Sorted for a deterministic emission order (stable tests + stable import lines).
+        return [
+            MetricSignal(
+                name=_METRIC_INCIDENT_COUNT,
+                value=float(count),
+                timestamp=timestamp,
+                labels={"env": self._env, "level": level_value, "project": self._project},
+            )
+            for level_value, count in sorted(counts_by_level.items())
+        ]
 
     @staticmethod
     def _map_level(raw_level: object) -> IncidentLevel:

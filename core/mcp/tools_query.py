@@ -28,12 +28,13 @@ IMPORTANT (FastMCP / PEP-563): this module must NOT add
 generation for the nested-`TypedDict` return shapes defined here.
 """
 
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TypedDict
 
 from core.config import ResolvedEnvironment
-from core.errors import CapabilityError
+from core.errors import CapabilityError, PanoptesError
 from core.mcp.context import QueryContext
 from core.model import (
     IncidentSignal,
@@ -49,6 +50,13 @@ from core.planes.source import Source
 # server contract — "Accept and respect an `env` argument (or `all`)").
 _ALL_ENVS = "all"
 
+# PromQL identifier pattern for a metric name or a label KEY (F7). Caller-supplied
+# `name`/label-keys are spliced into the selector unquoted, so they MUST be validated as
+# real PromQL identifiers; anything with a `"`/`{`/`}`/`\` (or other breakout char) is
+# rejected rather than corrupting the query. Label VALUES are quoted, so they are ESCAPED
+# (not identifier-validated) before interpolation.
+_PROMQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_:]*$")
+
 # Default query window for the live-source fetch tools. The MCP `window` argument is
 # a human string in v0.1 (e.g. "15m"); v0.1 maps an unparsed/default window to the
 # trailing N minutes so the tools have a bounded fetch without a full duration parser.
@@ -56,8 +64,14 @@ _DEFAULT_WINDOW_MINUTES = 15
 
 
 class SourceHealthInfo(TypedDict):
-    """One source's reachability within a `describe_health` rollup."""
+    """One source's reachability within a `describe_health` rollup.
 
+    Carries `env` so an `env="all"` aggregate rollup (which unions per-env source
+    health) keeps every entry's owning environment identifiable; for a single-env
+    rollup it is simply that env.
+    """
+
+    env: str
     type: str
     reachable: bool
     detail: str
@@ -123,15 +137,20 @@ def fan_out_over_envs[ResultT](
 
     The single home for the `env="all"` fan-out contract (spec § MCP server contract):
     iterate every enabled env in declaration order, call `fetch_one(environment)`, and —
-    when `fetch_one` raises a `CapabilityError` (the env cannot answer this query) —
-    capture an explicit per-env error marker rather than failing the whole call. The
-    result is a partial result: answerable envs carry their data, unanswerable ones carry
-    their error.
+    when `fetch_one` raises ANY `PanoptesError` (the env cannot answer this query —
+    whether a `CapabilityError` for a missing capability OR a bare `PanoptesError` for a
+    configured-but-down live source, e.g. a Sentry 5xx) — capture an explicit per-env
+    error marker rather than failing the whole call. The result is a partial result:
+    answerable envs carry their data, unanswerable/down ones carry their error.
+
+    F2: catching the `PanoptesError` BASE (not only the `CapabilityError` subclass) is
+    deliberate — a live-source failure must mark just that env down, never wholesale-fail
+    the multi-env call. A non-`PanoptesError` (a genuine bug) is intentionally NOT caught.
 
     Args:
         context: The query context (its enabled environments are iterated).
         fetch_one: The per-env fetch — given an environment, return its result. It may
-            raise `CapabilityError` to mark that env down without failing the fan-out.
+            raise any `PanoptesError` to mark that env down without failing the fan-out.
 
     Returns:
         One `FanOutResult[ResultT]` per enabled env, each carrying data XOR an error.
@@ -142,11 +161,24 @@ def fan_out_over_envs[ResultT](
             results.append(
                 FanOutResult(env=environment.name, data=fetch_one(environment), error=None)
             )
-        except CapabilityError as exc:
-            # The env cannot answer this query — mark it down (partial result), do not
-            # let one unanswerable env fail the whole fan-out.
-            results.append(FanOutResult(env=environment.name, data=None, error=exc.detail))
+        except PanoptesError as exc:
+            # The env cannot answer this query (missing capability) OR its source is down
+            # (a live-source PanoptesError) — mark it down (partial result), do not let one
+            # unanswerable/down env fail the whole fan-out. A CapabilityError carries a
+            # `.detail`; a bare PanoptesError surfaces its message via `str(exc)`.
+            detail = exc.detail if isinstance(exc, CapabilityError) else str(exc)
+            results.append(FanOutResult(env=environment.name, data=None, error=detail))
     return results
+
+
+def _escape_promql_value(value: str) -> str:
+    """Escape a value for a double-quoted PromQL label-matcher string (F7).
+
+    Backslash is escaped FIRST so the quote-escape's own backslash is not re-doubled, then
+    the double quote. This keeps a value like `a"b` a single closed string (`"a\\"b"`)
+    instead of breaking out of the selector (cross-env read / corrupted query).
+    """
+    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _window_for(_window: str) -> TimeWindow:
@@ -356,7 +388,9 @@ def query_metric(
 
     Args:
         context: The query context (its `store` answers the query).
-        env: The environment to scope the query to (added as an `env=` label matcher).
+        env: The environment to scope the query to (added as an `env=` label matcher),
+            or `"all"` to query across EVERY env (the `env=` matcher is omitted so the
+            selector returns series from all envs — metrics already carry an `env` label).
         name: The metric name to query.
         window: The query window string (v0.1: trailing default window).
         filters: Optional additional label matchers applied to the PromQL selector.
@@ -366,11 +400,46 @@ def query_metric(
         "no data in window" answer, distinct from the passthrough `CapabilityError`).
 
     Raises:
-        CapabilityError: the configured store cannot answer queries (e.g. passthrough).
+        CapabilityError: the configured store cannot answer queries (e.g. passthrough),
+            OR a caller-supplied `env`/`name`/filter-key fails validation (F7 — an unknown
+            env, or a value carrying PromQL-breaking characters, is rejected explicitly
+            rather than splicing it raw into the selector).
     """
-    selectors = [f'env="{env}"']
+    # F7 — validate every caller-controlled token that is spliced UNQUOTED into the
+    # selector (env, metric name, filter label keys). A value that breaks out of the
+    # selector (`"`/`{`/`}`/`\`) would otherwise read past the env filter (cross-env read)
+    # or corrupt the query — a latent auth-bypass at v0.2's HTTP/SSO surface.
+    if env != _ALL_ENVS and env not in context.env_names():
+        available = ", ".join(context.env_names()) or "(none)"
+        raise CapabilityError(
+            f"Unknown environment '{env}' for query_metric. Available environments: "
+            f"{available} (or 'all' to query across every env)."
+        )
+    if not _PROMQL_IDENTIFIER_RE.match(name):
+        raise CapabilityError(
+            f"Invalid metric name '{name}': a metric name must be a PromQL identifier "
+            f"([A-Za-z_][A-Za-z0-9_:]*)."
+        )
+
+    selectors: list[str] = []
+    # `env="all"` is the across-env query: omit the `env=` matcher entirely (F1). Pinning
+    # `env="all"` would select a literal label value no signal carries → silent-empty,
+    # which the spec forbids. The metrics already carry their own `env` label, so a
+    # matcher-free selector returns series across every env. (`env` is a validated env
+    # name here, so it needs no value escaping.)
+    if env != _ALL_ENVS:
+        selectors.append(f'env="{env}"')
     if filters:
-        selectors.extend(f'{key}="{value}"' for key, value in sorted(filters.items()))
+        for key, value in sorted(filters.items()):
+            if not _PROMQL_IDENTIFIER_RE.match(key):
+                raise CapabilityError(
+                    f"Invalid filter label key '{key}': a label key must be a PromQL "
+                    f"identifier ([A-Za-z_][A-Za-z0-9_:]*)."
+                )
+            # The label VALUE is interpolated inside a double-quoted PromQL string, so it
+            # is ESCAPED (not identifier-validated): backslash FIRST (so the quote-escape's
+            # own backslash is not doubled), then the double quote.
+            selectors.append(f'{key}="{_escape_promql_value(value)}"')
     expr = f"{name}{{{','.join(selectors)}}}"
     metric_query = MetricQuery(
         expr=expr, window=_window_for(window), step_seconds=_DEFAULT_WINDOW_MINUTES * 60
@@ -381,26 +450,58 @@ def query_metric(
 
 
 def describe_health(context: QueryContext, env: str) -> HealthRollup:
-    """Roll up per-source reachability + open-incident count for `env`.
+    """Roll up per-source reachability + open-incident count for `env` (or all envs).
 
     Every configured source is INCLUDED in the rollup with its reachability — an
     unreachable source is marked `reachable: False`, never omitted, so "the one
     thing to look at" actually shows what is down (the tool's core promise).
 
+    When `env == "all"` (F1), the rollup AGGREGATES across every enabled env: the
+    `sources` list is the union of per-env source-health entries (each carrying its
+    owning env), and `open_incident_count` is the sum across envs. This replaces the
+    previous misleading fall-through to `require_env("all")` (an "unknown env" error).
+
     Args:
         context: The query context.
-        env: The environment to roll up.
+        env: The environment to roll up, or `"all"` to aggregate across enabled envs.
 
     Returns:
         A `HealthRollup` with per-source health + the open-incident count (0 when no
-        source provides incidents — health is still answerable from reachability).
+        source provides incidents — health is still answerable from reachability). For
+        `env="all"`, the env field is `"all"` and the rollup is the across-env aggregate.
     """
+    if env == _ALL_ENVS:
+        # Aggregate the union of per-env source health + the sum of open incidents.
+        aggregated_sources: list[SourceHealthInfo] = []
+        aggregated_count = 0
+        for environment in context.enabled_envs():
+            env_sources, env_count = _health_for_env(context, environment)
+            aggregated_sources.extend(env_sources)
+            aggregated_count += env_count
+        return HealthRollup(
+            env=_ALL_ENVS, sources=aggregated_sources, open_incident_count=aggregated_count
+        )
+
     environment = context.require_env(env)
+    sources, open_incident_count = _health_for_env(context, environment)
+    return HealthRollup(env=env, sources=sources, open_incident_count=open_incident_count)
+
+
+def _health_for_env(
+    context: QueryContext, environment: ResolvedEnvironment
+) -> tuple[list[SourceHealthInfo], int]:
+    """Probe one env's per-source reachability + its open-incident count.
+
+    Extracted so a single-env rollup and the `env="all"` aggregate share one
+    implementation. Each `SourceHealthInfo` carries the env so an aggregate rollup
+    keeps every entry's owning environment identifiable.
+    """
     sources: list[SourceHealthInfo] = []
     for resolved in environment.sources:
         health = resolved.source.health()
         sources.append(
             SourceHealthInfo(
+                env=environment.name,
                 type=resolved.source.type,
                 reachable=health.reachable,
                 detail=health.detail,
@@ -415,5 +516,4 @@ def describe_health(context: QueryContext, env: str) -> HealthRollup:
         open_incident_count = len(
             _fetch_incidents(context, environment, TimeWindow.last(minutes=_DEFAULT_WINDOW_MINUTES))
         )
-
-    return HealthRollup(env=env, sources=sources, open_incident_count=open_incident_count)
+    return sources, open_incident_count

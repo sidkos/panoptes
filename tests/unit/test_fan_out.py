@@ -12,7 +12,7 @@ so the per-tool fan-out tests in `test_mcp_query.py` stay focused on the project
 """
 
 from core.config import ResolvedConfig, ResolvedEnvironment
-from core.errors import CapabilityError
+from core.errors import CapabilityError, PanoptesError
 from core.mcp.context import QueryContext
 from core.mcp.tools_query import fan_out_over_envs
 
@@ -94,3 +94,30 @@ def test_fan_out_marks_a_raising_env_with_an_error_not_a_wholesale_fail() -> Non
     # stage carries the explicit per-env error marker, with no data.
     assert by_env["stage"].data is None
     assert by_env["stage"].error == "stage cannot answer this query"
+
+
+def test_fan_out_marks_a_down_live_source_panoptes_error_not_a_wholesale_fail() -> None:
+    """A configured-but-DOWN source raises a bare PanoptesError (not CapabilityError).
+
+    F2: a live source failure (e.g. Sentry 5xx) raises the documented base
+    `PanoptesError`. The fan-out must mark just that env down — NOT fail the whole
+    multi-env call. The other envs still return their data (partial result).
+    """
+    context = _context({"dev": _env("dev"), "stage": _env("stage")})
+
+    def _fetch_one(environment: ResolvedEnvironment) -> str:
+        if environment.name == "stage":
+            # A configured-but-down upstream surfaces a bare PanoptesError (the
+            # REST-client failure type), NOT a CapabilityError.
+            raise PanoptesError("stage source returned HTTP 503")
+        return f"data-for-{environment.name}"
+
+    results = fan_out_over_envs(context, _fetch_one)
+
+    by_env = {result.env: result for result in results}
+    # dev still answered — one down env does not wholesale-fail the call.
+    assert by_env["dev"].data == "data-for-dev"
+    assert by_env["dev"].error is None
+    # stage is marked down with its error detail, no data.
+    assert by_env["stage"].data is None
+    assert by_env["stage"].error == "stage source returned HTTP 503"
