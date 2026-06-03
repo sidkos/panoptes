@@ -34,6 +34,7 @@ from core.errors import PanoptesError
 from core.model import CanonicalSignal, MetricQuery, MetricSeries, MetricSignal
 from core.registry import STORES, ConfigBlock
 from core.rest import RestClient
+from core.validation import require_str_field
 
 # VictoriaMetrics endpoints (Risk R9: JSON-line import for writes, PromQL range for
 # reads — chosen because the import line shape is byte-exact-assertable in tests).
@@ -56,12 +57,10 @@ class VictoriaMetricsStore:
         control where wanted. The client is threaded into the shared `RestClient`, which
         owns the transport + failure surfacing.
         """
-        url = config.get("url")
-        if not isinstance(url, str) or not url:
-            raise PanoptesError(
-                "The 'victoriametrics' store requires a non-empty string 'url' in its "
-                f"config block; got {url!r}."
-            )
+        # Plane-neutral field check (shared with the sources via `core.validation`) —
+        # replaces what was an inline reimplementation here, which existed only to
+        # avoid a store→`core.sources` cross-plane import.
+        url = require_str_field(config, "url", self.type)
         # Normalize away a trailing slash so endpoint joins produce a single slash.
         self._base_url = url.rstrip("/")
         self._rest = RestClient(client)
