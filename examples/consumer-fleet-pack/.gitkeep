@@ -1,0 +1,10 @@
+# Reserved for the v0.3 fleet consumer fixture pack (Phase 4).
+#
+# This dir will hold a brand-NEUTRALIZED fleet/Agones consumer pack: a fleet source that
+# wraps the core `prometheus` source's normalization + a `register_tools` adding
+# `get_fleet_health`, plus a `dashboards/fleet/dashboard.json` and a `panoptes.yaml` pointing
+# `consumer_pack.path` here. It injects via the v0.1 `PANOPTES_CONSUMER_PACK` mechanism and
+# NEVER touches `core/` (consumer->core import direction only). Consumer-domain tokens
+# (agones/allocator/matchmaking) are ALLOWED under examples/ (the core-purity guard scans
+# core/+modules/+deploy/+charts, not examples/); the consumer brand literal stays at 0
+# everywhere -- this is a GENERIC fleet example, never a named consumer.

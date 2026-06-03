@@ -1,0 +1,8 @@
+# Reserved for the v0.3 pipeline consumer fixture pack (Phase 5).
+#
+# This dir will hold the SECOND, UNRELATED consumer pack -- a job-lag/queue-depth source + a
+# `register_tools` adding `get_pipeline_lag`, plus a `dashboards/pipeline/dashboard.json` and
+# a `panoptes.yaml`. It is a deliberately different domain from the fleet pack so the
+# genericity proof (Phase 5: "two unrelated consumers, zero core diff between them") is
+# meaningful. It injects via the v0.1 `PANOPTES_CONSUMER_PACK` mechanism and NEVER touches
+# `core/`. The consumer brand literal stays at 0 everywhere.
