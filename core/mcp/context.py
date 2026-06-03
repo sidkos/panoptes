@@ -19,7 +19,7 @@ IMPORTANT (FastMCP / PEP-563): this module must NOT add
 annotations break FastMCP's schema generation for the tool returns that consume it.
 """
 
-from core.config import ResolvedConfig, ResolvedEnvironment
+from core.config import ResolvedConfig, ResolvedEnvironment, SloConfig
 from core.errors import CapabilityError
 from core.model import DashboardPack, SignalKind
 from core.planes.source import Source
@@ -86,3 +86,8 @@ class QueryContext:
     def dashboard_packs(self) -> list[DashboardPack]:
         """The resolved dashboard-pack catalog (core + injected consumer packs)."""
         return self._config.dashboard_packs
+
+    @property
+    def slos(self) -> list[SloConfig]:
+        """The resolved SLO definitions (the `get_slo` tool looks one up by name)."""
+        return self._config.slos

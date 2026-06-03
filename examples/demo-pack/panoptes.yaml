@@ -57,9 +57,9 @@ panoptes:
       objective: 0.99
   mcp:
     transport: stdio                               # v0.1 is stdio; HTTP+SSO is v0.2
-    # v0.1-implemented tools only — discovery + query. The v0.2 tools
-    # (compare_envs, get_slo, get_cost) are intentionally OMITTED so the default
-    # config path exercises only real tools; if listed, v0.1 registers them as
-    # call-time "not available in v0.1" stubs (see spec § MCP server).
+    # v0.1-implemented discovery + query tools. The v0.2 real tools (get_cluster_state,
+    # get_slo, compare_envs) are OMITTED here to keep this v0.1 fixture minimal; only
+    # get_cost remains a call-time "not available" stub (it ships v0.3). Listing any of
+    # the real tools would register them too (see spec § MCP server).
     tools: [describe_signal_catalog, list_dashboards, get_dashboard_data,
             query_metric, search_incidents, search_logs, describe_health]

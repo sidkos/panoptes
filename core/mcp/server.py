@@ -47,11 +47,15 @@ from core.mcp.tools_discovery import (
 )
 from core.mcp.tools_query import (
     ClusterState,
+    EnvComparison,
     HealthRollup,
     IncidentFanOut,
     LogFanOut,
+    SloResult,
+    compare_envs,
     describe_health,
     get_cluster_state,
+    get_slo,
     query_metric,
     search_incidents,
     search_logs,
@@ -101,13 +105,15 @@ class _FastMcpAdapter:
 
 
 # The v0.2-listed-but-unimplemented tools. Listing one is NOT a resolve failure —
-# v0.1 registers it as a call-time "not available" stub. All are read-shaped names,
-# so they also satisfy the structural no-mutation-verb-name invariant.
-_V0_2_STUB_TOOLS = ("compare_envs", "get_slo", "get_cost")
+# the server registers it as a call-time "not available" stub. All are read-shaped names,
+# so they also satisfy the structural no-mutation-verb-name invariant. v0.2 Phase 4
+# promoted `compare_envs`/`get_slo` to REAL registrars; `get_cost` STAYS a stub (it ships
+# v0.3 with the Cost dashboard + the CE/budgets read grant).
+_V0_2_STUB_TOOLS = ("get_cost",)
 
-# The exact v0.1-implemented read-only tool set (catalog / discovery / query). The
-# structural read-only test asserts a default-config server registers EXACTLY these
-# (plus any injected-pack tools); a future write tool under any name would break it.
+# The exact implemented read-only tool set (catalog / discovery / query). The structural
+# read-only test asserts a default-config server registers EXACTLY these (plus any
+# injected-pack tools); a future write tool under any name would break it.
 KNOWN_READ_ONLY_TOOLS: tuple[str, ...] = (
     "describe_signal_catalog",
     "list_dashboards",
@@ -119,6 +125,9 @@ KNOWN_READ_ONLY_TOOLS: tuple[str, ...] = (
     # v0.2 — get_cluster_state is a REAL read-only tool (renders the kubernetes snapshot
     # from the store), NOT a `_V0_2_STUB_TOOLS` entry.
     "get_cluster_state",
+    # v0.2 Phase 4 — promoted from stubs to real read-only tools.
+    "get_slo",
+    "compare_envs",
 )
 
 
@@ -421,6 +430,30 @@ def _core_registrars(
 
         server._register_tool(name, get_cluster_state_tool, invoker)
 
+    def register_get_slo(server: PanoptesMcpServer, name: str) -> None:
+        def get_slo_tool(env: str, slo_name: str) -> SloResult:
+            """Evaluate the named SLO for `env`: objective vs. actual + the error budget."""
+            return get_slo(context, env=env, name=slo_name)
+
+        def invoker(*_args: object, **kwargs: object) -> object:
+            return get_slo(
+                context, env=_str_kwarg(kwargs, "env"), name=_str_kwarg(kwargs, "slo_name")
+            )
+
+        server._register_tool(name, get_slo_tool, invoker)
+
+    def register_compare_envs(server: PanoptesMcpServer, name: str) -> None:
+        def compare_envs_tool(metric: str, window: str) -> EnvComparison:
+            """Compare one metric across every enabled env (per-env series + error markers)."""
+            return compare_envs(context, metric=metric, window=window)
+
+        def invoker(*_args: object, **kwargs: object) -> object:
+            return compare_envs(
+                context, metric=_str_kwarg(kwargs, "metric"), window=_str_kwarg(kwargs, "window")
+            )
+
+        server._register_tool(name, compare_envs_tool, invoker)
+
     return {
         "describe_signal_catalog": register_describe_signal_catalog,
         "list_dashboards": register_list_dashboards,
@@ -430,6 +463,8 @@ def _core_registrars(
         "search_logs": register_search_logs,
         "describe_health": register_describe_health,
         "get_cluster_state": register_get_cluster_state,
+        "get_slo": register_get_slo,
+        "compare_envs": register_compare_envs,
     }
 
 

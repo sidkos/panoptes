@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TypedDict
 
-from core.config import ResolvedEnvironment
+from core.config import ResolvedEnvironment, SloConfig
 from core.errors import CapabilityError, PanoptesError
 from core.mcp.context import QueryContext
 from core.model import (
@@ -103,6 +103,14 @@ _K8S_PODS_PENDING = "panoptes_k8s_pods_pending"
 _K8S_PODS_CRASHLOOP = "panoptes_k8s_pods_crashloop"
 _K8S_POD_RESTARTS_TOTAL = "panoptes_k8s_pod_restarts_total"
 
+# The default PromQL the `get_slo` tool measures when a SLO declares no explicit `query`:
+# the availability gauge the overview pack already backs (an uptime SLO is the common case).
+_DEFAULT_SLO_QUERY = "panoptes_health_up"
+
+# The lower clamp for `error_budget_remaining`: a fully-overspent budget reports `-1.0`
+# rather than an unbounded negative, so a wildly-breaching actual stays interpretable.
+_MIN_ERROR_BUDGET_REMAINING = -1.0
+
 
 class SourceHealthInfo(TypedDict):
     """One source's reachability within a `describe_health` rollup.
@@ -159,6 +167,39 @@ class ClusterState(TypedDict):
     pods_crashloop: float
     pod_restarts_total: float
     reachable: bool
+
+
+class SloResult(TypedDict):
+    """The result of evaluating one SLO for one env (spec § SLO + MCP return types).
+
+    Backs the `get_slo` MCP tool + the SLO dashboard. `objective` is the configured target
+    attainment (e.g. 0.99); `actual` is the measured attainment over the SLO's window;
+    `met` is `actual >= objective`; `error_budget_remaining` is the fraction of the error
+    budget still unspent (see `get_slo` for the exact formula): `1.0` = full budget, `0.0`
+    = exactly at objective, negative = objective breached (overspent, clamped at `-1.0`).
+    """
+
+    name: str
+    env: str
+    objective: float
+    actual: float
+    met: bool
+    error_budget_remaining: float
+
+
+class EnvComparison(TypedDict):
+    """One metric's series across every enabled env (spec § SLO + MCP return types).
+
+    Backs the `compare_envs` MCP tool. `per_env` maps each ENABLED env to its resolved
+    series for `metric` over `window`; `errors` carries a per-env marker for any env whose
+    query could not be answered (a partial result — the answerable envs still appear in
+    `per_env`, the down ones in `errors`, never a wholesale failure).
+    """
+
+    metric: str
+    window: str
+    per_env: dict[str, list[MetricSeries]]
+    errors: dict[str, str]
 
 
 class IncidentFanOutEntry(TypedDict):
@@ -669,6 +710,162 @@ def _sum_latest_per_series(series: list[MetricSeries]) -> float:
             latest = max(one_series.points, key=lambda point: point[0])
             total += latest[1]
     return total
+
+
+def get_slo(context: QueryContext, env: str, name: str) -> SloResult:
+    """Evaluate the named SLO for `env` against the store (spec § SLO + MCP return types).
+
+    Looks up the `SloConfig` by `name` (failing clearly if unknown), runs its `query`
+    (the optional v0.2 field — falling back to the `panoptes_health_up` availability gauge
+    when absent) over its `window` (default trailing window when absent) scoped to `env`,
+    takes the latest value as the `actual` attainment, and computes `met` + the error
+    budget.
+
+    **Error-budget formula (pinned).** For an availability-style objective `o` (e.g. 0.99)
+    and a measured actual `a`:
+
+        error_budget_remaining = (a - o) / (1 - o)
+
+    This is the fraction of the error budget still UNSPENT: the budget is the allowance
+    below 100% (`1 - o`); the consumed portion is `1 - a`; so the remaining fraction is
+    `((1 - o) - (1 - a)) / (1 - o) = (a - o) / (1 - o)`. It reads `1.0` at a perfect
+    `a == 1.0`, `0.0` exactly at the objective (`a == o`), and negative when the objective
+    is breached — clamped at `-1.0` (a fully-overspent budget) so a wildly-low actual stays
+    interpretable, and capped at `1.0` above. A degenerate objective of `o >= 1.0` (a 100%
+    target with a zero-width budget) reports `1.0` when `a >= o` else `-1.0` (no division).
+
+    Args:
+        context: The query context (its `store` answers the SLO query; its `slos` carry
+            the SLO definitions).
+        env: The environment to evaluate the SLO for (validated via `require_env`).
+        name: The SLO name to look up.
+
+    Returns:
+        A `SloResult` with the objective, the measured actual, `met`, and the remaining
+        error budget.
+
+    Raises:
+        CapabilityError: the env is unknown/disabled, OR no SLO is named `name`.
+    """
+    # Validate the env (an unknown/disabled env is a clear CapabilityError, not silent).
+    environment = context.require_env(env)
+    slo = _find_slo(context, name)
+
+    objective = float(slo.get("objective", 0.0))
+    query_expr = slo.get("query") or _DEFAULT_SLO_QUERY
+    window_str = slo.get("window") or ""
+    actual = _slo_actual(context, query_expr, window_str, environment.name)
+
+    met = actual >= objective
+    return SloResult(
+        name=name,
+        env=environment.name,
+        objective=objective,
+        actual=actual,
+        met=met,
+        error_budget_remaining=_error_budget_remaining(objective, actual),
+    )
+
+
+def _find_slo(context: QueryContext, name: str) -> SloConfig:
+    """Return the SLO config named `name`, raising a clear `CapabilityError` if unknown."""
+    for slo in context.slos:
+        if slo.get("name") == name:
+            return slo
+    available = ", ".join(str(slo.get("name")) for slo in context.slos) or "(none)"
+    raise CapabilityError(f"No SLO named '{name}'. Available SLOs: {available}.")
+
+
+def _slo_actual(context: QueryContext, query_expr: str, window_str: str, env: str) -> float:
+    """Run the SLO's query scoped to `env` and return the latest value (0.0 when no data).
+
+    The configured `query` is wrapped with an `env="<env>"` matcher so the attainment is
+    measured for the target env only (metrics carry their own `env` label). A store that
+    cannot answer (passthrough → `CapabilityError`) or has no data reports `0.0` — a missing
+    measurement is the worst-case attainment, never a crash into the MCP surface.
+    """
+    # Scope the metric to the env. The query is the metric selector; append the env matcher.
+    expr = f'{query_expr}{{env="{escape_promql_value(env)}"}}'
+    try:
+        series = context.store.query(
+            MetricQuery(
+                expr=expr,
+                window=_window_for(window_str),
+                step_seconds=_step_seconds_for(window_str),
+            )
+        )
+    except CapabilityError:
+        # A passthrough store cannot answer — treat as no measurement (0.0 attainment).
+        return 0.0
+    latest = _latest_value(series)
+    return latest if latest is not None else 0.0
+
+
+def _error_budget_remaining(objective: float, actual: float) -> float:
+    """Compute the fraction of the error budget still unspent (see `get_slo` for the math).
+
+    `(actual - objective) / (1 - objective)`, clamped to `[-1.0, 1.0]`. A degenerate
+    objective `>= 1.0` (zero-width budget) cannot divide, so it reports `1.0` when the
+    actual meets it, else the `-1.0` floor.
+    """
+    budget = 1.0 - objective
+    if budget <= 0.0:
+        # A 100%-or-impossible objective: no budget to spend. Met → full (1.0), else floor.
+        return 1.0 if actual >= objective else _MIN_ERROR_BUDGET_REMAINING
+    remaining = (actual - objective) / budget
+    # Clamp: never more than a full budget (1.0); never below the overspent floor (-1.0).
+    return max(_MIN_ERROR_BUDGET_REMAINING, min(1.0, remaining))
+
+
+def compare_envs(context: QueryContext, metric: str, window: str) -> EnvComparison:
+    """Compare one `metric` across every ENABLED env (spec § promoted tools).
+
+    Reuses the `env="all"` fan-out (`fan_out_over_envs`): queries `metric` over `window`
+    scoped to each enabled env, collecting that env's series under `per_env`. An env whose
+    query cannot be answered (a `CapabilityError`/`PanoptesError` — a passthrough store or a
+    per-env outage) is recorded in `errors` instead — a partial result, never a wholesale
+    failure (the answerable envs still appear in `per_env`).
+
+    Args:
+        context: The query context (its enabled envs + `store` answer the query).
+        metric: The metric name to compare (a PromQL identifier).
+        window: The trailing window string (e.g. "1h", "24h").
+
+    Returns:
+        An `EnvComparison` mapping each enabled env to its series (`per_env`) + a per-env
+        error map (`errors`) for any env that could not answer.
+
+    Raises:
+        CapabilityError: the `metric` is not a valid PromQL identifier (rejected before any
+            query, so a breakout token never reaches the store — the F7 discipline).
+    """
+    # F7 — validate the metric name before splicing it into the selector (a `"`/`{`/`}`/`\`
+    # token would otherwise break out of the per-env selector).
+    if not _PROMQL_IDENTIFIER_RE.match(metric):
+        raise CapabilityError(
+            f"Invalid metric name '{metric}': a metric name must be a PromQL identifier "
+            f"([A-Za-z_][A-Za-z0-9_:]*)."
+        )
+
+    def _fetch_one(environment: ResolvedEnvironment) -> list[MetricSeries]:
+        # Scope the metric to this env (metrics carry their own `env` label); the store
+        # raises a CapabilityError for a per-env outage, which the fan-out marks per-env.
+        expr = f'{metric}{{env="{escape_promql_value(environment.name)}"}}'
+        return context.store.query(
+            MetricQuery(
+                expr=expr, window=_window_for(window), step_seconds=_step_seconds_for(window)
+            )
+        )
+
+    per_env: dict[str, list[MetricSeries]] = {}
+    errors: dict[str, str] = {}
+    for result in fan_out_over_envs(context, _fetch_one):
+        if result.error is not None:
+            errors[result.env] = result.error
+        else:
+            # A successful env carries its (possibly empty) series list.
+            per_env[result.env] = result.data if result.data is not None else []
+    return EnvComparison(metric=metric, window=window, per_env=per_env, errors=errors)
 
 
 def describe_health(context: QueryContext, env: str) -> HealthRollup:

@@ -117,10 +117,19 @@ class DashboardsConfig(TypedDict, total=False):
 
 
 class SloConfig(TypedDict, total=False):
-    """One SLO entry (parsed-and-carried in v0.1; evaluated in v0.2)."""
+    """One SLO entry (parsed-and-carried in v0.1; evaluated in v0.2).
+
+    `name` + `objective` are the v0.1 fields. v0.2 adds optional `query` (the PromQL the
+    `get_slo` tool runs to compute the actual attainment) and `window` (the trailing window
+    string, e.g. "24h", over which the actual is measured). Both are parsed-but-defaulted:
+    a SLO without a `query` falls back to the `panoptes_health_up` availability gauge, and
+    an absent `window` uses the tool's default trailing window.
+    """
 
     name: str
     objective: float
+    query: str
+    window: str
 
 
 class McpConfig(TypedDict, total=False):

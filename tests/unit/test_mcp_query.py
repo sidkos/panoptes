@@ -840,12 +840,17 @@ def test_get_cluster_state_passthrough_store_is_unreachable_not_crash() -> None:
 
 
 def test_v0_2_stub_tool_errors_at_call_time() -> None:
-    """A config listing a v0.2 tool registers a stub returning not-available AT CALL TIME."""
-    config = _dev_only_config(mcp={"transport": "stdio", "tools": ["query_metric", "compare_envs"]})
+    """The remaining v0.2 stub (`get_cost`) registers + errors not-available AT CALL TIME.
+
+    v0.2 Phase 4 promoted `compare_envs`/`get_slo` to real tools; `get_cost` STAYS the sole
+    call-time stub (it ships v0.3 with the Cost dashboard). Listing it is NOT a resolve
+    failure — the server builds fine and the stub raises only when invoked.
+    """
+    config = _dev_only_config(mcp={"transport": "stdio", "tools": ["query_metric", "get_cost"]})
     server = build_server(config)
-    # Listing compare_envs is NOT a resolve failure — the server builds fine.
-    assert "compare_envs" in server.tool_names()
-    stub = server.tool_callable("compare_envs")
+    # Listing get_cost is NOT a resolve failure — the server builds fine.
+    assert "get_cost" in server.tool_names()
+    stub = server.tool_callable("get_cost")
     with pytest.raises(CapabilityError) as excinfo:
         stub(env="dev")
     message = str(excinfo.value).lower()
@@ -871,13 +876,17 @@ def test_default_config_registers_exactly_the_read_only_tool_set() -> None:
                 # v0.2 — get_cluster_state is a REAL tool (not a stub), so the default
                 # read-only set now includes it.
                 "get_cluster_state",
+                # v0.2 Phase 4 — get_slo + compare_envs are REAL tools (promoted from
+                # stubs), so the default read-only set includes them too.
+                "get_slo",
+                "compare_envs",
             ],
         }
     )
     server = build_server(config)
     assert set(server.tool_names()) == set(KNOWN_READ_ONLY_TOOLS)
-    # The v0.2 real tool is part of the exact set.
-    assert "get_cluster_state" in set(server.tool_names())
+    # The v0.2 real tools are part of the exact set.
+    assert {"get_cluster_state", "get_slo", "compare_envs"} <= set(server.tool_names())
 
 
 def test_no_registered_tool_name_matches_mutation_verb_regex() -> None:

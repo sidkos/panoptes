@@ -44,15 +44,15 @@ src = ["core", "examples", "tests"]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "C90"]
 
 [tool.ruff.lint.mccabe]
-# 25 = the most-complex function today (`core/mcp/server.py::_core_registrars`, a flat
+# 31 = the most-complex function today (`core/mcp/server.py::_core_registrars`, a flat
 # registrar table of per-tool registrar closures — structurally a dispatch map, not
 # tangled control flow, so it is left as-is per "set a sane passing threshold, don't
-# refactor to fit"). v0.2 added the `get_cluster_state` registrar (a sibling closure in
-# the same map), nudging the count from 22 to 25; the table is still a flat dispatch, so
-# the threshold tracks it rather than forcing a cosmetic split. Everything else sits at
-# <=12, so this leaves wide headroom for ordinary functions while still catching
-# genuinely runaway complexity.
-max-complexity = 25
+# refactor to fit"). v0.2 grew the table one closure at a time: get_cluster_state
+# (Phase 1) took it 22→25, then get_slo + compare_envs (Phase 4) took it 25→31. The table
+# is still a flat dispatch (each closure is independent), so the threshold tracks it rather
+# than forcing a cosmetic split. Everything else sits at <=12, so this leaves wide headroom
+# for ordinary functions while still catching genuinely runaway complexity.
+max-complexity = 31
 
 [tool.mypy]
 python_version = "3.12"
