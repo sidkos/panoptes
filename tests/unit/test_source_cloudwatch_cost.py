@@ -24,10 +24,12 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import boto3
+import pytest
 from botocore.stub import Stubber
+from core.errors import PanoptesError
 from core.model import MetricSignal, TimeWindow
 from core.registry import ConfigValue
-from core.sources.cloudwatch import CloudWatchSource
+from core.sources.cloudwatch import CloudWatchSource, _PollGate
 
 if TYPE_CHECKING:
     # Type-stub-only imports (boto3-stubs is a dev dep): present at type-check time, never at
@@ -367,3 +369,84 @@ def test_cost_transport_error_is_swallowed_and_cadence_not_advanced() -> None:
 
     for stub in (ce_stub, budgets_stub, sts_stub):
         stub.assert_no_pending_responses()
+
+
+# --- _PollGate — the extracted cadence seam (direct unit tests) ------------------
+#
+# `_PollGate` is the module-private cadence concern the cost path delegates to: `is_due()`
+# decides whether a gated read may fire this cycle, and `mark_done()` advances the marker
+# (called ONLY on a confirmed-successful read). These pin the gate's invariants directly so a
+# cadence regression fails HERE, not diffusely through the CE/budgets-stubbed cost tests above.
+
+
+def test_poll_gate_first_call_is_always_due() -> None:
+    """A fresh gate (no prior `mark_done`) is ALWAYS due on its first `is_due` call."""
+    clock = _FakeClock(_CLOCK_START)
+    gate = _PollGate(_POLL_INTERVAL_SECONDS, clock.now)
+
+    assert gate.is_due() is True
+
+
+def test_poll_gate_not_due_within_interval_after_mark_done() -> None:
+    """After `mark_done`, the gate is NOT due until the interval has fully elapsed."""
+    clock = _FakeClock(_CLOCK_START)
+    gate = _PollGate(_POLL_INTERVAL_SECONDS, clock.now)
+
+    gate.mark_done()
+    # Still inside the interval (one second short) → not due.
+    clock.advance(_POLL_INTERVAL_SECONDS - 1)
+    assert gate.is_due() is False
+
+
+def test_poll_gate_due_again_once_interval_elapses() -> None:
+    """The gate becomes due again once `clock() - last_done >= interval`."""
+    clock = _FakeClock(_CLOCK_START)
+    gate = _PollGate(_POLL_INTERVAL_SECONDS, clock.now)
+
+    gate.mark_done()
+    # Exactly the interval has elapsed → due (the boundary is inclusive: `>=`).
+    clock.advance(_POLL_INTERVAL_SECONDS)
+    assert gate.is_due() is True
+
+
+def test_poll_gate_stays_due_when_mark_done_is_not_called_on_error() -> None:
+    """If `mark_done` is NOT called (a failed read), the gate stays due on the next call.
+
+    This is the load-bearing cost-path contract: a swallowed CE/budgets error must NOT advance
+    the cadence marker, so the next cycle retries rather than blacking out cost for a full
+    interval. The first call is due; without a `mark_done`, a later call (even within what would
+    be the interval) is STILL due.
+    """
+    clock = _FakeClock(_CLOCK_START)
+    gate = _PollGate(_POLL_INTERVAL_SECONDS, clock.now)
+
+    assert gate.is_due() is True
+    # Simulate a failed read: NO mark_done. Advance well under the interval.
+    clock.advance(_POLL_INTERVAL_SECONDS - 1)
+    # Still due — the marker never advanced, so the next cycle retries.
+    assert gate.is_due() is True
+
+
+def test_poll_gate_rejects_non_positive_interval_at_construction() -> None:
+    """A non-positive interval is a misconfiguration → `PanoptesError` at construction."""
+    clock = _FakeClock(_CLOCK_START)
+
+    with pytest.raises(PanoptesError):
+        _PollGate(0, clock.now)
+    with pytest.raises(PanoptesError):
+        _PollGate(-1, clock.now)
+
+
+def test_poll_gate_uses_the_injected_clock_not_wall_time() -> None:
+    """The gate reads its time ONLY from the injected `clock` seam (no wall-clock call).
+
+    Pinning the clock and never advancing it keeps the gate un-due forever after `mark_done`,
+    proving the gate consults the injected clock rather than real wall time (which would tick
+    forward and eventually make it due).
+    """
+    clock = _FakeClock(_CLOCK_START)
+    gate = _PollGate(1, clock.now)  # a 1-second interval — trivially elapsed in wall time
+
+    gate.mark_done()
+    # The injected clock never advances, so even a 1s interval is never reached → not due.
+    assert gate.is_due() is False

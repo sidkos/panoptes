@@ -128,6 +128,69 @@ def _default_clock() -> datetime:
     return datetime.now(UTC)
 
 
+class _PollGate:
+    """A once-per-interval cadence gate for an expensive gated read (the cost-path seam).
+
+    Concentrates the "fire at most once per N seconds, but only advance the marker on a
+    CONFIRMED success" discipline the cost path needs (G3 — CE bills per request, so the read
+    must not fire every poll cycle). The cost path calls `is_due()` to decide whether to issue
+    the CE/budgets read this cycle, and `mark_done()` ONLY after that read succeeds — a failed
+    read leaves the marker un-advanced so the next cycle retries rather than blacking out cost
+    for a whole interval.
+
+    Module-private to `cloudwatch.py` (YAGNI): the metrics/logs/cost paths share one
+    assume-role seam, so the cost path stays in this source; the gate is its named cadence
+    concern, not a shared module — promote it only when a second consumer appears.
+
+    Invariants:
+        - The FIRST `is_due()` (no prior `mark_done`) is ALWAYS due.
+        - After a `mark_done`, `is_due()` is true only once `clock() - last_done >= interval`
+          (the boundary is inclusive).
+        - `last_done` advances ONLY on an explicit `mark_done()` — a failed sub-fetch that
+          skips it leaves the gate due next cycle (the retry contract).
+        - Time comes ONLY from the injected `clock` seam — never a direct wall-clock call — so
+          a test drives cadence with a fake clock and no `sleep`.
+    """
+
+    def __init__(self, interval_seconds: int, clock: Callable[[], datetime]) -> None:
+        """Build a gate over `interval_seconds`, reading time from the injected `clock`.
+
+        Args:
+            interval_seconds: The minimum gap between two `is_due()`-true cycles. MUST be
+                positive — a zero/negative interval is a misconfiguration and raises
+                `PanoptesError` at construction (fail fast, never silently disable the gate).
+            clock: The time source (`() -> datetime`); the gate never calls wall-clock time
+                directly, so a test injects a fake clock to assert cadence without sleeping.
+        """
+        if interval_seconds <= 0:
+            raise PanoptesError(
+                f"_PollGate interval_seconds must be positive; got {interval_seconds}."
+            )
+        self._interval = timedelta(seconds=interval_seconds)
+        self._clock = clock
+        # `None` until the first `mark_done` — so the first `is_due()` is always due.
+        self._last_done_at: datetime | None = None
+
+    def is_due(self) -> bool:
+        """True when no read has completed yet, or the cadence interval has fully elapsed.
+
+        The first call (`_last_done_at is None`) is always due; thereafter a read is due only
+        once `clock() - last_done >= interval`.
+        """
+        if self._last_done_at is None:
+            return True
+        return self._clock() - self._last_done_at >= self._interval
+
+    def mark_done(self) -> None:
+        """Advance the marker to `clock()` — call ONLY after a confirmed-successful read.
+
+        A failed read MUST NOT call this, so the gate stays due next cycle (the retry
+        contract): blacking out the gated read for a full interval on a transient failure is
+        exactly what this seam avoids.
+        """
+        self._last_done_at = self._clock()
+
+
 def _extract_amount(amount_block: object) -> float | None:
     """Pull a stringified float `Amount` out of a CE/budgets `{Amount, Unit}` block.
 
@@ -234,11 +297,13 @@ class CloudWatchSource:
         self._logs_client = logs_client
         self._ce_client = ce_client
         self._budgets_client = budgets_client
-        # The clock seam (G3 cadence gate). `None` → wall-clock `datetime.now(UTC)`.
+        # The clock seam (G3 cadence gate). `None` → wall-clock `datetime.now(UTC)`. Used by
+        # the cost gate AND for the budget-burn gauge timestamp.
         self._clock = clock if clock is not None else _default_clock
-        # Timestamp of the last CE/budgets read; `None` until the first cost fetch. Drives
-        # the once-per-interval cadence gate (`_cost_due`).
-        self._last_cost_read_at: datetime | None = None
+        # The once-per-interval cadence gate for the CE/budgets cost read (G3). It owns the
+        # "fire at most once per interval, advance only on success" discipline; the source
+        # just calls `is_due()` / `mark_done()`.
+        self._cost_gate = _PollGate(self._cost_poll_interval_seconds, self._clock)
 
     def capabilities(self) -> set[SignalKind]:
         """cloudwatch emits metric samples and log lines (incident is v0.2)."""
@@ -520,7 +585,7 @@ class CloudWatchSource:
         if self._cost_budget_name is None:
             # Cost path not configured — never touch CE/budgets.
             return []
-        if not self._cost_due():
+        if not self._cost_gate.is_due():
             # Within the cadence window — skip the CE/budgets calls this cycle (G3). The
             # store keeps serving the gauges from the previous read.
             return []
@@ -529,24 +594,13 @@ class CloudWatchSource:
             burn = self._fetch_budget_burn()
         except (ClientError, BotoCoreError):
             # An auth/transport failure on the cost feed is non-fatal: leave the cadence
-            # marker un-advanced so the next cycle retries, and emit nothing this cycle.
+            # marker un-advanced (do NOT call mark_done) so the next cycle retries, and emit
+            # nothing this cycle.
             return []
         # Only advance the cadence marker on a SUCCESSFUL read, so a failed call retries
         # next cycle rather than blacking out cost for a full interval.
-        self._last_cost_read_at = self._clock()
+        self._cost_gate.mark_done()
         return spend + burn
-
-    def _cost_due(self) -> bool:
-        """True when no cost read has happened yet, or the cadence interval has elapsed.
-
-        The cadence gate (G3): compares `now - last_read` against
-        `cost_poll_interval_seconds`. The very first fetch (`_last_cost_read_at is None`) is
-        always due; thereafter a read fires only once the interval has fully elapsed.
-        """
-        if self._last_cost_read_at is None:
-            return True
-        elapsed = self._clock() - self._last_cost_read_at
-        return elapsed >= timedelta(seconds=self._cost_poll_interval_seconds)
 
     def _fetch_cost_spend(self, window: TimeWindow) -> list[MetricSignal]:
         """Read CE `GetCostAndUsage` grouped by service → one spend gauge per service.
