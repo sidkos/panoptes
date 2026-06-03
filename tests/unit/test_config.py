@@ -28,7 +28,7 @@ from core.config import (
     ResolvedConfig,
     load_config,
 )
-from core.errors import MissingEnvVarError, UnknownAdapterError
+from core.errors import MissingEnvVarError, PanoptesError, UnknownAdapterError
 from core.model import (
     Alert,
     CanonicalSignal,
@@ -270,3 +270,73 @@ def test_provides_capabilities_mismatch_fails_fast(
     message = str(excinfo.value)
     assert "http-health" in message
     assert "metric" in message.lower() or "capab" in message.lower()
+
+
+# --- Negative paths (spec ## Tests "Config") -------------------------------------
+
+
+def test_malformed_yaml_raises_panoptes_error(tmp_path: Path) -> None:
+    """A YAML syntax error surfaces as a clear PanoptesError, not a raw YAMLError."""
+    config_path = _write_fixture(tmp_path, "panoptes:\n  environments: [unclosed\n")
+    with pytest.raises(PanoptesError) as excinfo:
+        load_config(config_path, registries=_registries_with_correct_capabilities())
+    assert str(config_path) in str(excinfo.value)
+
+
+def test_top_level_without_panoptes_key_rejected(tmp_path: Path) -> None:
+    """A file lacking the top-level `panoptes:` mapping fails fast."""
+    config_path = _write_fixture(tmp_path, "something_else:\n  foo: bar\n")
+    with pytest.raises(PanoptesError) as excinfo:
+        load_config(config_path, registries=_registries_with_correct_capabilities())
+    assert "panoptes" in str(excinfo.value)
+
+
+def test_consumer_pack_neither_path_nor_git_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A consumer_pack with neither `path` nor `git` is an invalid union."""
+    _set_reference_env(monkeypatch)
+    body = _REFERENCE_YAML.replace(
+        "    consumer_pack:\n      path: ${CONSUMER_PACK_DIR}\n",
+        "    consumer_pack: {}\n",
+    )
+    config_path = _write_fixture(tmp_path, body)
+    with pytest.raises(PanoptesError) as excinfo:
+        load_config(config_path, registries=_registries_with_correct_capabilities())
+    assert "consumer_pack" in str(excinfo.value)
+
+
+def test_consumer_pack_both_path_and_git_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A consumer_pack with BOTH `path` and `git` is an invalid union."""
+    _set_reference_env(monkeypatch)
+    body = _REFERENCE_YAML.replace(
+        "    consumer_pack:\n      path: ${CONSUMER_PACK_DIR}\n",
+        "    consumer_pack:\n      path: ${CONSUMER_PACK_DIR}\n      git: https://example/repo\n",
+    )
+    config_path = _write_fixture(tmp_path, body)
+    with pytest.raises(PanoptesError) as excinfo:
+        load_config(config_path, registries=_registries_with_correct_capabilities())
+    assert "consumer_pack" in str(excinfo.value)
+
+
+def test_consumer_pack_git_only_parses_and_validates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """git-only is a VALID shape (parsed-but-deferred): it resolves with no error and
+    adds no consumer-tier path pack (Grafana provider raises at provision in v0.1)."""
+    _set_reference_env(monkeypatch)
+    git_block = (
+        "    consumer_pack:\n"
+        "      git: https://example/repo\n"
+        "      ref: main\n"
+        "      subdir: dashboards\n"
+    )
+    body = _REFERENCE_YAML.replace(
+        "    consumer_pack:\n      path: ${CONSUMER_PACK_DIR}\n", git_block
+    )
+    config_path = _write_fixture(tmp_path, body)
+    resolved = load_config(config_path, registries=_registries_with_correct_capabilities())
+    assert isinstance(resolved, ResolvedConfig)
+    assert [p for p in resolved.dashboard_packs if p.tier == "consumer"] == []

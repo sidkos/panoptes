@@ -28,7 +28,7 @@ from typing import TypedDict, cast
 
 import yaml
 
-from core.errors import MissingEnvVarError
+from core.errors import MissingEnvVarError, PanoptesError
 from core.model import DashboardPack, SignalKind
 from core.planes.dashboard import DashboardProvider
 from core.planes.notifier import Notifier
@@ -288,6 +288,15 @@ def _resolve_dashboard_packs(dashboards: DashboardsConfig) -> list[DashboardPack
     consumer_pack = dashboards.get("consumer_pack")
     if consumer_pack is not None:
         path = consumer_pack.get("path")
+        git = consumer_pack.get("git")
+        # The consumer_pack selector is a union: EXACTLY one of `path` (v0.1) or
+        # `git` (v0.2, parsed-but-deferred). Neither (an empty/ambiguous block) or
+        # both at once is a config error rejected here at resolve time.
+        if (path is None) == (git is None):
+            raise PanoptesError(
+                "consumer_pack must specify exactly one of `path` (v0.1) or `git` "
+                f"(v0.2); got path={path!r}, git={git!r}."
+            )
         if path is not None:
             resolved_path = _interpolate(path)
             packs.append(
@@ -299,7 +308,8 @@ def _resolve_dashboard_packs(dashboards: DashboardsConfig) -> list[DashboardPack
                     json_path=Path(resolved_path),
                 )
             )
-        # The `git` variant is parsed-but-deferred to v0.2 (no resolution here).
+        # The `git` variant parses + validates here but is NOT resolved in v0.1: the
+        # Grafana provider raises a clear CapabilityError at provision time (Phase 5).
     return packs
 
 
@@ -321,9 +331,18 @@ def load_config(path: Path, registries: PlaneRegistries | None = None) -> Resolv
     """
     active_registries = registries if registries is not None else _default_registries()
 
-    raw = yaml.safe_load(path.read_text())
-    # `safe_load` returns `object`; narrow to the typed schema. The shape is the
-    # loader's contract — a malformed file surfaces as a KeyError naming the field.
+    # Parse YAML, surfacing a syntax error as a clear PanoptesError rather than a
+    # raw yaml.YAMLError the operator would have to decode.
+    try:
+        raw = yaml.safe_load(path.read_text())
+    except yaml.YAMLError as exc:
+        raise PanoptesError(f"Config file {path} is not valid YAML: {exc}") from exc
+    # The top-level shape is the loader's contract: a single `panoptes:` mapping.
+    if not isinstance(raw, dict) or "panoptes" not in raw:
+        raise PanoptesError(
+            f"Config file {path} must have a top-level 'panoptes:' mapping; "
+            f"got {type(raw).__name__}."
+        )
     config = cast(PanoptesConfig, raw)
     body = config["panoptes"]
 
