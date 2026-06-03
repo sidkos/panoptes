@@ -62,9 +62,9 @@ live target exists.
 | **sentry**          | source | incident, metric (derived `panoptes_sentry_incident_count` gauge) | ✅ | thin (REST API) |
 | **kubernetes**      | source | metric, incident (events → `incident`, resource state → `metric`) | ✅ (EKS) | medium (k8s client) |
 | **http-health**     | source | metric (from `/health`) | ✅ | trivial |
-| **prometheus**      | source | metric             | ❌ (not deployed) | medium |
-| **loki**            | source | log                | ❌ | later |
-| **tempo / jaeger**  | source | trace              | ❌ (no tracing yet) | later |
+| **prometheus**      | source | metric             | ❌ (not deployed) | medium — **v0.3 SHIPPED** |
+| **loki**            | source | log                | ❌ | **v0.3 SHIPPED** |
+| **tempo / jaeger**  | source | trace              | ❌ (no tracing yet) | later (v0.3 explicitly defers `tempo`) |
 | **datadog**         | source | metric, log        | ❌ | optional |
 | **victoriametrics** | store  | —                  | ❌ | deploy + adapter (default store) |
 | **passthrough**     | store  | —                  | n/a | trivial (no persistence) |
@@ -90,6 +90,32 @@ live target exists.
 Panoptes-owned channels; `core/notifiers/{sns,slack}.py`). The no-write guard's
 suppression is **path-scoped** to `core/notifiers/sns.py` — `sns.publish` anywhere else
 (esp. `core/sources/`) still red-bars (`tests/unit/test_no_write_actions_guard.py`).
+
+**v0.3 build set (SHIPPED):** the `prometheus` source (read-only PromQL scrape via httpx
+`GET /api/v1/query_range` → `MetricSignal` with `env` stamped, `capabilities() == {metric}`;
+`core/sources/prometheus.py`) and the `loki` source (read-only `GET
+/loki/api/v1/query_range` → `LogSignal`, `capabilities() == {log}`; `core/sources/loki.py`).
+Both are read-only (httpx GET — the documented read-only known-miss, same as the v0.1
+sentry/http-health sources: the read-only endpoint/token is the authoritative control, not
+the boto3-shaped no-write grep). **`tempo` is explicitly NOT shipped in v0.3** — with `loki`
+(LOG) added and `tempo` deferred, the union of `capabilities()` across all core sources stays
+exactly `{metric, log, incident}` (NO trace), so the v0.1/v0.2 "no trace source" negative
+path remains true (`tests/unit/test_source_capabilities.py`). The `cloudwatch` source also
+gains a v0.3 opt-in COST read path (CE `GetCostAndUsage` + budgets `DescribeBudget` →
+`panoptes_cost_*` gauges, rate-limited to once per poll interval) backing the real `get_cost`
+tool — see [`DASHBOARDS.md`](DASHBOARDS.md) §1 row 9 + [`IAM.md`](IAM.md) §A.
+
+> **Consumer-pack source adapters (v0.3 — fixtures under `examples/`, NOT core).** Two
+> unrelated consumer fixture packs demonstrate that a consumer extends a core plane without
+> touching core: the **fleet** pack (`examples/consumer-fleet-pack/pack.py`) registers a
+> `fleet` source that BUILDS ON the core `prometheus` source (it composes `PrometheusSource`
+> and relabels the scrape into `panoptes_fleet_*` gauges), and the **pipeline** pack
+> (`examples/consumer-pipeline-pack/pack.py`) registers a STANDALONE `pipeline` source over a
+> generic pipeline-metrics endpoint. Both register on the core `SOURCES` registry purely
+> additively via the pack's `import` (consumer→core only — the structural guard enforces
+> `core/`↛`examples/`), and both are read-only. These adapters are consumer-owned and stay
+> out of the core catalog above. See [`DASHBOARDS.md`](DASHBOARDS.md) §1 (rows C2/C-pipeline)
+> and the genericity proof in `tests/unit/test_genericity_two_consumers.py`.
 
 > **cloudwatch capability set (v0.1):** `cloudwatch` provides `{metric, log}` in
 > v0.1. Normalizing CloudWatch alarms into `incident` signals is a **v0.2**

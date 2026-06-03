@@ -87,8 +87,12 @@ Register the MCP server with any MCP client (e.g. Claude) by running
 **Wiring your own consumer pack:** keep a pack dir in *your* repo (a `pack.py`, a
 `panoptes.yaml`, and `dashboards/<name>/dashboard.json`), point `CONSUMER_PACK_DIR`
 at it, and Panoptes injects it at deploy time — it is never bundled into core. See
-[`examples/demo-pack/`](examples/demo-pack/) for the brand-neutral template and its
-[README](examples/demo-pack/README.md).
+[`examples/demo-pack/`](examples/demo-pack/) for the minimal brand-neutral template and its
+[README](examples/demo-pack/README.md), and the two richer v0.3 proof fixtures —
+[`examples/consumer-fleet-pack/`](examples/consumer-fleet-pack/) (a source that builds on the
+core `prometheus` source) and [`examples/consumer-pipeline-pack/`](examples/consumer-pipeline-pack/)
+(a standalone source, an unrelated domain) — which together form the "provable genericity"
+proof described under [Status](#status).
 
 ## Quickstart (v0.2 — hosted on EKS)
 
@@ -207,12 +211,44 @@ deploy-time `git` dashboard injection (full-SHA pin, mutable-ref rejected), and 
 GHCR publish workflow are all implemented and tested (unit + integration + the hermetic
 `terraform validate/tflint` + `helm lint/template/kubeconform` gates).
 
-**v0.3 — fully specified, implementation pending.** The `prometheus`/`loki`/`tempo`
-sources, the richer core packs (Compute/Datastore/Cost/Karpenter), and the second-consumer
-genericity proof are written up in
-[`docs/specs/v0.3_depth_genericity.md`](docs/specs/v0.3_depth_genericity.md) + its plan and
-summarized in [`docs/ROADMAP.md`](docs/ROADMAP.md). `docker compose` stays the local/dev
-path; EKS is the hosted target.
+**v0.3 (depth & provable genericity) — built.** The `prometheus` source (read-only PromQL
+scrape → `MetricSignal`) and the `loki` source (read-only → `LogSignal`; `tempo` explicitly
+deferred, so the "no trace source" invariant `{metric, log, incident}` still holds), three
+new core dashboard packs (**Cost**, **Datastore**, **Karpenter**), the now-real `get_cost`
+tool (the LAST `_V0_2_STUB_TOOLS` entry removed — the stub set is empty) reading
+`panoptes_cost_*` gauges from the `cloudwatch` source's opt-in once-per-interval CE/budgets
+read path, and — the release thesis — **two unrelated consumer packs proving provable
+genericity** (see below) are all implemented and tested (unit + integration, the gate stays
+green). `docker compose` stays the local/dev path; EKS is the hosted target. The full v0.3
+spec is [`docs/specs/v0.3_depth_genericity.md`](docs/specs/v0.3_depth_genericity.md) (+ its
+plan); the roadmap is summarized in [`docs/ROADMAP.md`](docs/ROADMAP.md).
+
+### Provable genericity — two unrelated consumers, zero core diff
+
+The v0.3 release thesis is the one test that distinguishes a *genuinely* generic core from
+one secretly shaped around its first consumer: **two UNRELATED consumer packs inject the same
+way with a byte-identical core baseline between them.** Both ship as brand-neutral fixtures
+under [`examples/`](examples/), each injected via the v0.1 `PANOPTES_CONSUMER_PACK` hook,
+each registering its own source + MCP tool + dashboard via `register_tools` — **never
+touching `core/`**:
+
+- **Consumer #1 — a game-server fleet** ([`examples/consumer-fleet-pack/`](examples/consumer-fleet-pack/)):
+  a `fleet` source that **BUILDS ON the core `prometheus` source** (it composes
+  `PrometheusSource` and relabels the scrape into `panoptes_fleet_*` gauges) + a
+  `get_fleet_health(env)` tool + a Fleet dashboard.
+- **Consumer #2 — a data pipeline** ([`examples/consumer-pipeline-pack/`](examples/consumer-pipeline-pack/)):
+  a deliberately UNRELATED domain — a STANDALONE `pipeline` source (job lag / queue depth /
+  data freshness, not built on prometheus) + a `get_pipeline_lag(env)` tool + a Pipeline
+  dashboard.
+
+The proof (`tests/unit/test_genericity_two_consumers.py`) asserts each pack injects
+**additively** (the core's own registrations are unchanged), the core-purity guard is green
+with **both** fixtures present, and — the load-bearing assertion — the **core registry
+baseline is BYTE-IDENTICAL** across the two injections: with each pack's own additions
+subtracted, the serialized core sources/stores/notifiers/tools are string-equal. A single
+per-consumer core branch would break it. `tests/integration/test_two_consumer_injection.py`
+then proves both packs' tools answer over the real MCP transport. The dependency arrow points
+ONE way — consumer→core — enforced structurally by the `core/`↛`examples/` import guard.
 
 ## License
 

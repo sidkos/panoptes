@@ -55,11 +55,24 @@ Grant only the read actions for the sources actually configured for that env.
 | CloudWatch metrics | `cloudwatch:GetMetricData`, `cloudwatch:ListMetrics`, `cloudwatch:GetMetricStatistics`, `cloudwatch:DescribeAlarms` |
 | CloudWatch Logs (logs dashboard) | `logs:DescribeLogGroups`, `logs:FilterLogEvents`, `logs:StartQuery`, `logs:GetQueryResults`, `logs:StopQuery` (see read-path note) |
 | EKS control plane (cluster discovery) | `eks:DescribeCluster`, `eks:ListClusters` |
-| Cost dashboard (v0.2+, when the Cost dashboard ships) | `ce:GetCostAndUsage`, `budgets:ViewBudget` |
+| Cost dashboard (v0.3 — SHIPPED) | `ce:GetCostAndUsage`, `budgets:ViewBudget` (authorizes the `DescribeBudget` API the source calls), `sts:GetCallerIdentity` (resolves the account id `DescribeBudget` requires) |
 
 **Hard rule:** zero `Put*`, `Create*`, `Update*`, `Delete*`, `Write*` on any
 observed resource. The policy is read/list/describe/get only. A CI check should
 fail the policy if any non-read action appears.
+
+> **Cost-grant note (v0.3) — the CE/budgets grant is CONSUMER-side IaC on the env
+> read-role, NOT Panoptes' IRSA, and it is read-only.** When a consumer enables the Cost
+> dashboard, the three actions above (`ce:GetCostAndUsage`, `budgets:ViewBudget`,
+> `sts:GetCallerIdentity`) are added to **that env's `PanoptesReadRole`** — the same per-env
+> read-role pattern as every other source capability — in the **consumer's own IaC**, exactly
+> like the EKS-RBAC and CRD examples below. They do NOT belong on Panoptes' home-principal
+> IRSA role (§B), which holds only `sts:AssumeRole` for the read-roles + the single
+> Panoptes-owned `sns:Publish`. All three are READ actions (Cost Explorer and Budgets expose
+> only read APIs here; `GetCallerIdentity` reads the caller's own identity), so the §A
+> hard rule (zero `Put*`/`Create*`/`Update*`/`Delete*`/`Write*` on observed resources) holds.
+> The source self-limits these calls to **at most once per poll interval** (default hourly —
+> CE bills per request), independent of the IAM grant.
 
 > **Read-path note — `logs:StartQuery` / `logs:StopQuery` / `logs:GetQueryResults`
 > are read actions despite the `Start`/`Stop` verb shapes.** Logs Insights queries

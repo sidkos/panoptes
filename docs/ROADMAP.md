@@ -64,23 +64,29 @@ GitOps image/build pipeline, alerting.
 
 ---
 
-## v0.3 — stretch (depth + provable genericity)
+## v0.3 — depth + provable genericity (SHIPPED)
 
-- **prometheus** core source — a read-only PromQL scrape of any reachable
+- **prometheus** core source (SHIPPED) — a read-only PromQL scrape of any reachable
   Prometheus. Panoptes does **not** stand up a Prometheus of its own (cost
   discipline); it scrapes a consumer-run one. Because Panoptes now runs on its own
   dedicated EKS cluster (v0.2), the `prometheus` source + the Kubernetes/Karpenter
   core packs can also observe **Panoptes' OWN cluster** (self-monitoring), in
-  addition to observed consumer clusters. The **Fleet / Game-Business** dashboards
-  are driven by a **consumer-pack source adapter** for the consumer's fleet
-  technology (e.g. an Agones source that scrapes fleet metrics via that Prometheus)
-  — that adapter is domain-specific and lives in the consumer's own repo, not in
-  core, so it stays out of the brand-neutral core catalog and the core-purity
-  guard's banned-term set.
-- Richer **core** dashboard packs (Kubernetes/Karpenter, Cost, Datastore).
-- A **second, unrelated consumer** wired in to prove the core is genuinely
-  generic — not just "the reference consumer's monitoring with extra steps."
-- Optional: loki/tempo sources for logs/traces parity.
+  addition to observed consumer clusters. The **Fleet** dashboard is driven by a
+  **consumer-pack source adapter** that BUILDS ON this core `prometheus` source
+  (a fleet source composing it) — that adapter is domain-specific and lives under
+  `examples/consumer-fleet-pack/` (a brand-neutral fixture), not in core, so it
+  stays out of the core catalog and the core-purity guard's banned-term set.
+- **loki** core source (SHIPPED) — a read-only Loki `query_range` scrape → `LogSignal`.
+  `tempo` is explicitly NOT shipped, so the "no trace source" invariant
+  (`{metric, log, incident}`) still holds.
+- Richer **core** dashboard packs (SHIPPED): **Cost** (+ the now-real `get_cost`), 
+  **Datastore**, and **Karpenter**.
+- A **second, unrelated consumer** (SHIPPED) — `examples/consumer-pipeline-pack/` (a
+  data-pipeline domain: job lag / queue depth / freshness) — wired in alongside the
+  fleet consumer to prove the core is genuinely generic. The **genericity proof**
+  (`tests/unit/test_genericity_two_consumers.py`) asserts the core registry baseline is
+  byte-identical across the two unrelated injections — not just "the reference consumer's
+  monitoring with extra steps."
 
 ---
 

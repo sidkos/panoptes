@@ -32,21 +32,39 @@ returns the same data programmatically.
 | 3 | **Overview / Single Pane** | core | rollup of all | per-env health traffic-light, top alerts/errors, key SLOs | `describe_health(env)` |
 | 4 | **Kubernetes** (v0.2 — SHIPPED) | core | kubernetes | node count, pod restarts/CrashLoops, pending pods | `get_cluster_state(env)` |
 | 5 | **Compute** | core | cloudwatch | invocations/errors/throttles/p99 across functions | `query_metric(...)` |
-| 6 | **Datastore** | core | cloudwatch | consumed capacity, throttles, latency per table | `query_metric(env, metric, dims)` |
+| 6 | **Datastore** (v0.3 — SHIPPED) | core | cloudwatch (store-carried signals) | log error-rate by group, datastore service spend | `query_metric(env, metric, dims)` |
 | 7 | **API gateway** | core | cloudwatch | 4xx/5xx, request count, latency | `query_metric(...)` |
 | 8 | **Networking / Certs** | core | cloudwatch | LB healthy/unhealthy hosts, cert days-until-expiry | `query_metric(...)` |
-| 9 | **Cost** (v0.3) | core | cloudwatch (CE/budgets) | budget burn, per-service spend | `get_cost(env, window)` |
+| 9 | **Cost** (v0.3 — SHIPPED) | core | cloudwatch (CE/budgets) | budget burn, total + per-service spend | `get_cost(env, window)` |
 | 10 | **SLO / Golden Signals** (v0.2 — SHIPPED) | core | derived | RED/USE rollup, error budgets | `get_slo(name, env)` |
+| 11 | **Karpenter** (v0.3 — SHIPPED) | core | kubernetes | provisioned nodes, unschedulable-pod pressure, crash-loops, consolidation churn | `get_cluster_state(env)` |
 | C1 | **Matchmaking / Allocator** | consumer | cloudwatch + sentry | allocator errors/throttles, success vs 429/503, time-to-match | `get_allocator_pressure(env, window)` |
-| C2 | **Fleet / Agones** | consumer | agones (prometheus) | ready/allocated/reserved, ready-to-serve %, 429 rate | `get_fleet_health(env)` |
+| C2 | **Fleet** (v0.3 — SHIPPED as a consumer-pack PROOF fixture) | consumer | `fleet` source (builds on core `prometheus`) | ready/allocated/reserved replicas | `get_fleet_health(env)` |
+| C-pipeline | **Pipeline** (v0.3 — SHIPPED as the 2nd, unrelated consumer-pack PROOF fixture) | consumer | `pipeline` source (standalone) | job lag, queue depth, data freshness | `get_pipeline_lag(env)` |
 | C3 | **Game / Business** | consumer | http-health + sentry | active matches, connections, match duration, registrations | `get_game_metrics(env)` |
 
 *core* packs ship with Panoptes and apply to any AWS/Sentry/K8s consumer.
-*consumer* packs (C-prefixed) are a reference game-platform example that **lives in
-the consumer's own repo** and is injected at deploy time — they demonstrate the
-extension mechanism, not core scope. Consumer-specific MCP tools (e.g.
-`get_allocator_pressure`) are registered by the injected consumer pack's optional
+*consumer* packs (C-prefixed) **live in the consumer's own repo** and are injected at deploy
+time — they demonstrate the extension mechanism, not core scope. Consumer-specific MCP tools
+(e.g. `get_allocator_pressure`) are registered by the injected consumer pack's optional
 `pack.py`, not built into core.
+
+> **v0.3 SHIPPED — three new CORE packs + two CONSUMER-PACK proof fixtures.**
+> - **Core (in `core/dashboards/`, always provisioned):** **Cost** (row 9 — `panoptes_cost_*`
+>   total/burn/per-service spend, backing the now-real `get_cost`), **Datastore** (row 6 — the
+>   cloudwatch-source store-carried signals: log error-rate + datastore service spend), and
+>   **Karpenter** (row 11 — node-pool + k8s pressure over `panoptes_k8s_*`). All three declare
+>   the `env` template variable and reference only `panoptes_*` metrics
+>   (`tests/unit/test_dashboards_valid.py`).
+> - **Consumer (fixtures under `examples/`, NOT core):** the **Fleet** pack (row C2 —
+>   `examples/consumer-fleet-pack/`, whose `fleet` source BUILDS ON the core `prometheus`
+>   source) and the **Pipeline** pack (row C-pipeline — `examples/consumer-pipeline-pack/`, a
+>   STANDALONE `pipeline` source, a DELIBERATELY UNRELATED domain). These two unrelated packs
+>   are the v0.3 **genericity proof**: each injects via the v0.1 `register_tools` hook with a
+>   BYTE-IDENTICAL core registry baseline between them — zero per-consumer core assumption
+>   (`tests/unit/test_genericity_two_consumers.py` + `tests/integration/test_two_consumer_injection.py`).
+>   The C2 Fleet row, historically sketched as a reference-consumer example, is NOW a concrete
+>   shipped proof fixture (brand-neutral, under `examples/`, never core).
 
 **v0.1 scope (dev only):** the three core packs — **Errors**, **Logs**,
 **Overview** — ship in Panoptes and are always provisioned. The consumer tier is
@@ -84,16 +102,25 @@ Synthesized where one question deserves one call.
 - **Core (v0.2 — SHIPPED):** `get_slo(name, env)` — the SLO rollup (objective vs.
   actual + error-budget remaining) that ships with the SLO dashboard (catalog row 10).
   Promoted out of `_V0_2_STUB_TOOLS` to a real registrar (`core/mcp/tools_query.py`).
-- **Core (deferred):** `get_cost(env, window)` (v0.3) — the only remaining call-time stub;
-  it ships with the Cost dashboard (catalog row 9) + the CE/budgets read grant in v0.3.
+- **Core (v0.3 — SHIPPED):** `get_cost(env, window)` — promoted out of `_V0_2_STUB_TOOLS`
+  (it was the LAST remaining stub, so the stub set is now **empty**) to a real registrar
+  (`core/mcp/tools_query.py`). It renders `total`/`per_service`/`budget_burn` from the stored
+  `panoptes_cost_*` gauges (two-faces-one-store parity), backing the Cost dashboard (catalog
+  row 9). The gauges come from the `cloudwatch` source's opt-in CE/budgets read path (rate-
+  limited to once per poll interval); the CE/budgets read grant is consumer-side IaC (see
+  [`IAM.md`](IAM.md) §A), NOT Panoptes' IRSA.
 - **Core (v0.2 — SHIPPED, ships with the `kubernetes` source):** `get_cluster_state(env)`
   — node count, pod restarts/CrashLoops, pending pods (the parallel tool for the
   Kubernetes dashboard, catalog row 4), rendered from the stored `panoptes_k8s_*` gauges
   (two-faces-one-store parity). Listed here so the "every dashboard has a parallel MCP
   tool" invariant resolves; introduced alongside its source in v0.2.
-- **Consumer-pack-registered examples** (registered by an injected consumer pack,
-  not core): `get_fleet_health(env)`, `get_allocator_pressure(env, window)`,
-  `get_game_metrics(env)`.
+- **Consumer-pack-registered tools** (registered by an injected consumer pack via
+  `register_tools`, NOT core): `get_fleet_health(env)` and `get_pipeline_lag(env)` are
+  **shipped v0.3 proof fixtures** (`examples/consumer-fleet-pack/` and
+  `examples/consumer-pipeline-pack/` — two UNRELATED consumer domains), exercised end to end
+  over the real MCP transport in `tests/integration/test_two_consumer_injection.py`.
+  `get_allocator_pressure(env, window)` / `get_game_metrics(env)` remain illustrative
+  reference-consumer examples (not built in this repo).
 
 ### Cross-environment
 - `compare_envs(metric, window)` (v0.2 — SHIPPED) — same signal across dev/stage/prod.
