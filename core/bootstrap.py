@@ -22,6 +22,7 @@ _CORE_ADAPTER_MODULES = (
     "core.notifiers.logging_notifier",
     "core.sources.cloudwatch",
     "core.sources.http_health",
+    "core.sources.kubernetes",
     "core.sources.sentry",
     "core.stores.passthrough",
     "core.stores.victoriametrics",

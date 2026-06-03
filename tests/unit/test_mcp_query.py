@@ -47,6 +47,7 @@ from core.mcp.server import (
 from core.mcp.tools_query import (
     describe_health,
     escape_promql_value,
+    get_cluster_state,
     query_metric,
     search_incidents,
     search_logs,
@@ -740,6 +741,101 @@ def test_escape_promql_value_is_public_and_escapes_backslash_first() -> None:
     assert escape_promql_value('a\\"b') == r"a\\\"b"
 
 
+# --- get_cluster_state (v0.2 — renders from the STORE gauges, parity) -------------
+
+
+def _k8s_series(
+    metric: str, env: str, cluster: str, value: float, *, namespace: str | None = None
+) -> MetricSeries:
+    """A one-point `panoptes_k8s_*` series with the source's exact label set."""
+    labels = {"env": env, "cluster": cluster}
+    if namespace is not None:
+        labels["namespace"] = namespace
+    return MetricSeries(metric=metric, labels=labels, points=[(_now(), value)])
+
+
+class _K8sGaugeStore:
+    """A fake store answering each `panoptes_k8s_*` query from a fixed series map.
+
+    Keyed on the metric-name prefix of the query expr so `get_cluster_state` reads the
+    same store the kubernetes source writes to (the two-faces-one-store parity).
+    """
+
+    type = "k8s-gauge"
+
+    def __init__(self, series_by_metric: dict[str, list[MetricSeries]]) -> None:
+        self._series_by_metric = series_by_metric
+
+    def write(self, signals: list[CanonicalSignal]) -> None:
+        return None
+
+    def query(self, query: MetricQuery) -> list[MetricSeries]:
+        for metric_name, series in self._series_by_metric.items():
+            if metric_name in query.expr:
+                return series
+        return []
+
+
+def _k8s_config(store: Store) -> ResolvedConfig:
+    """A dev env carrying a kubernetes source (the capability) bound to `store`."""
+    return _config(
+        {
+            "dev": ResolvedEnvironment(
+                name="dev",
+                enabled=True,
+                sources=[_resolved_source("kubernetes", {SignalKind.METRIC, SignalKind.INCIDENT})],
+            ),
+        },
+        store=store,
+    )
+
+
+def test_get_cluster_state_aggregates_the_gauges() -> None:
+    """`get_cluster_state` assembles the cluster snapshot from the stored k8s gauges."""
+    store = _K8sGaugeStore(
+        {
+            "panoptes_k8s_node_count": [_k8s_series("panoptes_k8s_node_count", "dev", "c1", 5.0)],
+            "panoptes_k8s_pods_pending": [
+                _k8s_series("panoptes_k8s_pods_pending", "dev", "c1", 2.0)
+            ],
+            "panoptes_k8s_pods_crashloop": [
+                _k8s_series("panoptes_k8s_pods_crashloop", "dev", "c1", 1.0)
+            ],
+            "panoptes_k8s_pod_restarts_total": [
+                _k8s_series("panoptes_k8s_pod_restarts_total", "dev", "c1", 4.0, namespace="ns-a"),
+                _k8s_series("panoptes_k8s_pod_restarts_total", "dev", "c1", 6.0, namespace="ns-b"),
+            ],
+        }
+    )
+    state = get_cluster_state(QueryContext(_k8s_config(store)), env="dev")
+    assert state["env"] == "dev"
+    assert state["cluster"] == "c1"
+    assert state["node_count"] == 5.0
+    assert state["pods_pending"] == 2.0
+    assert state["pods_crashloop"] == 1.0
+    # pod_restarts_total is summed across the per-namespace series (4 + 6).
+    assert state["pod_restarts_total"] == 10.0
+    assert state["reachable"] is True
+
+
+def test_get_cluster_state_unreachable_when_no_gauges() -> None:
+    """An absent/unreachable cluster → `reachable: false`, never a silent-empty snapshot."""
+    # An empty store returns no series for any k8s gauge query.
+    state = get_cluster_state(QueryContext(_k8s_config(_FakeStore())), env="dev")
+    assert state["env"] == "dev"
+    assert state["reachable"] is False
+    # The counts default to 0.0 (an explicit "nothing observed" snapshot, not None).
+    assert state["node_count"] == 0.0
+    assert state["pods_pending"] == 0.0
+
+
+def test_get_cluster_state_passthrough_store_is_unreachable_not_crash() -> None:
+    """A passthrough store (cannot answer PromQL) → unreachable, not a crash/silent-empty."""
+    config = _k8s_config(PassthroughStore({}))
+    state = get_cluster_state(QueryContext(config), env="dev")
+    assert state["reachable"] is False
+
+
 # --- v0.2 stub tools -------------------------------------------------------------
 
 
@@ -772,11 +868,16 @@ def test_default_config_registers_exactly_the_read_only_tool_set() -> None:
                 "search_incidents",
                 "search_logs",
                 "describe_health",
+                # v0.2 — get_cluster_state is a REAL tool (not a stub), so the default
+                # read-only set now includes it.
+                "get_cluster_state",
             ],
         }
     )
     server = build_server(config)
     assert set(server.tool_names()) == set(KNOWN_READ_ONLY_TOOLS)
+    # The v0.2 real tool is part of the exact set.
+    assert "get_cluster_state" in set(server.tool_names())
 
 
 def test_no_registered_tool_name_matches_mutation_verb_regex() -> None:

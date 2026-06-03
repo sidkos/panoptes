@@ -94,6 +94,15 @@ _MIN_STEP_SECONDS = 15
 # not appear (best-effort enrichment — reachability remains the rollup's mandatory promise).
 _KEY_HEALTH_METRICS = ("panoptes_health_up", "panoptes_health_latency_ms")
 
+# The four derived kubernetes gauges `get_cluster_state` reads back from the store — the
+# SAME series the kubernetes source writes (two-faces-one-store parity). The cluster-wide
+# three carry exactly one series per env (one value); `pod_restarts_total` is per-namespace
+# (summed across its series). Kept aligned with `core/sources/kubernetes.py` metric names.
+_K8S_NODE_COUNT = "panoptes_k8s_node_count"
+_K8S_PODS_PENDING = "panoptes_k8s_pods_pending"
+_K8S_PODS_CRASHLOOP = "panoptes_k8s_pods_crashloop"
+_K8S_POD_RESTARTS_TOTAL = "panoptes_k8s_pod_restarts_total"
+
 
 class SourceHealthInfo(TypedDict):
     """One source's reachability within a `describe_health` rollup.
@@ -129,6 +138,27 @@ class HealthRollup(TypedDict):
     sources: list[SourceHealthInfo]
     metrics: list[HealthMetricInfo]
     open_incident_count: int
+
+
+class ClusterState(TypedDict):
+    """A point-in-time snapshot of one env's kubernetes cluster, read from the STORE.
+
+    Backs the `get_cluster_state` MCP tool (spec § Data Model — MCP return types). It is
+    rendered from the stored `panoptes_k8s_*` gauges (the two-faces-one-store parity — the
+    Grafana Kubernetes dashboard renders the SAME series), NOT from a live cluster call, so
+    the tool needs no kubernetes client. `cluster` is the cluster name the gauges carry
+    (distinguishing an observed cluster from Panoptes' own). `reachable` is `False` when no
+    k8s gauge is present for the env (the cluster was never collected / is down) — never a
+    silent-empty snapshot.
+    """
+
+    env: str
+    cluster: str
+    node_count: float
+    pods_pending: float
+    pods_crashloop: float
+    pod_restarts_total: float
+    reachable: bool
 
 
 class IncidentFanOutEntry(TypedDict):
@@ -542,6 +572,103 @@ def query_metric(
     # A passthrough store raises CapabilityError here — it propagates as the
     # structured MCP error the read-only contract requires (never swallowed).
     return context.store.query(metric_query)
+
+
+def get_cluster_state(context: QueryContext, env: str) -> ClusterState:
+    """Render `env`'s kubernetes cluster snapshot from the stored `panoptes_k8s_*` gauges.
+
+    This reads the STORE (two-faces-one-store parity — the Grafana Kubernetes dashboard
+    renders the same series), NOT a live cluster call, so the tool needs no kubernetes
+    client. The cluster-wide gauges (node count / pending / crashloop) contribute their
+    latest single value; `pod_restarts_total` is summed across its per-namespace series.
+
+    Reachability is explicit: when NO k8s gauge is present for the env (the cluster was
+    never collected, or its source is down so nothing reached the store), `reachable` is
+    `False` and the counts default to `0.0` — a clear "nothing observed" snapshot, never a
+    silent-empty result the caller could mistake for a healthy empty cluster. A passthrough
+    store (which cannot answer PromQL at all) is likewise surfaced as unreachable rather
+    than crashing the tool.
+
+    Args:
+        context: The query context (its `store` answers the gauge queries).
+        env: The environment whose cluster snapshot to render.
+
+    Returns:
+        A `ClusterState` with the four derived metrics + the `cluster` name + `reachable`.
+    """
+    # Validate the env up front (same discipline as query_metric) so an unknown env fails
+    # with a clear error rather than silently returning an unreachable snapshot.
+    environment = context.require_env(env)
+
+    node_series = _k8s_query(context, _K8S_NODE_COUNT, environment.name)
+    pending_series = _k8s_query(context, _K8S_PODS_PENDING, environment.name)
+    crashloop_series = _k8s_query(context, _K8S_PODS_CRASHLOOP, environment.name)
+    restarts_series = _k8s_query(context, _K8S_POD_RESTARTS_TOTAL, environment.name)
+
+    # The cluster is reachable in the store's eyes iff ANY k8s gauge produced a series for
+    # the env. A passthrough store yields empty lists for all four (the CapabilityError is
+    # swallowed in `_k8s_query`), so it reads as unreachable — never a crash.
+    all_series = node_series + pending_series + crashloop_series + restarts_series
+    reachable = bool(all_series)
+
+    return ClusterState(
+        env=environment.name,
+        # The cluster name is carried on every k8s gauge's labels; read it from the first
+        # series that has one (empty string when nothing was collected).
+        cluster=_cluster_label(all_series),
+        node_count=_latest_value(node_series) or 0.0,
+        pods_pending=_latest_value(pending_series) or 0.0,
+        pods_crashloop=_latest_value(crashloop_series) or 0.0,
+        # pod_restarts_total is per-namespace: sum the latest value of EACH namespace series
+        # so the snapshot reports the cluster-wide restart total.
+        pod_restarts_total=_sum_latest_per_series(restarts_series),
+        reachable=reachable,
+    )
+
+
+def _k8s_query(context: QueryContext, metric_name: str, env: str) -> list[MetricSeries]:
+    """Query one `panoptes_k8s_*` gauge scoped to `env`, swallowing a passthrough error.
+
+    Returns the resolved series (possibly empty — empty is a legitimate "not collected"
+    answer). A `passthrough` store that cannot answer PromQL raises `CapabilityError`,
+    which is swallowed here so `get_cluster_state` reports the cluster unreachable rather
+    than crashing — health/state must stay answerable, never raise into the MCP surface.
+    The env name is escaped defensively (F7 discipline) even though it is a validated env.
+    """
+    expr = f'{metric_name}{{env="{escape_promql_value(env)}"}}'
+    window = TimeWindow.last(minutes=_DEFAULT_WINDOW_MINUTES)
+    try:
+        return context.store.query(
+            MetricQuery(expr=expr, window=window, step_seconds=_step_seconds_for("15m"))
+        )
+    except CapabilityError:
+        return []
+
+
+def _cluster_label(series: list[MetricSeries]) -> str:
+    """The `cluster` label value carried on the k8s gauges, or empty when none present."""
+    for one_series in series:
+        cluster = one_series.labels.get("cluster")
+        if cluster:
+            return cluster
+    return ""
+
+
+def _sum_latest_per_series(series: list[MetricSeries]) -> float:
+    """Sum the latest point value across EACH series (the per-namespace restart total).
+
+    `pod_restarts_total` emits one series per namespace, so the cluster-wide total is the
+    sum of each namespace series' latest value (not a single `_latest_value` across all,
+    which would pick only one namespace's number).
+    """
+    total = 0.0
+    for one_series in series:
+        if one_series.points:
+            # The latest point of this namespace's series (points are time-ordered by the
+            # store; take the max-timestamp value to be order-independent).
+            latest = max(one_series.points, key=lambda point: point[0])
+            total += latest[1]
+    return total
 
 
 def describe_health(context: QueryContext, env: str) -> HealthRollup:

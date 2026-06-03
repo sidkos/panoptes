@@ -46,10 +46,12 @@ from core.mcp.tools_discovery import (
     list_dashboards,
 )
 from core.mcp.tools_query import (
+    ClusterState,
     HealthRollup,
     IncidentFanOut,
     LogFanOut,
     describe_health,
+    get_cluster_state,
     query_metric,
     search_incidents,
     search_logs,
@@ -114,6 +116,9 @@ KNOWN_READ_ONLY_TOOLS: tuple[str, ...] = (
     "search_incidents",
     "search_logs",
     "describe_health",
+    # v0.2 — get_cluster_state is a REAL read-only tool (renders the kubernetes snapshot
+    # from the store), NOT a `_V0_2_STUB_TOOLS` entry.
+    "get_cluster_state",
 )
 
 
@@ -406,6 +411,16 @@ def _core_registrars(
 
         server._register_tool(name, describe_health_tool, invoker)
 
+    def register_get_cluster_state(server: PanoptesMcpServer, name: str) -> None:
+        def get_cluster_state_tool(env: str) -> ClusterState:
+            """Render `env`'s kubernetes cluster snapshot from the stored k8s gauges."""
+            return get_cluster_state(context, env=env)
+
+        def invoker(*_args: object, **kwargs: object) -> object:
+            return get_cluster_state(context, env=_str_kwarg(kwargs, "env"))
+
+        server._register_tool(name, get_cluster_state_tool, invoker)
+
     return {
         "describe_signal_catalog": register_describe_signal_catalog,
         "list_dashboards": register_list_dashboards,
@@ -414,6 +429,7 @@ def _core_registrars(
         "search_incidents": register_search_incidents,
         "search_logs": register_search_logs,
         "describe_health": register_describe_health,
+        "get_cluster_state": register_get_cluster_state,
     }
 
 

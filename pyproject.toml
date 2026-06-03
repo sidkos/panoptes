@@ -13,6 +13,7 @@ dependencies = [
     "boto3>=1.34",
     "pyyaml>=6.0",
     "fastmcp>=0.2",
+    "kubernetes>=29",
 ]
 
 [project.optional-dependencies]
@@ -43,12 +44,15 @@ src = ["core", "examples", "tests"]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "C90"]
 
 [tool.ruff.lint.mccabe]
-# 22 = the most-complex function today (`core/mcp/server.py::_core_registrars`, a flat
-# registrar table of 9 nested per-tool registrar closures — structurally a dispatch
-# map, not tangled control flow, so it is left as-is per "set a sane passing threshold,
-# don't refactor to fit"). Everything else sits at <=12, so this leaves wide headroom
-# for ordinary functions while still catching genuinely runaway complexity.
-max-complexity = 22
+# 25 = the most-complex function today (`core/mcp/server.py::_core_registrars`, a flat
+# registrar table of per-tool registrar closures — structurally a dispatch map, not
+# tangled control flow, so it is left as-is per "set a sane passing threshold, don't
+# refactor to fit"). v0.2 added the `get_cluster_state` registrar (a sibling closure in
+# the same map), nudging the count from 22 to 25; the table is still a flat dispatch, so
+# the threshold tracks it rather than forcing a cosmetic split. Everything else sits at
+# <=12, so this leaves wide headroom for ordinary functions while still catching
+# genuinely runaway complexity.
+max-complexity = 25
 
 [tool.mypy]
 python_version = "3.12"
@@ -59,7 +63,10 @@ disallow_any_generics = true
 files = ["core", "examples", "tests"]
 
 [[tool.mypy.overrides]]
-module = ["fastmcp.*", "testcontainers.*", "respx.*"]
+# `kubernetes` ships no py.typed (Risk K5), so its import is untyped; the source wraps
+# the client surface behind a small local Protocol so `disallow_any_explicit` stays
+# satisfied (the `_FastMcpAdapter` pattern). Only deps without type stubs go here.
+module = ["fastmcp.*", "testcontainers.*", "respx.*", "kubernetes.*"]
 ignore_missing_imports = true       # only for deps that ship no type stubs
 
 [tool.pytest.ini_options]

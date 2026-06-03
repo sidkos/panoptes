@@ -37,7 +37,8 @@ from core.errors import CapabilityError, PanoptesError
 from core.model import DashboardPack
 
 # The in-repo core packs the provider ships + provisions (spec UI-Surfaces table).
-_CORE_PACK_IDS = ("errors-sentry", "logs", "overview")
+# v0.2 adds the `kubernetes` pack (spec § Directory Layout / Rollout Phase 1).
+_CORE_PACK_IDS = ("errors-sentry", "logs", "overview", "kubernetes")
 _CORE_DASHBOARDS_DIR = Path(__file__).resolve().parents[2] / "core" / "dashboards"
 
 # The exact label set each derived metric emits (asserted against each source's
@@ -47,11 +48,19 @@ _METRIC_LABELS: dict[str, frozenset[str]] = {
     "panoptes_log_error_rate": frozenset({"env", "log_group"}),
     "panoptes_health_up": frozenset({"env", "url"}),
     "panoptes_health_latency_ms": frozenset({"env", "url"}),
+    # v0.2 kubernetes gauges — exact label sets mirror core/sources/kubernetes.py: the
+    # three cluster-wide gauges carry {env, cluster}; pod_restarts_total adds namespace.
+    "panoptes_k8s_node_count": frozenset({"env", "cluster"}),
+    "panoptes_k8s_pods_pending": frozenset({"env", "cluster"}),
+    "panoptes_k8s_pods_crashloop": frozenset({"env", "cluster"}),
+    "panoptes_k8s_pod_restarts_total": frozenset({"env", "cluster", "namespace"}),
 }
 
 # A PromQL label selector token: `metric_name{label="value", ...}`. The metric name
-# is the leading identifier; the brace body holds `label op value` filters.
-_METRIC_REF_RE = re.compile(r"\b(panoptes_[a-z_]+)\b(?:\s*\{([^}]*)\})?")
+# is the leading identifier; the brace body holds `label op value` filters. The name
+# class includes DIGITS so the v0.2 kubernetes gauges (`panoptes_k8s_*`) match — a
+# `[a-z_]`-only class would stop at the `8` in `k8s` and miss the metric entirely.
+_METRIC_REF_RE = re.compile(r"\b(panoptes_[a-z0-9_]+)\b(?:\s*\{([^}]*)\})?")
 _LABEL_KEY_RE = re.compile(r"([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:=|!=|=~|!~)")
 # A PromQL aggregation grouping clause: `by (label, ...)` (e.g. `sum by (project, env)`).
 # The captured body is the comma-separated grouping label list.
