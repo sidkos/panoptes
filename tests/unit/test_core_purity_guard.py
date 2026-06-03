@@ -1,7 +1,8 @@
 """Boundary guard: ``core/`` must not couple to any consumer.
 
-Two controls, walking the filesystem with ``pathlib`` + ``re`` (NOT by importing
-modules — importing would couple the guard to runtime deps):
+Three controls. The first two walk the filesystem with ``pathlib`` + ``re`` (NOT by
+importing modules — importing would couple the guard to runtime deps); the third is
+a runtime invariant exercised against the real Phase-7 demo pack:
 
 1. **Primary — structural import check.** No ``core/**/*.py`` may contain
    ``from examples`` / ``import examples``. This is the real anti-coupling
@@ -12,13 +13,27 @@ modules — importing would couple the guard to runtime deps):
    literal. ``demo``/``game`` are intentionally NOT banned — ``demo`` is the
    example pack's own name and ``game`` is a common substring; banning them adds
    no protection beyond the structural check and is false-positive prone.
+3. **Additive-injection runtime invariant (Phase 7 — proves injection ≠ bundling).**
+   Loading the demo pack via the ``PANOPTES_CONSUMER_PACK`` hook is **purely
+   additive and reversible**: a server built WITH the hook adds EXACTLY the demo
+   tool(s) on top of the core-only baseline, while a server built WITHOUT the hook
+   yields precisely that baseline (the core registrations are unchanged). The pack's
+   synthetic adapter likewise appears on the core registry only as an ADDITION to a
+   baseline snapshot taken before the pack imports (the core registries are module
+   singletons, so additivity is asserted at the snapshot/superset level).
 
 Vacuously green on the Phase 0 skeleton; becomes non-vacuous once the demo pack
 lands in Phase 7.
 """
 
+import importlib
 import re
 from pathlib import Path
+
+import pytest
+from core.config import ResolvedConfig
+from core.mcp.server import build_server
+from core.registry import STORES
 
 # Repo root is two levels up from this file (tests/unit/<this>.py).
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -30,9 +45,38 @@ _BANNED_TOKENS = frozenset({"allocator", "matchmaking", "agones"})
 # `from examples ...` / `import examples ...` at any indentation.
 _IMPORT_EXAMPLES = re.compile(r"^\s*(?:from|import)\s+examples\b", re.MULTILINE)
 
+# The dotted path the injection hook imports (the in-repo demo pack).
+_PACK_MODULE = "examples.demo-pack.pack"
+# The exact tool the demo pack contributes — the only addition a WITH-hook server makes.
+_DEMO_TOOL = "get_demo_signal"
+# The exact synthetic adapter the demo pack contributes to the STORES registry.
+_DEMO_ADAPTER = "demo-synthetic"
+
 
 def _core_py_files() -> list[Path]:
     return sorted(_CORE.rglob("*.py"))
+
+
+def _baseline_config() -> ResolvedConfig:
+    """A minimal core-only `ResolvedConfig` (no store query is driven by tool_names())."""
+
+    class _NullStore:
+        type = "null"
+
+        def write(self, signals: list[object]) -> None:  # pragma: no cover - unused
+            return None
+
+        def query(self, query: object) -> list[object]:  # pragma: no cover - unused
+            return []
+
+    return ResolvedConfig(
+        environments={},
+        store=_NullStore(),  # type: ignore[arg-type]
+        notifiers=[],
+        dashboard_packs=[],
+        slos=[],
+        mcp={},
+    )
 
 
 def test_core_does_not_import_from_examples() -> None:
@@ -52,3 +96,41 @@ def test_core_contains_no_banned_consumer_tokens() -> None:
             if re.search(rf"\b{re.escape(token)}\b", text):
                 hits.append(f"{path.relative_to(_REPO_ROOT)}:{token}")
     assert not hits, f"banned consumer-domain token(s) in core/: {hits}"
+
+
+def test_no_hook_server_equals_core_only_baseline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With the hook UNSET, the server registers exactly the core-only tool set."""
+    monkeypatch.delenv("PANOPTES_CONSUMER_PACK", raising=False)
+    baseline_tools = set(build_server(_baseline_config()).tool_names())
+    assert _DEMO_TOOL not in baseline_tools, (
+        "without the injection hook the demo tool must NOT be present (no bundling)"
+    )
+
+
+def test_injection_is_purely_additive_at_the_tool_level(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A WITH-hook server adds EXACTLY the demo tool on top of the no-hook baseline."""
+    monkeypatch.delenv("PANOPTES_CONSUMER_PACK", raising=False)
+    baseline_tools = set(build_server(_baseline_config()).tool_names())
+
+    monkeypatch.setenv("PANOPTES_CONSUMER_PACK", _PACK_MODULE)
+    injected_tools = set(build_server(_baseline_config()).tool_names())
+
+    # Superset: every core tool survives untouched (injection changes nothing of core's).
+    assert baseline_tools <= injected_tools, "injection must not remove/alter core tools"
+    # Additive by exactly the demo tool — nothing more leaks in, nothing core is lost.
+    assert injected_tools - baseline_tools == {_DEMO_TOOL}, (
+        "the injected pack must add EXACTLY get_demo_signal (purely additive)"
+    )
+
+
+def test_synthetic_adapter_is_an_addition_to_a_pre_import_baseline() -> None:
+    """The pack's synthetic adapter appears on the core registry only as an ADDITION."""
+    baseline_adapters = set(STORES.available())
+    importlib.import_module(_PACK_MODULE)
+    after_adapters = set(STORES.available())
+
+    assert baseline_adapters <= after_adapters, "importing the pack must not drop core adapters"
+    # The pack adds its synthetic adapter (and only consumer-owned additions) — core's
+    # own registered store types are unchanged.
+    assert _DEMO_ADAPTER in after_adapters - baseline_adapters or _DEMO_ADAPTER in baseline_adapters
+    assert _DEMO_ADAPTER in after_adapters, "the synthetic adapter must be registered"

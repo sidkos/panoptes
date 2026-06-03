@@ -27,6 +27,7 @@ generation for the nested-`TypedDict` returns the registered tools expose.
 """
 
 import importlib
+import importlib.util
 import os
 from collections.abc import Callable, Mapping
 from typing import Protocol
@@ -34,7 +35,7 @@ from typing import Protocol
 from fastmcp import FastMCP
 
 from core.config import ResolvedConfig
-from core.errors import CapabilityError
+from core.errors import CapabilityError, PanoptesError
 from core.mcp.tools_discovery import (
     DashboardData,
     DashboardSummary,
@@ -321,18 +322,39 @@ def _register_v0_2_stub(server: PanoptesMcpServer, name: str) -> None:
 def _load_consumer_pack(server: PanoptesMcpServer) -> None:
     """Import the consumer pack named by `PANOPTES_CONSUMER_PACK` and register its tools.
 
-    Default unset = core-only (no import, no consumer coupling). When set, the named
-    module is imported and its `register_tools(mcp_server)` hook is called so the
-    injected pack can add its own read-only tools. `core` never imports the pack
-    statically — the pack is injected at deploy time, never bundled.
+    Default unset = core-only (no import, no consumer coupling). When set, the pack is
+    imported and its `register_tools(mcp_server)` hook is called so the injected pack
+    can add its own read-only tools. `core` never imports the pack statically — the
+    pack is injected at deploy time, never bundled.
+
+    `PANOPTES_CONSUMER_PACK` is primarily a FILE PATH: the compose deployment mounts
+    the consumer's pack as a single file at `/packs/consumer/pack.py` and points the
+    env var at it, so a mounted (non-installed, not-on-`sys.path`) pack is loaded via
+    `importlib.util.spec_from_file_location`. A dotted module name is also accepted as
+    a fallback (an installed or in-repo importable pack).
     """
-    module_path = os.environ.get(_CONSUMER_PACK_ENV_VAR)
-    if not module_path:
+    pack_ref = os.environ.get(_CONSUMER_PACK_ENV_VAR)
+    if not pack_ref:
         return
-    module = importlib.import_module(module_path)
+    module = _import_consumer_pack(pack_ref)
     register_tools = getattr(module, "register_tools", None)
     if callable(register_tools):
         register_tools(server)
+
+
+def _import_consumer_pack(pack_ref: str) -> object:
+    """Load the consumer pack from a file path (deploy model) or a dotted module name."""
+    # A path-shaped ref (a mounted pack.py) loads from file; everything else is treated
+    # as a dotted, importable module name.
+    looks_like_path = pack_ref.endswith(".py") or "/" in pack_ref or os.sep in pack_ref
+    if not looks_like_path:
+        return importlib.import_module(pack_ref)
+    spec = importlib.util.spec_from_file_location("panoptes_consumer_pack", pack_ref)
+    if spec is None or spec.loader is None:
+        raise PanoptesError(f"Cannot load consumer pack from file path: {pack_ref}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def main() -> None:

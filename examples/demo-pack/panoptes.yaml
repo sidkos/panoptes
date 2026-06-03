@@ -1,0 +1,64 @@
+# The v0.1 reference Panoptes config (spec `## Configuration`).
+#
+# This is the EXACT shape a consumer deploys: `dev` only is live; `stage`/`prod` are
+# wired-but-inert (`enabled: false`). Every secret/endpoint is `${VAR}`-interpolated
+# from the process environment (see `.env.example`) — NEVER inlined. `provides:` is
+# omitted on each source: it is optional/advisory, and `capabilities()` is the
+# authoritative source of truth, so omitting it keeps the config DRY and avoids a
+# reconciliation mismatch when an adapter's capability set evolves.
+panoptes:
+  environments:
+    dev:
+      enabled: true
+      sources:
+        - type: cloudwatch
+          region: ${AWS_REGION}
+          namespace: AWS/ApplicationELB
+          metric_names: [RequestCount, HTTPCode_Target_5XX_Count]
+          log_groups: [/demo/dev/app]
+          # Read-only AWS access: a local profile (or a forward-compatible
+          # PanoptesReadRole assume_role_arn + external_id). Inlined as a plain
+          # profile name (not a secret) so the default resolve path needs no extra
+          # env var; swap for `assume_role_arn: ${PANOPTES_ASSUME_ROLE_ARN}` when
+          # using the cross-account read role.
+          profile: panoptes-dev-readonly
+        - type: sentry
+          org: ${SENTRY_ORG}
+          project: ${SENTRY_PROJECT}
+          token: ${SENTRY_TOKEN}
+        - type: http-health
+          url: ${DEV_HEALTH_URL}
+    stage:
+      enabled: false
+      sources:
+        - type: http-health
+          url: ${DEV_HEALTH_URL}
+    prod:
+      enabled: false
+      sources: []
+  store:
+    type: victoriametrics
+    # The VictoriaMetrics endpoint is local-compose infrastructure (not a secret):
+    # the `vm` service inside the docker-compose network. Inlined like the spec's
+    # reference config (`http://vm:8428`).
+    url: http://vm:8428
+    retention: 15d
+  notifiers:
+    - type: logging
+  dashboards:
+    provider: grafana
+    env_variable: true
+    core_packs: [errors-sentry, logs, overview]   # tier 1, from core/dashboards/
+    consumer_pack:
+      path: ${CONSUMER_PACK_DIR}                   # mounted at /packs/consumer (the demo pack)
+  slos:
+    - name: health-uptime
+      objective: 0.99
+  mcp:
+    transport: stdio                               # v0.1 is stdio; HTTP+SSO is v0.2
+    # v0.1-implemented tools only — discovery + query. The v0.2 tools
+    # (compare_envs, get_slo, get_cost) are intentionally OMITTED so the default
+    # config path exercises only real tools; if listed, v0.1 registers them as
+    # call-time "not available in v0.1" stubs (see spec § MCP server).
+    tools: [describe_signal_catalog, list_dashboards, get_dashboard_data,
+            query_metric, search_incidents, search_logs, describe_health]

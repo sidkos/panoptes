@@ -1,0 +1,53 @@
+{
+  "title": "Demo (consumer pack)",
+  "uid": null,
+  "tags": ["panoptes", "consumer", "demo"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "templating": {
+    "list": [
+      {
+        "name": "env",
+        "type": "query",
+        "label": "Environment",
+        "datasource": "VictoriaMetrics",
+        "query": "label_values(panoptes_health_up, env)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": false,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Endpoint availability",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "panoptes_health_up{env=~\"$env\"}",
+          "legendFormat": "{{env}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Endpoint latency (ms)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "panoptes_health_latency_ms{env=~\"$env\"}",
+          "legendFormat": "{{env}}"
+        }
+      ]
+    }
+  ]
+}
