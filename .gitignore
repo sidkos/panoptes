@@ -1,0 +1,30 @@
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+
+# Environment / secrets (consumer packs supply their own .env; never commit it)
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
