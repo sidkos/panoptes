@@ -149,13 +149,39 @@ class PanoptesConfig(TypedDict):
 # --- Runtime resolved shapes -----------------------------------------------------
 
 
+# Per-source collector timing defaults (spec `## Performance Constraints`). Poll
+# cadence + fetch bound are a *collector* concern, not a `Source` concern — the
+# `Source` Protocol deliberately carries no timing attrs — so the loader wraps each
+# built `Source` in a `ResolvedSource` carrying these resolved values for the
+# collector to consume. Both are config-overridable per source.
+_DEFAULT_FETCH_TIMEOUT_SECONDS = 30
+_DEFAULT_POLL_INTERVAL_SECONDS = 60
+
+
+@dataclass(frozen=True)
+class ResolvedSource:
+    """A built `Source` plus its resolved collector timing.
+
+    The `Source` Protocol intentionally has no timing attributes — poll cadence and
+    fetch-timeout are collector concerns, not properties of the upstream adapter. The
+    loader reads `fetch_timeout_seconds` (default 30s) and `poll_interval_seconds`
+    (default 60s) from each source's config block (both already in `SourceConfig`)
+    and pairs them with the built `Source` here, so the collector has everything it
+    needs to bound + schedule a fetch without the `Source` Protocol leaking timing.
+    """
+
+    source: Source
+    fetch_timeout_seconds: int
+    poll_interval_seconds: int
+
+
 @dataclass(frozen=True)
 class ResolvedEnvironment:
     """An environment after resolution. Disabled envs carry an empty source list."""
 
     name: str
     enabled: bool
-    sources: list[Source]
+    sources: list[ResolvedSource]
 
 
 @dataclass(frozen=True)
@@ -263,7 +289,7 @@ def _reconcile_capabilities(source_type: str, declared: list[str], actual: set[S
 
 def _resolve_sources(
     env_name: str, env_config: EnvironmentConfig, registries: PlaneRegistries
-) -> list[Source]:
+) -> list[ResolvedSource]:
     """Build + reconcile the live sources for one enabled environment.
 
     The environment name is injected into each source's config block as `env`: the
@@ -272,15 +298,31 @@ def _resolve_sources(
     YAML having to repeat `env:` on every source entry. An explicit `env:` in the
     YAML is honored only if it matches; a stray different value would be an operator
     error, so the loader's name is authoritative.
+
+    Each built `Source` is wrapped in a `ResolvedSource` carrying its per-source
+    collector timing (`fetch_timeout_seconds` default 30s, `poll_interval_seconds`
+    default 60s), read from the source's own config block. The timing fields are
+    NOT forwarded into the adapter `__init__` block (they are collector concerns,
+    not adapter config), so they are read off the raw `source_config` directly.
     """
-    resolved: list[Source] = []
+    resolved: list[ResolvedSource] = []
     for source_config in env_config["sources"]:
         source_type = source_config["type"]
         block = {**_interpolate_block(source_config), "env": env_name}
         source = registries.sources.build(source_type, block)
         declared = source_config.get("provides", [])
         _reconcile_capabilities(source_type, declared, source.capabilities())
-        resolved.append(source)
+        resolved.append(
+            ResolvedSource(
+                source=source,
+                fetch_timeout_seconds=source_config.get(
+                    "fetch_timeout_seconds", _DEFAULT_FETCH_TIMEOUT_SECONDS
+                ),
+                poll_interval_seconds=source_config.get(
+                    "poll_interval_seconds", _DEFAULT_POLL_INTERVAL_SECONDS
+                ),
+            )
+        )
     return resolved
 
 

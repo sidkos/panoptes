@@ -200,10 +200,11 @@ def test_interpolation_substitutes_env_vars(
     config_path = _write_fixture(tmp_path)
     resolved = load_config(config_path, registries=_registries_with_correct_capabilities())
     dev_sources = resolved.environments["dev"].sources
-    http_health = next(s for s in dev_sources if s.type == "http-health")
+    # `.sources` now holds `ResolvedSource` wrappers; the built adapter is `.source`.
+    http_health = next(rs for rs in dev_sources if rs.source.type == "http-health")
     # `Source` is a Protocol without a `config` accessor; the resolved instance is a
     # `_FakeSource`, so cast to read back the interpolated config block.
-    assert cast(_FakeSource, http_health).config["url"] == "https://dev.example/health"
+    assert cast(_FakeSource, http_health.source).config["url"] == "https://dev.example/health"
 
 
 def test_loader_injects_environment_name_into_source_blocks(
@@ -214,8 +215,8 @@ def test_loader_injects_environment_name_into_source_blocks(
     _set_reference_env(monkeypatch)
     config_path = _write_fixture(tmp_path)
     resolved = load_config(config_path, registries=_registries_with_correct_capabilities())
-    for source in resolved.environments["dev"].sources:
-        assert cast(_FakeSource, source).config["env"] == "dev"
+    for resolved_source in resolved.environments["dev"].sources:
+        assert cast(_FakeSource, resolved_source.source).config["env"] == "dev"
 
 
 def test_missing_env_var_fails_fast_naming_var(
