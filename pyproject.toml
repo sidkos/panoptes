@@ -24,7 +24,7 @@ dev = [
     "pytest-cov>=5.0",
     "respx>=0.21",
     "testcontainers>=4.0",
-    "boto3-stubs[cloudwatch,logs,sts,sns]>=1.34",
+    "boto3-stubs[cloudwatch,logs,sts,sns,ce,budgets]>=1.34",
     "types-PyYAML>=6.0",
     "yamllint>=1.35",
     # Hermetic static `.tf` parsing for the Terraform plan-assertion test (Risk K3 — assert
@@ -49,15 +49,16 @@ src = ["core", "examples", "tests"]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "C90"]
 
 [tool.ruff.lint.mccabe]
-# 31 = the most-complex function today (`core/mcp/server.py::_core_registrars`, a flat
-# registrar table of per-tool registrar closures — structurally a dispatch map, not
-# tangled control flow, so it is left as-is per "set a sane passing threshold, don't
-# refactor to fit"). v0.2 grew the table one closure at a time: get_cluster_state
-# (Phase 1) took it 22→25, then get_slo + compare_envs (Phase 4) took it 25→31. The table
-# is still a flat dispatch (each closure is independent), so the threshold tracks it rather
-# than forcing a cosmetic split. Everything else sits at <=12, so this leaves wide headroom
-# for ordinary functions while still catching genuinely runaway complexity.
-max-complexity = 31
+# 12 = the most-complex function today (`core/stores/victoriametrics.py::_parse_matrix`, a
+# Prometheus matrix-response parser whose branches are inherent to the response shape).
+# v0.3 Phase 3 lifted `core/mcp/server.py::_core_registrars`'s per-tool registrar closures
+# OUT to module-level `_register_*` functions (each `(context, server, name) -> None`), so
+# `_core_registrars` collapsed from a 31-complexity nested-closure table to a flat
+# `functools.partial` dispatch dict (~1). That dropped the codebase ceiling 31→12 and means
+# adding a tool no longer inflates the registrar function — the get_cost promotion landed
+# under this lower bar rather than bumping the gate. Everything else sits at <=12, so this
+# is a tight-but-passing ceiling that red-bars any genuinely runaway new function.
+max-complexity = 12
 
 [tool.mypy]
 python_version = "3.12"

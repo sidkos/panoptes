@@ -13,9 +13,9 @@ Covers (spec `## Tests` → MCP bullet / playbook Phase 6 table):
   `CapabilityError`, never an empty list (no v0.1 source provides TRACE).
 - **`env="all"` fan-out** including the **one-env-down → per-env partial result
   with an explicit per-env error marker** case (the call does not wholesale-fail).
-- A **v0.2 stub tool** (`compare_envs` / `get_slo`) listed in config returns an
-  explicit "not available in v0.1 (ships v0.2)" error **at call time** (NOT a
-  config-resolve failure).
+- **No call-time stub tools remain** — v0.2 promoted `compare_envs`/`get_slo` and
+  v0.3 promoted `get_cost` (the last stub), so `_V0_2_STUB_TOOLS` is now empty and
+  `get_cost` is a REAL tool returning a `CostBreakdown` rather than raising.
 - **STRUCTURAL read-only assertion** — with the default v0.1 config (no v0.2
   stubs) the registered tool set is EXACTLY the known read-only set AND no
   registered tool NAME matches the mutation-verb regex, so a future write tool
@@ -29,6 +29,7 @@ introspection, so no FastMCP async transport is driven here.
 import re
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 from core.config import (
@@ -40,11 +41,13 @@ from core.config import (
 from core.errors import CapabilityError
 from core.mcp.context import QueryContext
 from core.mcp.server import (
+    _V0_2_STUB_TOOLS,
     KNOWN_READ_ONLY_TOOLS,
     PanoptesMcpServer,
     build_server,
 )
 from core.mcp.tools_query import (
+    CostBreakdown,
     describe_health,
     escape_promql_value,
     get_cluster_state,
@@ -836,26 +839,36 @@ def test_get_cluster_state_passthrough_store_is_unreachable_not_crash() -> None:
     assert state["reachable"] is False
 
 
-# --- v0.2 stub tools -------------------------------------------------------------
+# --- v0.x stub tools -------------------------------------------------------------
 
 
-def test_v0_2_stub_tool_errors_at_call_time() -> None:
-    """The remaining v0.2 stub (`get_cost`) registers + errors not-available AT CALL TIME.
+def test_no_call_time_stub_tools_remain() -> None:
+    """The v0.x call-time-stub set is EMPTY — every shipped tool is fully implemented.
 
-    v0.2 Phase 4 promoted `compare_envs`/`get_slo` to real tools; `get_cost` STAYS the sole
-    call-time stub (it ships v0.3 with the Cost dashboard). Listing it is NOT a resolve
-    failure — the server builds fine and the stub raises only when invoked.
+    v0.2 Phase 4 promoted `compare_envs`/`get_slo`; v0.3 Phase 3 promoted `get_cost` (the
+    last stub) into a REAL tool rendering from the stored `panoptes_cost_*` gauges. With
+    `get_cost` real, `_V0_2_STUB_TOOLS` collapses to the empty tuple — no name resolves to a
+    not-available stub any more.
+    """
+    assert _V0_2_STUB_TOOLS == ()
+
+
+def test_get_cost_is_a_real_tool_not_a_call_time_stub() -> None:
+    """`get_cost` registers AND returns a real `CostBreakdown` (no CapabilityError at call).
+
+    The promoted tool reads the stored cost gauges (empty here → zeroed breakdown), so a call
+    succeeds rather than raising the old "not available in v0.x" stub error.
     """
     config = _dev_only_config(mcp={"transport": "stdio", "tools": ["query_metric", "get_cost"]})
     server = build_server(config)
-    # Listing get_cost is NOT a resolve failure — the server builds fine.
     assert "get_cost" in server.tool_names()
-    stub = server.tool_callable("get_cost")
-    with pytest.raises(CapabilityError) as excinfo:
-        stub(env="dev")
-    message = str(excinfo.value).lower()
-    assert "not available in v0.1" in message
-    assert "v0.2" in message
+    # `tool_callable` returns the uniform `_ToolCallable` (-> object); the real tool yields a
+    # `CostBreakdown`, so a single honest cast to that genuine return type keeps mypy precise.
+    breakdown = cast(CostBreakdown, server.tool_callable("get_cost")(env="dev", window="30d"))
+    # A real render off an empty store → a zeroed breakdown, never the stub CapabilityError.
+    assert breakdown["env"] == "dev"
+    assert breakdown["total"] == 0.0
+    assert breakdown["per_service"] == {}
 
 
 # --- structural read-only contract -----------------------------------------------
@@ -880,13 +893,16 @@ def test_default_config_registers_exactly_the_read_only_tool_set() -> None:
                 # stubs), so the default read-only set includes them too.
                 "get_slo",
                 "compare_envs",
+                # v0.3 Phase 3 — get_cost is promoted from the last stub to a REAL tool, so
+                # the default read-only set includes it (and the stub set is now empty).
+                "get_cost",
             ],
         }
     )
     server = build_server(config)
     assert set(server.tool_names()) == set(KNOWN_READ_ONLY_TOOLS)
-    # The v0.2 real tools are part of the exact set.
-    assert {"get_cluster_state", "get_slo", "compare_envs"} <= set(server.tool_names())
+    # The v0.2/v0.3 real tools are part of the exact set.
+    assert {"get_cluster_state", "get_slo", "compare_envs", "get_cost"} <= set(server.tool_names())
 
 
 def test_no_registered_tool_name_matches_mutation_verb_regex() -> None:

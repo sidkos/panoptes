@@ -43,6 +43,26 @@ def optional_str_field(config: ConfigBlock, field: str) -> str | None:
     return None
 
 
+def optional_int_field(config: ConfigBlock, field: str, default: int) -> int:
+    """Return a positive-int config field if present, else `default`.
+
+    An absent key falls back to `default`. A present value MUST be a positive `int`
+    (the flat `ConfigBlock` permits `int`); a non-int or non-positive value fails fast
+    so a typo (e.g. a string "3600" or a negative interval) surfaces at construction
+    rather than silently disabling a cadence gate. `bool` is rejected explicitly —
+    Python's `bool` is an `int` subclass, so `True`/`False` would otherwise slip
+    through as `1`/`0`.
+    """
+    value = config.get(field)
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise PanoptesError(
+            f"The '{field}' config field must be a positive integer when set; got {value!r}."
+        )
+    return value
+
+
 def require_str_list_field(config: ConfigBlock, field: str, adapter_type: str) -> list[str]:
     """Return a required `list[str]` config field or raise `PanoptesError`.
 

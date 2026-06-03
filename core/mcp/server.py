@@ -9,12 +9,14 @@ no-mutation-verb-name invariant).
 
 Three registration concerns live here:
 
-1. **Core tools** — the v0.1-implemented discovery + query tools, registered for
-   every tool name the config lists that Panoptes implements.
-2. **v0.2 stub tools** — `compare_envs` / `get_slo` / `get_cost` are valid FUTURE
-   tools, not unknown adapters, so listing them is NOT a config-resolve failure.
-   v0.1 registers them as stubs that raise an explicit "not available in v0.1
-   (ships v0.2)" `CapabilityError` AT CALL TIME.
+1. **Core tools** — the fully-implemented discovery + query tools, registered for
+   every tool name the config lists that Panoptes implements (the v0.1 trio + v0.2's
+   `get_cluster_state`/`get_slo`/`compare_envs` + v0.3's `get_cost`).
+2. **Future-tool stubs** — `_V0_2_STUB_TOOLS` lists tool names that are valid FUTURE
+   tools (not unknown adapters), so listing them is NOT a config-resolve failure;
+   they register as stubs raising "not available" AT CALL TIME. As of v0.3 Phase 3
+   this set is EMPTY (`get_cost`, the last stub, was promoted to a real tool), so the
+   stub path is dormant — retained as the seam for the next version's planned tools.
 3. **Consumer-pack hook** — if `PANOPTES_CONSUMER_PACK` names a module path, import
    it and call its `register_tools(mcp_server)` so an injected pack can add its own
    read-only tools (default unset = core-only). This keeps `core` free of any
@@ -26,6 +28,7 @@ IMPORTANT (FastMCP / PEP-563): this module must NOT add
 generation for the nested-`TypedDict` returns the registered tools expose.
 """
 
+import functools
 import importlib
 import importlib.util
 import os
@@ -47,6 +50,7 @@ from core.mcp.tools_discovery import (
 )
 from core.mcp.tools_query import (
     ClusterState,
+    CostBreakdown,
     EnvComparison,
     HealthRollup,
     IncidentFanOut,
@@ -55,6 +59,7 @@ from core.mcp.tools_query import (
     compare_envs,
     describe_health,
     get_cluster_state,
+    get_cost,
     get_slo,
     query_metric,
     search_incidents,
@@ -151,12 +156,11 @@ class _FastMcpAdapter:
         return app
 
 
-# The v0.2-listed-but-unimplemented tools. Listing one is NOT a resolve failure —
-# the server registers it as a call-time "not available" stub. All are read-shaped names,
-# so they also satisfy the structural no-mutation-verb-name invariant. v0.2 Phase 4
-# promoted `compare_envs`/`get_slo` to REAL registrars; `get_cost` STAYS a stub (it ships
-# v0.3 with the Cost dashboard + the CE/budgets read grant).
-_V0_2_STUB_TOOLS = ("get_cost",)
+# The future-tool stub set is now EMPTY: v0.3 Phase 3 promoted the last stub (`get_cost`)
+# to a real registrar (the Cost dashboard + the CE/budgets read grant shipped). The
+# mechanism stays in place (a future-listed tool would register as a call-time stub), but
+# no tool is currently a stub — the structural read-only test asserts this is empty.
+_V0_2_STUB_TOOLS: tuple[str, ...] = ()
 
 # The exact implemented read-only tool set (catalog / discovery / query). The structural
 # read-only test asserts a default-config server registers EXACTLY these (plus any
@@ -175,6 +179,8 @@ KNOWN_READ_ONLY_TOOLS: tuple[str, ...] = (
     # v0.2 Phase 4 — promoted from stubs to real read-only tools.
     "get_slo",
     "compare_envs",
+    # v0.3 Phase 3 — get_cost promoted from the last stub to a real read-only tool.
+    "get_cost",
 )
 
 
@@ -380,162 +386,203 @@ def _str_dict_kwarg(kwargs: dict[str, object], key: str) -> dict[str, str] | Non
     return coerced
 
 
+# --- Module-level core tool registrars (one per tool) --------------------------------
+#
+# Each registrar binds the `QueryContext` into TWO handles for its tool: the introspectable
+# `*_tool` wrapper (FastMCP schema generation) and a uniform `_ToolCallable` invoker (the
+# synchronous unit-test seam). Both close over the same core function, so the invoker is a
+# faithful, transport-free stand-in for the registered tool (F3f).
+#
+# These were lifted OUT of `_core_registrars` (where they were nested closures) to module
+# scope so `_core_registrars` stays a flat, trivial dispatch dict — the v0.3 `get_cost`
+# promotion would otherwise push the nested-closure version past the ruff C90 ceiling. Each
+# takes `context` first (bound via `functools.partial` in `_core_registrars`), keeping the
+# registrar's call shape `(server, name)`.
+
+
+def _register_describe_signal_catalog(
+    context: QueryContext, server: "PanoptesMcpServer", name: str
+) -> None:
+    def describe_signal_catalog_tool() -> SignalCatalog:
+        """List environments, configured sources + capabilities, metrics, dashboards."""
+        return describe_signal_catalog(context)
+
+    def invoker(*_args: object, **_kwargs: object) -> object:
+        return describe_signal_catalog(context)
+
+    server._register_tool(name, describe_signal_catalog_tool, invoker)
+
+
+def _register_list_dashboards(
+    context: QueryContext, server: "PanoptesMcpServer", name: str
+) -> None:
+    def list_dashboards_tool() -> list[DashboardSummary]:
+        """Return the dashboard catalog (core + injected consumer packs)."""
+        return list_dashboards(context.dashboard_packs)
+
+    def invoker(*_args: object, **_kwargs: object) -> object:
+        return list_dashboards(context.dashboard_packs)
+
+    server._register_tool(name, list_dashboards_tool, invoker)
+
+
+def _register_get_dashboard_data(
+    context: QueryContext, server: "PanoptesMcpServer", name: str
+) -> None:
+    def get_dashboard_data_tool(dashboard_id: str, env: str) -> DashboardData:
+        """Execute one dashboard's panels for `env`: title + PromQL + series."""
+        return get_dashboard_data(dashboard_id, env, context)
+
+    def invoker(*_args: object, **kwargs: object) -> object:
+        return get_dashboard_data(
+            _str_kwarg(kwargs, "dashboard_id"), _str_kwarg(kwargs, "env"), context
+        )
+
+    server._register_tool(name, get_dashboard_data_tool, invoker)
+
+
+def _register_query_metric(context: QueryContext, server: "PanoptesMcpServer", name: str) -> None:
+    def query_metric_tool(
+        env: str, metric: str, window: str, filters: dict[str, str] | None = None
+    ) -> list[MetricSeries]:
+        """Run a PromQL passthrough query for a metric against the store."""
+        return query_metric(context, env=env, name=metric, window=window, filters=filters)
+
+    def invoker(*_args: object, **kwargs: object) -> object:
+        return query_metric(
+            context,
+            env=_str_kwarg(kwargs, "env"),
+            name=_str_kwarg(kwargs, "metric"),
+            window=_str_kwarg(kwargs, "window"),
+            filters=_str_dict_kwarg(kwargs, "filters"),
+        )
+
+    server._register_tool(name, query_metric_tool, invoker)
+
+
+def _register_search_incidents(
+    context: QueryContext, server: "PanoptesMcpServer", name: str
+) -> None:
+    def search_incidents_tool(
+        env: str, window: str, tag: str | None = None, level: str | None = None
+    ) -> list[IncidentSignal] | IncidentFanOut:
+        """Search incident signals for `env` (or fan out across all enabled envs)."""
+        return search_incidents(context, env=env, window=window, tag=tag, level=level)
+
+    def invoker(*_args: object, **kwargs: object) -> object:
+        return search_incidents(
+            context,
+            env=_str_kwarg(kwargs, "env"),
+            window=_str_kwarg(kwargs, "window"),
+            tag=_opt_str_kwarg(kwargs, "tag"),
+            level=_opt_str_kwarg(kwargs, "level"),
+        )
+
+    server._register_tool(name, search_incidents_tool, invoker)
+
+
+def _register_search_logs(context: QueryContext, server: "PanoptesMcpServer", name: str) -> None:
+    def search_logs_tool(
+        env: str, query: str, window: str, level: str | None = None
+    ) -> list[LogSignal] | LogFanOut:
+        """Search log signals for `env` (or fan out across all enabled envs)."""
+        return search_logs(context, env=env, query=query, window=window, level=level)
+
+    def invoker(*_args: object, **kwargs: object) -> object:
+        return search_logs(
+            context,
+            env=_str_kwarg(kwargs, "env"),
+            query=_str_kwarg(kwargs, "query"),
+            window=_str_kwarg(kwargs, "window"),
+            level=_opt_str_kwarg(kwargs, "level"),
+        )
+
+    server._register_tool(name, search_logs_tool, invoker)
+
+
+def _register_describe_health(
+    context: QueryContext, server: "PanoptesMcpServer", name: str
+) -> None:
+    def describe_health_tool(env: str) -> HealthRollup:
+        """Roll up per-source reachability + open-incident count for `env`."""
+        return describe_health(context, env=env)
+
+    def invoker(*_args: object, **kwargs: object) -> object:
+        return describe_health(context, env=_str_kwarg(kwargs, "env"))
+
+    server._register_tool(name, describe_health_tool, invoker)
+
+
+def _register_get_cluster_state(
+    context: QueryContext, server: "PanoptesMcpServer", name: str
+) -> None:
+    def get_cluster_state_tool(env: str) -> ClusterState:
+        """Render `env`'s kubernetes cluster snapshot from the stored k8s gauges."""
+        return get_cluster_state(context, env=env)
+
+    def invoker(*_args: object, **kwargs: object) -> object:
+        return get_cluster_state(context, env=_str_kwarg(kwargs, "env"))
+
+    server._register_tool(name, get_cluster_state_tool, invoker)
+
+
+def _register_get_slo(context: QueryContext, server: "PanoptesMcpServer", name: str) -> None:
+    def get_slo_tool(env: str, slo_name: str) -> SloResult:
+        """Evaluate the named SLO for `env`: objective vs. actual + the error budget."""
+        return get_slo(context, env=env, name=slo_name)
+
+    def invoker(*_args: object, **kwargs: object) -> object:
+        return get_slo(context, env=_str_kwarg(kwargs, "env"), name=_str_kwarg(kwargs, "slo_name"))
+
+    server._register_tool(name, get_slo_tool, invoker)
+
+
+def _register_compare_envs(context: QueryContext, server: "PanoptesMcpServer", name: str) -> None:
+    def compare_envs_tool(metric: str, window: str) -> EnvComparison:
+        """Compare one metric across every enabled env (per-env series + error markers)."""
+        return compare_envs(context, metric=metric, window=window)
+
+    def invoker(*_args: object, **kwargs: object) -> object:
+        return compare_envs(
+            context, metric=_str_kwarg(kwargs, "metric"), window=_str_kwarg(kwargs, "window")
+        )
+
+    server._register_tool(name, compare_envs_tool, invoker)
+
+
+def _register_get_cost(context: QueryContext, server: "PanoptesMcpServer", name: str) -> None:
+    def get_cost_tool(env: str, window: str) -> CostBreakdown:
+        """Render `env`'s cost snapshot over `window` from the stored cost gauges."""
+        return get_cost(context, env=env, window=window)
+
+    def invoker(*_args: object, **kwargs: object) -> object:
+        return get_cost(context, env=_str_kwarg(kwargs, "env"), window=_str_kwarg(kwargs, "window"))
+
+    server._register_tool(name, get_cost_tool, invoker)
+
+
 def _core_registrars(
     context: QueryContext,
 ) -> Mapping[str, Callable[[PanoptesMcpServer, str], None]]:
-    """Map each v0.1 core tool name to a registrar that binds `context` into a wrapper.
+    """Map each core tool name to a registrar with `context` bound in (a flat dispatch dict).
 
-    Each wrapper closes over the `QueryContext` so the FastMCP-facing signature carries
-    only the caller-supplied arguments (env / name / window / …), and returns the
-    precise nested-`TypedDict` shapes from `tools_discovery` / `tools_query`.
+    Each value is one of the module-level `_register_*` functions with `context` pre-bound
+    via `functools.partial`, leaving the registrar's call shape `(server, name)`. Keeping
+    this a flat dict (the registrars live at module scope) holds `_core_registrars`'s
+    cyclomatic complexity at ~1, so adding a tool never inflates this function.
     """
-
-    # Each registrar binds `context` into TWO handles for its tool: the introspectable
-    # `*_tool` wrapper (FastMCP schema generation) and a uniform `_ToolCallable` invoker
-    # (the synchronous unit-test seam). Both close over the same core function, so the
-    # invoker is a faithful, transport-free stand-in for the registered tool (F3f).
-
-    def register_describe_signal_catalog(server: PanoptesMcpServer, name: str) -> None:
-        def describe_signal_catalog_tool() -> SignalCatalog:
-            """List environments, configured sources + capabilities, metrics, dashboards."""
-            return describe_signal_catalog(context)
-
-        def invoker(*_args: object, **_kwargs: object) -> object:
-            return describe_signal_catalog(context)
-
-        server._register_tool(name, describe_signal_catalog_tool, invoker)
-
-    def register_list_dashboards(server: PanoptesMcpServer, name: str) -> None:
-        def list_dashboards_tool() -> list[DashboardSummary]:
-            """Return the dashboard catalog (core + injected consumer packs)."""
-            return list_dashboards(context.dashboard_packs)
-
-        def invoker(*_args: object, **_kwargs: object) -> object:
-            return list_dashboards(context.dashboard_packs)
-
-        server._register_tool(name, list_dashboards_tool, invoker)
-
-    def register_get_dashboard_data(server: PanoptesMcpServer, name: str) -> None:
-        def get_dashboard_data_tool(dashboard_id: str, env: str) -> DashboardData:
-            """Execute one dashboard's panels for `env`: title + PromQL + series."""
-            return get_dashboard_data(dashboard_id, env, context)
-
-        def invoker(*_args: object, **kwargs: object) -> object:
-            return get_dashboard_data(
-                _str_kwarg(kwargs, "dashboard_id"), _str_kwarg(kwargs, "env"), context
-            )
-
-        server._register_tool(name, get_dashboard_data_tool, invoker)
-
-    def register_query_metric(server: PanoptesMcpServer, name: str) -> None:
-        def query_metric_tool(
-            env: str, metric: str, window: str, filters: dict[str, str] | None = None
-        ) -> list[MetricSeries]:
-            """Run a PromQL passthrough query for a metric against the store."""
-            return query_metric(context, env=env, name=metric, window=window, filters=filters)
-
-        def invoker(*_args: object, **kwargs: object) -> object:
-            return query_metric(
-                context,
-                env=_str_kwarg(kwargs, "env"),
-                name=_str_kwarg(kwargs, "metric"),
-                window=_str_kwarg(kwargs, "window"),
-                filters=_str_dict_kwarg(kwargs, "filters"),
-            )
-
-        server._register_tool(name, query_metric_tool, invoker)
-
-    def register_search_incidents(server: PanoptesMcpServer, name: str) -> None:
-        def search_incidents_tool(
-            env: str, window: str, tag: str | None = None, level: str | None = None
-        ) -> list[IncidentSignal] | IncidentFanOut:
-            """Search incident signals for `env` (or fan out across all enabled envs)."""
-            return search_incidents(context, env=env, window=window, tag=tag, level=level)
-
-        def invoker(*_args: object, **kwargs: object) -> object:
-            return search_incidents(
-                context,
-                env=_str_kwarg(kwargs, "env"),
-                window=_str_kwarg(kwargs, "window"),
-                tag=_opt_str_kwarg(kwargs, "tag"),
-                level=_opt_str_kwarg(kwargs, "level"),
-            )
-
-        server._register_tool(name, search_incidents_tool, invoker)
-
-    def register_search_logs(server: PanoptesMcpServer, name: str) -> None:
-        def search_logs_tool(
-            env: str, query: str, window: str, level: str | None = None
-        ) -> list[LogSignal] | LogFanOut:
-            """Search log signals for `env` (or fan out across all enabled envs)."""
-            return search_logs(context, env=env, query=query, window=window, level=level)
-
-        def invoker(*_args: object, **kwargs: object) -> object:
-            return search_logs(
-                context,
-                env=_str_kwarg(kwargs, "env"),
-                query=_str_kwarg(kwargs, "query"),
-                window=_str_kwarg(kwargs, "window"),
-                level=_opt_str_kwarg(kwargs, "level"),
-            )
-
-        server._register_tool(name, search_logs_tool, invoker)
-
-    def register_describe_health(server: PanoptesMcpServer, name: str) -> None:
-        def describe_health_tool(env: str) -> HealthRollup:
-            """Roll up per-source reachability + open-incident count for `env`."""
-            return describe_health(context, env=env)
-
-        def invoker(*_args: object, **kwargs: object) -> object:
-            return describe_health(context, env=_str_kwarg(kwargs, "env"))
-
-        server._register_tool(name, describe_health_tool, invoker)
-
-    def register_get_cluster_state(server: PanoptesMcpServer, name: str) -> None:
-        def get_cluster_state_tool(env: str) -> ClusterState:
-            """Render `env`'s kubernetes cluster snapshot from the stored k8s gauges."""
-            return get_cluster_state(context, env=env)
-
-        def invoker(*_args: object, **kwargs: object) -> object:
-            return get_cluster_state(context, env=_str_kwarg(kwargs, "env"))
-
-        server._register_tool(name, get_cluster_state_tool, invoker)
-
-    def register_get_slo(server: PanoptesMcpServer, name: str) -> None:
-        def get_slo_tool(env: str, slo_name: str) -> SloResult:
-            """Evaluate the named SLO for `env`: objective vs. actual + the error budget."""
-            return get_slo(context, env=env, name=slo_name)
-
-        def invoker(*_args: object, **kwargs: object) -> object:
-            return get_slo(
-                context, env=_str_kwarg(kwargs, "env"), name=_str_kwarg(kwargs, "slo_name")
-            )
-
-        server._register_tool(name, get_slo_tool, invoker)
-
-    def register_compare_envs(server: PanoptesMcpServer, name: str) -> None:
-        def compare_envs_tool(metric: str, window: str) -> EnvComparison:
-            """Compare one metric across every enabled env (per-env series + error markers)."""
-            return compare_envs(context, metric=metric, window=window)
-
-        def invoker(*_args: object, **kwargs: object) -> object:
-            return compare_envs(
-                context, metric=_str_kwarg(kwargs, "metric"), window=_str_kwarg(kwargs, "window")
-            )
-
-        server._register_tool(name, compare_envs_tool, invoker)
-
     return {
-        "describe_signal_catalog": register_describe_signal_catalog,
-        "list_dashboards": register_list_dashboards,
-        "get_dashboard_data": register_get_dashboard_data,
-        "query_metric": register_query_metric,
-        "search_incidents": register_search_incidents,
-        "search_logs": register_search_logs,
-        "describe_health": register_describe_health,
-        "get_cluster_state": register_get_cluster_state,
-        "get_slo": register_get_slo,
-        "compare_envs": register_compare_envs,
+        "describe_signal_catalog": functools.partial(_register_describe_signal_catalog, context),
+        "list_dashboards": functools.partial(_register_list_dashboards, context),
+        "get_dashboard_data": functools.partial(_register_get_dashboard_data, context),
+        "query_metric": functools.partial(_register_query_metric, context),
+        "search_incidents": functools.partial(_register_search_incidents, context),
+        "search_logs": functools.partial(_register_search_logs, context),
+        "describe_health": functools.partial(_register_describe_health, context),
+        "get_cluster_state": functools.partial(_register_get_cluster_state, context),
+        "get_slo": functools.partial(_register_get_slo, context),
+        "compare_envs": functools.partial(_register_compare_envs, context),
+        "get_cost": functools.partial(_register_get_cost, context),
     }
 
 

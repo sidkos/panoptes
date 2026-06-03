@@ -51,8 +51,10 @@ panoptes:
   dashboards:
     provider: grafana
     env_variable: true
-    # The hosted core packs: the v0.1 trio + the v0.2 kubernetes + slo packs.
-    core_packs: [errors-sentry, logs, overview, kubernetes, slo]
+    # The hosted core packs: the v0.1 trio + the v0.2 kubernetes/slo packs + the v0.3
+    # karpenter/cost/datastore packs.
+    core_packs:
+      [errors-sentry, logs, overview, kubernetes, slo, karpenter, cost, datastore]
     consumer_pack:
       path: ${CONSUMER_PACK_DIR}
   slos:

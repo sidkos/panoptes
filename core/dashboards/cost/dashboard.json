@@ -1,0 +1,81 @@
+{
+  "title": "Cost",
+  "uid": null,
+  "tags": ["panoptes", "core", "cost"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "templating": {
+    "list": [
+      {
+        "name": "env",
+        "type": "query",
+        "label": "Environment",
+        "datasource": "VictoriaMetrics",
+        "query": "label_values(panoptes_cost_spend, env)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": false,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "time": { "from": "now-30d", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Total spend",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 0 },
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum (panoptes_cost_spend{env=~\"$env\"})",
+          "legendFormat": "total"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Budget burn",
+      "type": "gauge",
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 0 },
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max (panoptes_cost_budget_burn{env=~\"$env\"})",
+          "legendFormat": "burn"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Spend by service",
+      "type": "barchart",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service) (panoptes_cost_spend{env=~\"$env\"})",
+          "legendFormat": "{{service}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Spend by service over time",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service) (panoptes_cost_spend{env=~\"$env\"})",
+          "legendFormat": "{{service}}"
+        }
+      ]
+    }
+  ]
+}

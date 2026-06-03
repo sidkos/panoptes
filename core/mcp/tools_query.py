@@ -103,6 +103,13 @@ _K8S_PODS_PENDING = "panoptes_k8s_pods_pending"
 _K8S_PODS_CRASHLOOP = "panoptes_k8s_pods_crashloop"
 _K8S_POD_RESTARTS_TOTAL = "panoptes_k8s_pod_restarts_total"
 
+# The cost gauges `get_cost` reads back from the store — the SAME series the cloudwatch
+# CE/budgets cost path writes (two-faces-one-store parity; the Cost dashboard renders them).
+# `panoptes_cost_spend` is per-service (one series per `{env, service}`); `budget_burn` is
+# one series per env. Kept aligned with `core/sources/cloudwatch.py` metric names.
+_COST_SPEND = "panoptes_cost_spend"
+_COST_BUDGET_BURN = "panoptes_cost_budget_burn"
+
 # The default PromQL the `get_slo` tool measures when a SLO declares no explicit `query`:
 # the availability gauge the overview pack already backs (an uptime SLO is the common case).
 _DEFAULT_SLO_QUERY = "panoptes_health_up"
@@ -167,6 +174,23 @@ class ClusterState(TypedDict):
     pods_crashloop: float
     pod_restarts_total: float
     reachable: bool
+
+
+class CostBreakdown(TypedDict):
+    """A cost snapshot for one env over a window, read from the STORE's cost gauges.
+
+    Backs the `get_cost` MCP tool (spec § Cost types). Rendered from the stored
+    `panoptes_cost_*` gauges (the two-faces-one-store parity — the Cost dashboard renders
+    the SAME series), NOT a live Cost Explorer call. `total` is the sum of the per-service
+    spend; `per_service` maps each service to its latest spend; `budget_burn` is the latest
+    budget-burn fraction. No-data → zero total / empty map / 0.0 burn (never silent-empty).
+    """
+
+    env: str
+    window: str
+    total: float
+    per_service: dict[str, float]
+    budget_burn: float
 
 
 class SloResult(TypedDict):
@@ -710,6 +734,84 @@ def _sum_latest_per_series(series: list[MetricSeries]) -> float:
             latest = max(one_series.points, key=lambda point: point[0])
             total += latest[1]
     return total
+
+
+def get_cost(context: QueryContext, env: str, window: str) -> CostBreakdown:
+    """Render `env`'s cost snapshot over `window` from the stored `panoptes_cost_*` gauges.
+
+    This reads the STORE (two-faces-one-store parity — the Cost dashboard renders the same
+    series), NOT a live Cost Explorer call, so the tool needs no CE/budgets client. The
+    per-service spend gauges (`panoptes_cost_spend{env, service}`) contribute their latest
+    value per service; `total` is the sum across services; `budget_burn` is the latest
+    `panoptes_cost_budget_burn{env}` gauge.
+
+    No cost data (the env was never collected, or the store is a passthrough that cannot
+    answer PromQL) yields a zero/empty breakdown — never a crash or a silent-empty result a
+    caller could mistake for "$0 spend".
+
+    Args:
+        context: The query context (its `store` answers the cost-gauge queries).
+        env: The environment whose cost snapshot to render.
+        window: The cost window string (echoed back; the gauges are the latest collected).
+
+    Returns:
+        A `CostBreakdown` with `total`, `per_service`, and `budget_burn`.
+
+    Raises:
+        CapabilityError: the env is unknown/disabled.
+    """
+    # Validate the env up front (same discipline as get_cluster_state) so an unknown env
+    # fails with a clear error rather than silently returning a zero snapshot.
+    environment = context.require_env(env)
+
+    spend_series = _cost_query(context, _COST_SPEND, environment.name)
+    burn_series = _cost_query(context, _COST_BUDGET_BURN, environment.name)
+
+    per_service, total = _per_service_spend(spend_series)
+    return CostBreakdown(
+        env=environment.name,
+        window=window,
+        total=total,
+        per_service=per_service,
+        budget_burn=_latest_value(burn_series) or 0.0,
+    )
+
+
+def _cost_query(context: QueryContext, metric_name: str, env: str) -> list[MetricSeries]:
+    """Query one `panoptes_cost_*` gauge scoped to `env`, swallowing a passthrough error.
+
+    Mirrors `_k8s_query`: returns the resolved series (empty when not collected); a
+    passthrough store that cannot answer PromQL raises `CapabilityError`, swallowed here so
+    `get_cost` reports zeros rather than crashing into the MCP surface.
+    """
+    expr = f'{metric_name}{{env="{escape_promql_value(env)}"}}'
+    window = TimeWindow.last(minutes=_DEFAULT_WINDOW_MINUTES)
+    try:
+        return context.store.query(
+            MetricQuery(expr=expr, window=window, step_seconds=_step_seconds_for("15m"))
+        )
+    except CapabilityError:
+        return []
+
+
+def _per_service_spend(series: list[MetricSeries]) -> tuple[dict[str, float], float]:
+    """Build the per-service spend map + the total from the spend gauges.
+
+    Each series is one `{env, service}` spend gauge; the map keys on the `service` label
+    (a series missing it contributes to the total but cannot key the map). The total is the
+    sum of every series' latest value.
+    """
+    per_service: dict[str, float] = {}
+    total = 0.0
+    for one_series in series:
+        latest = _latest_value([one_series])
+        if latest is None:
+            continue
+        total += latest
+        service = one_series.labels.get("service")
+        if service:
+            per_service[service] = latest
+    return per_service, total
 
 
 def get_slo(context: QueryContext, env: str, name: str) -> SloResult:

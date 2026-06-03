@@ -1,9 +1,10 @@
-"""Phase 5 unit tests — the Grafana provider + the three shipped core packs.
+"""Phase 5 unit tests — the Grafana provider + the shipped core packs.
 
 Covers (spec `## Tests` → Dashboards + the two provision-time negative paths in
 `## Tests` → Config):
 
-- each shipped core dashboard JSON (`errors-sentry`, `logs`, `overview`) is valid
+- each shipped core dashboard JSON (`errors-sentry`, `logs`, `overview`,
+  `kubernetes`, `slo`, plus the v0.3 `karpenter`/`cost`/`datastore` packs) is valid
   JSON;
 - each declares the `env` Grafana template variable (in `templating.list`, named
   `env`) — every face keys on `env`, so a missing template variable is a regression;
@@ -39,8 +40,20 @@ from core.model import DashboardPack
 # The in-repo core packs the provider ships + provisions (spec UI-Surfaces table).
 # v0.2 adds the `kubernetes` pack (Phase 1) and the `slo` pack (spec § UI Surfaces row
 # `slo` — per-SLO actual-vs-objective, error-budget burn, RED/USE rollup; it completes
-# the Phase-4 SLO feature).
-_CORE_PACK_IDS = ("errors-sentry", "logs", "overview", "kubernetes", "slo")
+# the Phase-4 SLO feature). v0.3 Phase 3 adds three richer core packs: `karpenter`
+# (node-pool + k8s pressure), `cost` (per-service spend + budget burn — the surface for
+# the promoted `get_cost` tool), and `datastore` (the cloudwatch-source store-carried
+# signals: log error-rate + cost gauges).
+_CORE_PACK_IDS = (
+    "errors-sentry",
+    "logs",
+    "overview",
+    "kubernetes",
+    "slo",
+    "karpenter",
+    "cost",
+    "datastore",
+)
 _CORE_DASHBOARDS_DIR = Path(__file__).resolve().parents[2] / "core" / "dashboards"
 
 # The exact label set each derived metric emits (asserted against each source's
@@ -56,6 +69,10 @@ _METRIC_LABELS: dict[str, frozenset[str]] = {
     "panoptes_k8s_pods_pending": frozenset({"env", "cluster"}),
     "panoptes_k8s_pods_crashloop": frozenset({"env", "cluster"}),
     "panoptes_k8s_pod_restarts_total": frozenset({"env", "cluster", "namespace"}),
+    # v0.3 cost gauges — exact label sets mirror core/sources/cloudwatch.py's cost path:
+    # spend is per-service ({env, service}); the budget burn is env-scoped ({env}).
+    "panoptes_cost_spend": frozenset({"env", "service"}),
+    "panoptes_cost_budget_burn": frozenset({"env"}),
 }
 
 # A PromQL label selector token: `metric_name{label="value", ...}`. The metric name

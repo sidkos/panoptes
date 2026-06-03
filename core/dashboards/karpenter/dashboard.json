@@ -1,0 +1,81 @@
+{
+  "title": "Karpenter",
+  "uid": null,
+  "tags": ["panoptes", "core", "karpenter", "kubernetes"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "templating": {
+    "list": [
+      {
+        "name": "env",
+        "type": "query",
+        "label": "Environment",
+        "datasource": "VictoriaMetrics",
+        "query": "label_values(panoptes_k8s_node_count, env)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": false,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Provisioned nodes",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 0 },
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (cluster) (panoptes_k8s_node_count{env=~\"$env\"})",
+          "legendFormat": "{{cluster}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Unschedulable pods (provisioning pressure)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 0 },
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (cluster) (panoptes_k8s_pods_pending{env=~\"$env\"})",
+          "legendFormat": "{{cluster}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Crash-looping containers on provisioned capacity",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 0 },
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (cluster) (panoptes_k8s_pods_crashloop{env=~\"$env\"})",
+          "legendFormat": "{{cluster}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Pod restarts by namespace (consolidation churn)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 0 },
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (namespace) (panoptes_k8s_pod_restarts_total{env=~\"$env\"})",
+          "legendFormat": "{{namespace}}"
+        }
+      ]
+    }
+  ]
+}

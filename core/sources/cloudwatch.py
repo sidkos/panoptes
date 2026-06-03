@@ -21,8 +21,18 @@ stubbed client so `Stubber` attaches to the exact instance. `assume_role_arn` ta
 precedence over `profile`; when set, `external_id` is passed through to the STS
 `assume_role` call as `ExternalId` (IAM.md confused-deputy guard).
 
+When `cost_budget_name` is configured the source ALSO reads Cost Explorer +
+budgets (v0.3): `ce:GetCostAndUsage` (grouped by service) → one
+`panoptes_cost_spend{env,service}` gauge per service, and `budgets:DescribeBudget`
+→ one `panoptes_cost_budget_burn{env}` gauge (actual/limit). These calls are rate-
+limited to at most once per `cost_poll_interval_seconds` (default 3600) via an
+injectable clock seam (G3 — CE bills per request), while the cheaper metric/log
+feeds run every cycle. The CE/budgets IAM grant is consumer-side IaC (a Phase-6
+IAM.md note), NOT part of this adapter's IRSA.
+
 This source is read-only w.r.t. AWS: only `get_metric_data` / `filter_log_events` /
-`get_paginator` / `assume_role` are called — none are in the no-write guard's
+`get_paginator` / `assume_role` / `get_caller_identity` / `get_cost_and_usage` /
+`describe_budget` are called — all read actions, none in the no-write guard's
 mutation-verb set.
 
 Type-stub-only imports (`mypy_boto3_*`) are guarded behind `if TYPE_CHECKING:` — they
@@ -31,8 +41,8 @@ are NOT installed in slim CI, so a bare runtime import would crash; the runtime
 """
 
 from collections.abc import Callable, Iterator
-from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Literal
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
@@ -53,10 +63,13 @@ from core.sources._config import (
     require_str_field,
     require_str_list_field,
 )
+from core.validation import optional_int_field
 
 if TYPE_CHECKING:
     # Type-stub-only imports — present at type-check time (boto3-stubs is a dev dep)
     # but NOT installed in slim CI, so they must never run at import time.
+    from mypy_boto3_budgets import BudgetsClient
+    from mypy_boto3_ce import CostExplorerClient
     from mypy_boto3_cloudwatch import CloudWatchClient
     from mypy_boto3_cloudwatch.type_defs import GetMetricDataOutputTypeDef
     from mypy_boto3_logs import CloudWatchLogsClient
@@ -66,6 +79,31 @@ if TYPE_CHECKING:
 # Derived-metric name (spec `## Data Model` — `panoptes_` prefix avoids PromQL
 # collisions with native upstream metric names).
 _METRIC_LOG_ERROR_RATE = "panoptes_log_error_rate"
+
+# Cost gauges (v0.3) — the `get_cost` MCP tool + the Cost dashboard both render these from
+# the store (two-faces-one-store parity). `panoptes_cost_spend{env,service}` carries the
+# unblended spend per AWS service over the cost window; `panoptes_cost_budget_burn{env}` is
+# the configured budget's actual/limit burn fraction.
+_METRIC_COST_SPEND = "panoptes_cost_spend"
+_METRIC_COST_BUDGET_BURN = "panoptes_cost_budget_burn"
+
+# The cost window the CE `GetCostAndUsage` read spans, in days (a rolling trailing window —
+# matched by the Cost dashboard's `30d` range). Hard-coded rather than configurable to keep
+# the flat-config surface small; the burn gauge is independent of this (budget-period scoped).
+_COST_WINDOW_DAYS = 30
+
+# CE `GetCostAndUsage` granularity + metric. MONTHLY over the trailing window keeps the call
+# cheap (CE bills per request); UnblendedCost is the spend figure the budget alerts track.
+# `_COST_GRANULARITY` is annotated `Literal["MONTHLY"]` (not a bare `str`) so it matches the
+# boto3-stubs `get_cost_and_usage` `Granularity` overload without an `# type: ignore`.
+_COST_GRANULARITY: Literal["MONTHLY"] = "MONTHLY"
+_COST_METRIC = "UnblendedCost"
+
+# The default cost-read cadence (G3): the CE/budgets calls fire at most once per this many
+# seconds even though `fetch` runs every poll cycle. 3600 s (hourly) keeps CE request spend
+# negligible while the cheap metric/log feeds stay real-time. Overridable per source via the
+# flat `cost_poll_interval_seconds` config field.
+_DEFAULT_COST_POLL_INTERVAL_SECONDS = 3600
 
 # Message-substring markers → their TRUE `LogLevel` (F2h). CloudWatch log events carry no
 # structured level, so the message text is inspected. Ordered MOST-SEVERE FIRST so a line
@@ -82,6 +120,29 @@ _LEVEL_MARKERS: tuple[tuple[tuple[str, ...], LogLevel], ...] = (
 # The levels that count toward `panoptes_log_error_rate` (F2h): ERROR and above
 # (ERROR + CRITICAL). WARNING/DEBUG/INFO are NOT errors, so they do not inflate the rate.
 _ERROR_RATE_LEVELS = frozenset({LogLevel.ERROR, LogLevel.CRITICAL})
+
+
+def _default_clock() -> datetime:
+    """Wall-clock `now` in UTC — the production `clock` seam for the cost cadence gate."""
+    return datetime.now(UTC)
+
+
+def _extract_amount(amount_block: object) -> float | None:
+    """Pull a stringified float `Amount` out of a CE/budgets `{Amount, Unit}` block.
+
+    Both CE results and budgets payloads model money as `{"Amount": "12.34", "Unit":
+    "USD"}`. Returns the parsed float, or `None` when the block is missing/malformed so the
+    caller skips it rather than crashing.
+    """
+    if not isinstance(amount_block, dict):
+        return None
+    amount = amount_block.get("Amount")
+    if not isinstance(amount, str):
+        return None
+    try:
+        return float(amount)
+    except ValueError:
+        return None
 
 
 def _paginate[PageT](
@@ -131,14 +192,25 @@ class CloudWatchSource:
         sts_client: "STSClient | None" = None,
         cloudwatch_client: "CloudWatchClient | None" = None,
         logs_client: "CloudWatchLogsClient | None" = None,
+        ce_client: "CostExplorerClient | None" = None,
+        budgets_client: "BudgetsClient | None" = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
-        """Read flat config fields; accept injectable boto3 client seams (all optional).
+        """Read flat config fields; accept injectable boto3 client + clock seams (all optional).
 
-        The three client params default to `None`, so the registry's single-positional
+        The client params default to `None`, so the registry's single-positional
         `cls(config)` still constructs the source; a test injects a stubbed client so
         `botocore.stub.Stubber` attaches to the exact instance the source uses. Real
         runs leave them `None` and the clients are lazily built from `region`/`profile`
         on first use.
+
+        The cost read path (CE `GetCostAndUsage` + budgets `DescribeBudget`) is OPT-IN: it
+        activates only when `cost_budget_name` is configured (a flat string field). When set,
+        every `fetch` MAY emit `panoptes_cost_*` gauges — but the CE/budgets calls themselves
+        are rate-limited to at most once per `cost_poll_interval_seconds` (default 3600) via
+        the injectable `clock` seam (G3: CE bills per request, so an every-cycle call would
+        be wasteful). The `clock` defaults to `datetime.now(UTC)`; a test injects a fake clock
+        to assert the cadence without a wall-clock `sleep`.
         """
         self._region = require_str_field(config, "region", self.type)
         self._namespace = require_str_field(config, "namespace", self.type)
@@ -150,27 +222,42 @@ class CloudWatchSource:
         self._profile = optional_str_field(config, "profile")
         self._assume_role_arn = optional_str_field(config, "assume_role_arn")
         self._external_id = optional_str_field(config, "external_id")
+        # Cost path (v0.3) — opt-in via `cost_budget_name`; cadence via the int field.
+        self._cost_budget_name = optional_str_field(config, "cost_budget_name")
+        self._cost_poll_interval_seconds = optional_int_field(
+            config, "cost_poll_interval_seconds", _DEFAULT_COST_POLL_INTERVAL_SECONDS
+        )
         # Injected seams (None in production; a stubbed client in tests).
         self._sts_client = sts_client
         self._cloudwatch_client = cloudwatch_client
         self._logs_client = logs_client
+        self._ce_client = ce_client
+        self._budgets_client = budgets_client
+        # The clock seam (G3 cadence gate). `None` → wall-clock `datetime.now(UTC)`.
+        self._clock = clock if clock is not None else _default_clock
+        # Timestamp of the last CE/budgets read; `None` until the first cost fetch. Drives
+        # the once-per-interval cadence gate (`_cost_due`).
+        self._last_cost_read_at: datetime | None = None
 
     def capabilities(self) -> set[SignalKind]:
         """cloudwatch emits metric samples and log lines (incident is v0.2)."""
         return {SignalKind.METRIC, SignalKind.LOG}
 
     def fetch(self, window: TimeWindow) -> list[CanonicalSignal]:
-        """Page CloudWatch metrics + Logs over `window`, normalizing both feeds.
+        """Page CloudWatch metrics + Logs over `window`, normalizing all feeds.
 
         Returns the metric samples, then the log lines, then the per-log-group derived
-        `panoptes_log_error_rate` gauges. Both upstream reads are fully paginated so a
-        result spanning multiple pages is never truncated.
+        `panoptes_log_error_rate` gauges, then (when cost is configured AND the
+        once-per-interval cadence gate is open) the `panoptes_cost_*` gauges. The metric
+        and log reads are fully paginated so a multi-page result is never truncated; the
+        cost read is gated to at most once per `cost_poll_interval_seconds` (G3).
         """
         signals: list[CanonicalSignal] = []
         signals.extend(self._fetch_metrics(window))
         log_signals, error_rates = self._fetch_logs(window)
         signals.extend(log_signals)
         signals.extend(error_rates)
+        signals.extend(self._fetch_cost(window))
         return signals
 
     def health(self) -> SourceHealth:
@@ -432,6 +519,205 @@ class CloudWatchSource:
             return None
         timestamp = datetime.fromtimestamp(float(timestamp_millis) / 1000.0, tz=UTC)
         return _LogEvent(timestamp=timestamp, message=message)
+
+    def _fetch_cost(self, window: TimeWindow) -> list[MetricSignal]:
+        """Read CE spend + budget burn into `panoptes_cost_*` gauges (gated, opt-in).
+
+        A no-op (empty list) unless `cost_budget_name` is configured AND the once-per-
+        `cost_poll_interval_seconds` cadence gate is open (G3 — CE bills per request, so the
+        call must not fire every poll cycle). When the gate opens, issues exactly two read
+        calls — CE `GetCostAndUsage` (grouped by service) and budgets `DescribeBudget` — and
+        normalizes them into one `panoptes_cost_spend{env,service}` gauge per service plus one
+        `panoptes_cost_budget_burn{env}` gauge. A CE/budgets error is swallowed (logged via
+        the empty-list return) the same way an unreachable feed is — it must NOT crash the
+        cycle, since cost is an auxiliary signal.
+        """
+        if self._cost_budget_name is None:
+            # Cost path not configured — never touch CE/budgets.
+            return []
+        if not self._cost_due():
+            # Within the cadence window — skip the CE/budgets calls this cycle (G3). The
+            # store keeps serving the gauges from the previous read.
+            return []
+        try:
+            spend = self._fetch_cost_spend(window)
+            burn = self._fetch_budget_burn()
+        except (ClientError, BotoCoreError):
+            # An auth/transport failure on the cost feed is non-fatal: leave the cadence
+            # marker un-advanced so the next cycle retries, and emit nothing this cycle.
+            return []
+        # Only advance the cadence marker on a SUCCESSFUL read, so a failed call retries
+        # next cycle rather than blacking out cost for a full interval.
+        self._last_cost_read_at = self._clock()
+        return spend + burn
+
+    def _cost_due(self) -> bool:
+        """True when no cost read has happened yet, or the cadence interval has elapsed.
+
+        The cadence gate (G3): compares `now - last_read` against
+        `cost_poll_interval_seconds`. The very first fetch (`_last_cost_read_at is None`) is
+        always due; thereafter a read fires only once the interval has fully elapsed.
+        """
+        if self._last_cost_read_at is None:
+            return True
+        elapsed = self._clock() - self._last_cost_read_at
+        return elapsed >= timedelta(seconds=self._cost_poll_interval_seconds)
+
+    def _fetch_cost_spend(self, window: TimeWindow) -> list[MetricSignal]:
+        """Read CE `GetCostAndUsage` grouped by service → one spend gauge per service.
+
+        The CE window is a trailing `_COST_WINDOW_DAYS` ending at the fetch window's end, at
+        MONTHLY granularity (cheap + matches the budget period). Each `ResultsByTime` group's
+        unblended-cost amount becomes one `panoptes_cost_spend{env,service}` gauge stamped at
+        the window end.
+        """
+        client = self._cost_explorer()
+        end = window.end
+        start = end - timedelta(days=_COST_WINDOW_DAYS)
+        response = client.get_cost_and_usage(
+            TimePeriod={"Start": start.date().isoformat(), "End": end.date().isoformat()},
+            Granularity=_COST_GRANULARITY,
+            Metrics=[_COST_METRIC],
+            GroupBy=[{"Type": "DIMENSION", "Key": "SERVICE"}],
+        )
+        return self._normalize_cost_results(response.get("ResultsByTime", []), end)
+
+    def _normalize_cost_results(self, results: object, sample_time: datetime) -> list[MetricSignal]:
+        """Normalize CE `ResultsByTime` groups into per-service spend gauges.
+
+        Each group carries `Keys` (the service name) and a `Metrics` map whose
+        `UnblendedCost.Amount` is the spend string. A malformed group is skipped rather than
+        aborting the batch. Spend across multiple time periods for the same service is summed
+        so the gauge is one value per service over the whole window.
+        """
+        if not isinstance(results, list):
+            return []
+        spend_by_service: dict[str, float] = {}
+        for period in results:
+            if not isinstance(period, dict):
+                continue
+            for group in period.get("Groups", []):
+                service, amount = self._parse_cost_group(group)
+                if service is None or amount is None:
+                    continue
+                spend_by_service[service] = spend_by_service.get(service, 0.0) + amount
+        return [
+            MetricSignal(
+                name=_METRIC_COST_SPEND,
+                value=amount,
+                timestamp=sample_time,
+                # Exact cost-gauge label set: `{env, service}` (mirrors the get_cost reader).
+                labels={"env": self._env, "service": service},
+            )
+            for service, amount in spend_by_service.items()
+        ]
+
+    @staticmethod
+    def _parse_cost_group(group: object) -> tuple[str | None, float | None]:
+        """Parse one CE group into `(service, unblended_amount)`; `(None, None)` if malformed.
+
+        A group's `Keys[0]` is the SERVICE dimension value; `Metrics[UnblendedCost][Amount]`
+        is the spend (a stringified float in CE responses). Anything missing or unparseable
+        collapses to `(None, None)` so the caller skips it.
+        """
+        if not isinstance(group, dict):
+            return None, None
+        keys = group.get("Keys")
+        if not isinstance(keys, list) or not keys or not isinstance(keys[0], str):
+            return None, None
+        metrics = group.get("Metrics")
+        if not isinstance(metrics, dict):
+            return None, None
+        unblended = metrics.get(_COST_METRIC)
+        if not isinstance(unblended, dict):
+            return None, None
+        amount = unblended.get("Amount")
+        if not isinstance(amount, str):
+            return None, None
+        try:
+            return keys[0], float(amount)
+        except ValueError:
+            return None, None
+
+    def _fetch_budget_burn(self) -> list[MetricSignal]:
+        """Read budgets `DescribeBudget` → one `panoptes_cost_budget_burn{env}` gauge.
+
+        The burn fraction is `actual_spend / budget_limit` for the configured budget. A zero
+        or missing limit yields no gauge (a divide-by-zero guard) rather than a crash. The
+        gauge is stamped at the clock's `now` (budget state is period-scoped, not window-tied).
+        """
+        budget_name = self._cost_budget_name
+        assert budget_name is not None  # guarded by _fetch_cost
+        client = self._budgets()
+        account_id = self._resolve_account_id()
+        response = client.describe_budget(AccountId=account_id, BudgetName=budget_name)
+        burn = self._compute_budget_burn(response.get("Budget"))
+        if burn is None:
+            return []
+        return [
+            MetricSignal(
+                name=_METRIC_COST_BUDGET_BURN,
+                value=burn,
+                timestamp=self._clock(),
+                labels={"env": self._env},
+            )
+        ]
+
+    @staticmethod
+    def _compute_budget_burn(budget: object) -> float | None:
+        """Compute `actual / limit` from a budgets `Budget` payload; `None` if not derivable.
+
+        `BudgetLimit.Amount` is the limit and `CalculatedSpend.ActualSpend.Amount` is the
+        actual, both stringified floats. A missing/zero limit or unparseable amount yields
+        `None` (no gauge) — never a divide-by-zero or a crash.
+        """
+        if not isinstance(budget, dict):
+            return None
+        limit = _extract_amount(budget.get("BudgetLimit"))
+        calculated = budget.get("CalculatedSpend")
+        actual = (
+            _extract_amount(calculated.get("ActualSpend")) if isinstance(calculated, dict) else None
+        )
+        if limit is None or actual is None or limit <= 0.0:
+            return None
+        return actual / limit
+
+    def _resolve_account_id(self) -> str:
+        """Resolve the AWS account id (required by `DescribeBudget`) via STS GetCallerIdentity.
+
+        Uses the same injectable sts client seam as assume-role, so a test stubs it. The
+        account id is the budgets API's mandatory partition key.
+        """
+        identity = self._sts().get_caller_identity()
+        account = identity.get("Account")
+        if not isinstance(account, str) or not account:
+            raise PanoptesError(
+                "cloudwatch cost path could not resolve the AWS account id "
+                "(STS GetCallerIdentity returned no Account)."
+            )
+        return account
+
+    def _cost_explorer(self) -> "CostExplorerClient":
+        """Return the injected Cost Explorer client, or lazily build one.
+
+        CE is a global service (always `us-east-1` regardless of the source's region), so the
+        lazily-built client pins that region; an injected client is used as-is.
+        """
+        if self._ce_client is not None:
+            return self._ce_client
+        session = self._session()
+        # CE has a single global endpoint in us-east-1; the source's region does not apply.
+        self._ce_client = session.client("ce", region_name="us-east-1")
+        return self._ce_client
+
+    def _budgets(self) -> "BudgetsClient":
+        """Return the injected budgets client, or lazily build one (global, us-east-1)."""
+        if self._budgets_client is not None:
+            return self._budgets_client
+        session = self._session()
+        # The budgets API is global with a single us-east-1 endpoint.
+        self._budgets_client = session.client("budgets", region_name="us-east-1")
+        return self._budgets_client
 
     @staticmethod
     def _classify_level(message: str) -> LogLevel:
