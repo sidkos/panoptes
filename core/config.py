@@ -261,12 +261,22 @@ def _reconcile_capabilities(source_type: str, declared: list[str], actual: set[S
         )
 
 
-def _resolve_sources(env_config: EnvironmentConfig, registries: PlaneRegistries) -> list[Source]:
-    """Build + reconcile the live sources for one enabled environment."""
+def _resolve_sources(
+    env_name: str, env_config: EnvironmentConfig, registries: PlaneRegistries
+) -> list[Source]:
+    """Build + reconcile the live sources for one enabled environment.
+
+    The environment name is injected into each source's config block as `env`: the
+    loader is the single place that knows which environment a source belongs to, so
+    every source stamps `env` onto its signals (the model invariant) without the
+    YAML having to repeat `env:` on every source entry. An explicit `env:` in the
+    YAML is honored only if it matches; a stray different value would be an operator
+    error, so the loader's name is authoritative.
+    """
     resolved: list[Source] = []
     for source_config in env_config["sources"]:
         source_type = source_config["type"]
-        block = _interpolate_block(source_config)
+        block = {**_interpolate_block(source_config), "env": env_name}
         source = registries.sources.build(source_type, block)
         declared = source_config.get("provides", [])
         _reconcile_capabilities(source_type, declared, source.capabilities())
@@ -350,7 +360,7 @@ def load_config(path: Path, registries: PlaneRegistries | None = None) -> Resolv
     for env_name, env_config in body.get("environments", {}).items():
         enabled = env_config["enabled"]
         # Disabled envs parse but produce NO live adapters (wired-but-inert).
-        sources = _resolve_sources(env_config, active_registries) if enabled else []
+        sources = _resolve_sources(env_name, env_config, active_registries) if enabled else []
         environments[env_name] = ResolvedEnvironment(
             name=env_name, enabled=enabled, sources=sources
         )

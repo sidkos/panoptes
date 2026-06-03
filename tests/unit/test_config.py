@@ -206,6 +206,18 @@ def test_interpolation_substitutes_env_vars(
     assert cast(_FakeSource, http_health).config["url"] == "https://dev.example/health"
 
 
+def test_loader_injects_environment_name_into_source_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each source's config block gets the env name as `env` (sources stamp it on
+    signals; the YAML need not repeat `env:` per source)."""
+    _set_reference_env(monkeypatch)
+    config_path = _write_fixture(tmp_path)
+    resolved = load_config(config_path, registries=_registries_with_correct_capabilities())
+    for source in resolved.environments["dev"].sources:
+        assert cast(_FakeSource, source).config["env"] == "dev"
+
+
 def test_missing_env_var_fails_fast_naming_var(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
