@@ -203,16 +203,26 @@ class DashboardPack:
     Grafana provider globs/syncs.
 
     `selector` records WHICH consumer-pack reference form the operator chose —
-    `path` (v0.1, resolved + provisioned) or `git` (v0.2, parsed-but-deferred).
-    The loader emits a `git`-selected consumer pack so the deferral is enforced at
-    PROVISION time (the Grafana provider raises a clear `CapabilityError`), not
-    silently dropped at resolve time — this keeps the "parses OK, acting on it
-    fails in v0.1" boundary explicit and testable. It defaults to `path`, which is
-    the only meaningful selector for a core pack (and the common consumer case), so
-    existing call sites need not pass it.
+    `path` (resolved + provisioned from a mounted dir) or `git` (the v0.2 hosted
+    variant). For a `git` pack the in-pod Grafana provider VALIDATES the pinned ref
+    (`git_ref` must be a full 40-hex commit SHA — a mutable branch like `main`/`HEAD`
+    is rejected, because the pinned ref is a code-execution trust boundary,
+    DASHBOARDS §4) and then reads the `json_path` subdir READ-ONLY, exactly as the
+    mounted-`path` case does. It defaults to `path`, which is the only meaningful
+    selector for a core pack (and the common consumer case), so existing call sites
+    need not pass it.
+
+    `git_ref` is the pinned commit SHA for a `git`-selected pack. Scope note: Phase 6
+    shipped the in-pod ref-VALIDATION + read-only glob (this provider); it did NOT
+    ship the deploy-time `git fetch` job itself (the OTHER HALF of the trust boundary
+    — a Terraform null_resource / Helm pre-install job — is future deploy-wiring
+    work). When that fetch job lands it MUST pass THIS same validated `git_ref` to its
+    `git fetch` so the validated ref and the fetched ref cannot diverge. `None` for
+    `path`/`core` packs.
     """
 
     id: str
     tier: Literal["core", "consumer"]
     json_path: Path
     selector: Literal["path", "git"] = "path"
+    git_ref: str | None = None

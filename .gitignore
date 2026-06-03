@@ -32,6 +32,11 @@ htmlcov/
 *.tfplan
 crash.log
 crash.*.log
+# A filled `terraform.tfvars` carries real secrets (the GitHub OAuth secret, the Slack
+# webhook) and must NEVER be committed; the tracked `*.tfvars.example` placeholder stays
+# tracked (the negation re-includes it after the broad `*.tfvars` ignore).
+*.tfvars
+!*.tfvars.example
 
 # Environment / secrets (consumer packs supply their own .env; never commit it)
 .env

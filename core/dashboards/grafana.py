@@ -12,10 +12,17 @@ injected consumer pack whose `json_path` is a mounted dir) and:
    - a *consumer* pack's `json_path` is the mounted *dir*; we GLOB
      `dashboards/**/dashboard.json` under it (the provider never hardcodes the
      `demo`/`consumer` pack name — it discovers whatever the consumer injected);
-   - a *git*-selected consumer pack is rejected here: git injection is deferred to
-     v0.2, so we raise a clear `CapabilityError`. The deferral is enforced at
-     PROVISION time (not silently at resolve time) so "parses OK, acting on it fails
-     in v0.1" stays explicit and testable.
+   - a *git*-selected consumer pack (v0.2 hosted path) first has its pinned ref
+     VALIDATED here in-pod — a full 40-hex commit SHA is REQUIRED; a mutable branch
+     (`main`/`HEAD`), a tag, or a short SHA is rejected with a clear `CapabilityError`,
+     because the pinned ref is a code-execution trust boundary (the fetched subdir
+     may carry an executable `pack.py`). This provider does the ref VALIDATION + a
+     READ-ONLY glob of the already-present `json_path` subdir (exactly like the
+     mounted-`path` case) — it does NOT itself fetch. The deploy-time `git fetch`
+     job that places the subdir (a Terraform null_resource / Helm pre-install job)
+     is the OTHER HALF of the trust boundary and is unimplemented future
+     deploy-wiring; when it lands it MUST pass THIS same validated `git_ref` to its
+     `git fetch` so the validated ref and the fetched ref cannot diverge.
 2. **Syncs** every resolved JSON into the Grafana file-provisioning dir via
    `Path.write_text` (the no-write guard allowlists `write_text`/`write_bytes` —
    Risk R6; this is local file I/O, not a boto3 mutation).
@@ -31,6 +38,7 @@ avoided by syncing each pack into a per-pack subdir keyed on the pack id + the
 source pack-dir name, so two packs that both ship a `dashboard.json` never clobber.
 """
 
+import re
 from pathlib import Path
 
 import httpx
@@ -51,9 +59,13 @@ _DEFAULT_PROVISIONING_DIR = Path("core/dashboards/provisioning/generated")
 # The Grafana HTTP endpoint hit to confirm dashboards loaded (read-only).
 _SEARCH_PATH = "/api/search"
 
-# The exact CapabilityError message the git-deferral negative path asserts on
-# (spec `## Tests` → Config). Kept as a literal so the message never drifts.
-_GIT_DEFERRED_DETAIL = "git injection is v0.2; use `path` in v0.1"
+# A FULL git commit SHA: exactly 40 lowercase hex chars (git's default SHA-1 object id).
+# The git-injection variant REQUIRES a full-SHA pin (DASHBOARDS §4 control (a)): a mutable
+# branch ref (`main`/`HEAD`) or a short ref is rejected — pulling a moving ref would be
+# arbitrary-code-execution-on-deploy (the pinned ref is a code-execution trust boundary,
+# because the fetched subdir may carry an executable `pack.py`). 40-hex only (a 7-char
+# short SHA, a tag, or `main`/`HEAD` all fail the anchor).
+_FULL_SHA_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 
 
 @DASHBOARD_PROVIDERS.register("grafana")
@@ -119,12 +131,23 @@ class GrafanaDashboardProvider:
     def _resolve_pack(self, pack: DashboardPack) -> list[tuple[str, Path]]:
         """Resolve one pack to its `(sync_subdir, dashboard.json)` pairs.
 
-        Core packs resolve to a single file (fail fast if missing); consumer packs
-        glob their mounted dir; a git-selected consumer pack raises `CapabilityError`.
+        Core packs resolve to a single file (fail fast if missing); consumer packs glob
+        their mounted/already-fetched dir. A `git`-selected consumer pack first has its
+        pinned ref VALIDATED (a full commit SHA is required — a mutable branch is rejected),
+        then its `json_path` dir is globbed READ-ONLY exactly like the mounted-`path` case.
         """
         if pack.tier == "consumer" and pack.selector == "git":
-            # Deferred to v0.2 — enforced here at provision time, not at resolve time.
-            raise CapabilityError(_GIT_DEFERRED_DETAIL)
+            # The git-injection variant (DASHBOARDS §4). This provider's role is the IN-POD
+            # ref-validation security gate + a read-only consume of the already-present
+            # `pack.json_path` dir — it does NOT fetch. The deploy-time `git fetch` that
+            # places that dir (a Terraform null_resource / Helm pre-install job, the OTHER
+            # half of the trust boundary) is unimplemented future deploy-wiring; running the
+            # fetch in this long-running pod would be a worse trust boundary than a reviewed
+            # deploy-time fetch (spec § No repo-write credential). When the fetch job lands
+            # it MUST pass THIS same validated `git_ref` to `git fetch` so the validated ref
+            # and the fetched ref cannot diverge.
+            self._require_full_sha_pin(pack)
+            return self._glob_consumer_dir(pack)
 
         if pack.tier == "core":
             if not pack.json_path.exists():
@@ -135,12 +158,44 @@ class GrafanaDashboardProvider:
                 )
             return [(pack.id, pack.json_path)]
 
-        # A path-selected consumer pack: glob `dashboards/**/dashboard.json` under the
-        # mounted dir. The provider discovers whatever the consumer injected — it
-        # never hardcodes a pack name.
+        # A path-selected consumer pack: glob the mounted dir (read-only) — the provider
+        # discovers whatever the consumer injected; it never hardcodes a pack name.
+        return self._glob_consumer_dir(pack)
+
+    def _require_full_sha_pin(self, pack: DashboardPack) -> None:
+        """Reject a `git` pack whose ref is not a full commit SHA (the code-exec trust gate).
+
+        DASHBOARDS §4 control (a): the pinned ref MUST be an immutable full 40-hex commit
+        SHA — a mutable branch (`main`/`HEAD`), a tag, or a short SHA is rejected, because
+        the (future) deploy-time fetch job uses this ref to pull a subdir that may carry an
+        executable `pack.py`; a moving ref would be arbitrary-code-execution-on-deploy. This
+        method is the IN-POD validation half of that boundary: it does not fetch — it gates
+        the ref so the validated ref is the one the fetch job must use (they cannot diverge).
+        The `\\A...\\Z` anchors on `_FULL_SHA_RE` also reject newline-smuggling / path-traversal
+        / uppercase-hex bypass refs (only 40 lowercase-hex with no surrounding bytes passes).
+        Raises a clear `CapabilityError` naming the requirement so the operator fix is obvious.
+
+        Raises:
+            CapabilityError: `git_ref` is absent or not a full 40-hex commit SHA.
+        """
+        ref = pack.git_ref
+        if ref is None or not _FULL_SHA_RE.match(ref):
+            raise CapabilityError(
+                f"git dashboard pack '{pack.id}' must pin an IMMUTABLE full 40-hex commit "
+                f"SHA (got {ref!r}); a mutable branch (main/HEAD), a tag, or a short SHA is "
+                f"rejected — the pinned ref is a code-execution trust boundary (DASHBOARDS §4)."
+            )
+
+    def _glob_consumer_dir(self, pack: DashboardPack) -> list[tuple[str, Path]]:
+        """Glob `dashboards/**/dashboard.json` under a consumer pack's dir (READ-ONLY).
+
+        Shared by the `path` (mounted dir) and validated-`git` (already-fetched dir) cases:
+        the provider only READS the source tree here (the write happens later into the
+        SEPARATE provisioning dir via `_sync_one`), so the mounted/fetched tree is never
+        mutated in place. Each synced file is keyed on the pack id + its source pack-dir name
+        so two packs that both ship a `dashboard.json` never clobber in the provisioning dir.
+        """
         matches = sorted(pack.json_path.glob(_DASHBOARD_GLOB))
-        # Key each synced file on the pack id + its source pack-dir name so two packs
-        # that both ship a `dashboard.json` never clobber in the provisioning dir.
         return [(f"{pack.id}-{source_json.parent.name}", source_json) for source_json in matches]
 
     def _sync_one(self, sync_subdir: str, source_json: Path) -> None:

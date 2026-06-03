@@ -1,0 +1,22 @@
+# Copy to `terraform.tfvars` and fill for your deployment. Secrets (the GitHub OAuth
+# secret, the Slack webhook) are best supplied via `TF_VAR_*` env vars or a secrets manager
+# rather than committed here.
+
+home_region = "us-east-1"
+hostname    = "panoptes.example.com"
+image_tag   = "v0.2.0" # an IMMUTABLE tag, never :latest
+
+github_oauth_client_id = "Iv1.0123456789abcdef"
+# github_oauth_client_secret = "..."   # prefer TF_VAR_github_oauth_client_secret
+github_org = "your-github-org"
+# github_team = "platform"             # optional finer gate
+
+# The per-env read-roles the IRSA role may assume, IN-ACCOUNT. Empty = no grants (stage/prod
+# stay disabled stubs). Light up an env by adding its PanoptesReadRole ARN here.
+read_role_arns = [
+  "arn:aws:iam::111122223333:role/PanoptesReadRole-dev",
+]
+
+# The single Panoptes-owned SNS alert topic the IRSA role may publish to (resource-scoped).
+alert_topic_arn = "arn:aws:sns:us-east-1:111122223333:panoptes-alerts"
+# slack_webhook_url = "https://hooks.slack.com/services/..."  # prefer TF_VAR_slack_webhook_url

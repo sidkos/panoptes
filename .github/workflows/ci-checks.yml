@@ -82,6 +82,22 @@ jobs:
       # Python venv for the marked plan-assertion test (extended in Phase 6). Selecting
       # `-m terraform` runs ONLY the marked IaC tests against the just-validated module.
       - uses: ./.github/actions/setup-panoptes
+      # Anti-rot floor for the SECURITY-CORE terraform suite (mirrors the integration job's
+      # collect-count guard): a future marker-loss / file-rename could make the whole
+      # plan-assertion + IRSA-scoping suite vacuous-by-omission (collect 0, exit 0, green).
+      # Assert the marked set still collects at least its floor BEFORE running it.
+      - name: Assert terraform suite collects >= 15 tests (anti-rot floor)
+        run: |
+          # pytest -q prints "N tests collected" or, when deselecting, "N/M tests
+          # collected"; match the LEADING count in both forms.
+          summary=$(pytest -m terraform --collect-only -q 2>/dev/null \
+            | grep -Eo '[0-9]+(/[0-9]+)? tests? collected' || true)
+          collected=$(printf '%s' "${summary}" | grep -Eo '^[0-9]+' || echo 0)
+          echo "Collected ${collected} terraform test(s)."
+          if [ "${collected}" -lt 15 ]; then
+            echo "::error::Terraform anti-rot floor: expected >= 15, collected ${collected}."
+            exit 1
+          fi
       - run: pytest -m terraform
 
   helm:                            # hermetic chart gate — offline schema validation, no cluster

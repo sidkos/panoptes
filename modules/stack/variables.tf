@@ -1,25 +1,144 @@
 # Panoptes hosting module — input variables.
 #
-# Phase-0 SKELETON: only the load-bearing inputs needed for a valid module are declared
-# now. The full variable surface (node sizing, the GitHub OAuth allowlist, the read-role
-# ARN list, the alert topic ARN, the Slack webhook, the hostname) is finalized in Phase 6
-# alongside the resources that consume them. Defaults keep the dedicated-VPC,
-# same-account, failure-domain-independent posture (decision #1) front-and-center.
+# The full v0.2 input surface (spec § Locked decisions + § Directory Layout). Defaults keep
+# the dedicated-VPC, same-account, failure-domain-independent posture (decision #1) and the
+# single small MANAGED spot node group (decision #2). Secrets are marked `sensitive = true`
+# so Terraform redacts them in plan/apply output.
 
 variable "home_region" {
-  description = "AWS region for the dedicated Panoptes hosting account/cluster (SAME account as the observed infra; NEVER an observed cluster's region by accident — failure-domain independence is a deliberate, dedicated VPC + cluster, not co-tenancy)."
+  description = "AWS region for the dedicated Panoptes hosting cluster (SAME account as the observed infra — decision #1; never an observed cluster's region by accident, failure-domain independence is a deliberate dedicated VPC + cluster, not co-tenancy)."
   type        = string
   default     = "us-east-1"
 }
 
+# --- VPC (dedicated, same account — decision #1, failure-domain independence) ------
+
 variable "create_vpc" {
-  description = "Provision a DEDICATED VPC for the Panoptes cluster (the default and recommended posture). Set false only to attach to a pre-created, NON-observed VPC in the same account — never an observed workload's VPC (decision #1, failure-domain independence)."
+  description = "Provision a DEDICATED VPC for the Panoptes cluster (the default + recommended posture). Set false only to attach to a pre-created, NON-observed VPC in the same account — NEVER an observed workload's VPC (decision #1, K12 failure-domain independence)."
   type        = bool
   default     = true
 }
 
-variable "image_tag" {
-  description = "The immutable GHCR image tag the cluster runs (e.g. a `v0.2.x` release tag). Pinned to an immutable tag, never a moving `:latest` ref, so a republish cannot silently drift the running cluster (Risk K11)."
+variable "vpc_cidr" {
+  description = "CIDR block for the dedicated Panoptes VPC. A private /16 distinct from any observed VPC's range so the network failure domain is independent."
   type        = string
-  default     = "latest"
+  default     = "10.180.0.0/16"
+}
+
+# --- EKS control plane + node group (single small MANAGED spot group — decision #2) -
+
+variable "cluster_version" {
+  description = "The EKS control-plane Kubernetes version for the dedicated Panoptes cluster."
+  type        = string
+  default     = "1.30"
+}
+
+variable "node_instance_type" {
+  description = "Instance type for the single small managed node group (decision #2: a fixed, small, always-on stack — store + Grafana + collector + MCP + proxy — nothing to autoscale). A small default keeps cost discipline."
+  type        = string
+  default     = "t4g.small"
+}
+
+variable "node_min" {
+  description = "Minimum node count for the managed node group (a one-node monitoring stack; min 1 keeps the workloads always-on)."
+  type        = number
+  default     = 1
+}
+
+variable "node_max" {
+  description = "Maximum node count for the managed node group (a small headroom of 2 for a rolling node replacement; NOT an autoscaling target — decision #2 is no Karpenter)."
+  type        = number
+  default     = 2
+}
+
+variable "capacity_type" {
+  description = "Capacity type for the managed node group: SPOT (default, cost-disciplined) or ON_DEMAND. Single-AZ spot is acceptable for a dev/home monitoring stack (decision #2)."
+  type        = string
+  default     = "SPOT"
+}
+
+# --- Ingress + TLS + GitHub SSO (nginx + cert-manager + oauth2-proxy — decision #3/5) -
+
+variable "hostname" {
+  description = "The public hostname for the Panoptes ingress (e.g. panoptes.example.com). TLS is issued by cert-manager + Let's Encrypt (decision #3 — NOT ACM); the nginx ingress + oauth2-proxy GitHub-gate it (decision #5)."
+  type        = string
+  default     = "panoptes.example.com"
+}
+
+variable "github_oauth_client_id" {
+  description = "GitHub OAuth app client id for oauth2-proxy's `github` provider (decision #5). The MCP server holds no IdP secret — oauth2-proxy is the auth boundary."
+  type        = string
+  default     = ""
+}
+
+variable "github_oauth_client_secret" {
+  description = "GitHub OAuth app client secret for oauth2-proxy (decision #5). Sensitive — redacted in plan/apply output and never logged."
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "github_org" {
+  description = "The GitHub ORG allowlist that gates access via oauth2-proxy (decision #5 — the org/team allowlist is the access boundary)."
+  type        = string
+  default     = ""
+}
+
+variable "github_team" {
+  description = "Optional GitHub TEAM allowlist (within `github_org`) for a finer access gate. Empty = org-wide access."
+  type        = string
+  default     = ""
+}
+
+# --- Image pin (immutable tag — Risk K11) ------------------------------------------
+
+variable "image_tag" {
+  description = "The immutable GHCR image tag the cluster runs (e.g. a `v0.2.x` release tag). Pinned to an immutable tag, never a moving `:latest` ref, so a republish cannot silently drift the running cluster (Risk K11). REQUIRED (no default) — a no-default var forces the operator to pin an immutable tag rather than fall back to a moving ref."
+  type        = string
+}
+
+# --- IRSA read scope + the single write grant (the security core — decisions #1/#6) -
+
+variable "read_role_arns" {
+  description = "The per-env `PanoptesReadRole/<env>` ARNs the IRSA role may `sts:AssumeRole`, IN-ACCOUNT (decision #1 — no cross-account trust; decision #6 — Panoptes does NOT create these, the observed-side IaC owns them). Default `[]` so stage/prod stay disabled stubs that produce ZERO assume-role grants until a non-empty list is supplied (no code change)."
+  type        = list(string)
+  default     = []
+}
+
+variable "alert_topic_arn" {
+  description = "The single Panoptes-OWNED SNS alert topic ARN. The IRSA role grants `sns:Publish` on THIS ARN ONLY (resource-scoped — the one write grant in the system, on a Panoptes-owned resource). Empty = no publish grant."
+  type        = string
+  default     = ""
+}
+
+variable "slack_webhook_url" {
+  description = "The Slack incoming-webhook URL for alert delivery (a Panoptes-owned sink, not an observed system). Sensitive — redacted in plan/apply output. Consumed by the slack notifier via Helm values, not an IAM grant."
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+# --- Kubernetes namespace + service-account names (the IRSA trust-scope subjects) ---
+#
+# These pin the EXACT `system:serviceaccount:<namespace>:<sa>` subjects the IRSA trust
+# policy's `StringEquals` condition binds to (irsa.tf). Defaulted so the module is
+# self-contained; the Helm chart (Phase 7) mounts the collector + MCP pods under exactly
+# these SA names in this namespace, so the IRSA credential is scoped to those two SAs only.
+
+variable "namespace" {
+  description = "The Kubernetes namespace the Panoptes collector + MCP service accounts live in. The IRSA trust policy binds to `system:serviceaccount:<namespace>:<sa>` for exactly the collector + MCP SAs."
+  type        = string
+  default     = "panoptes"
+}
+
+variable "collector_service_account" {
+  description = "The collector pod's Kubernetes ServiceAccount name. The IRSA trust policy's `:sub` StringEquals pins to this SA (in `namespace`) — scoping the assume-role credential to the collector pod only (K9)."
+  type        = string
+  default     = "panoptes-collector"
+}
+
+variable "mcp_service_account" {
+  description = "The MCP pod's Kubernetes ServiceAccount name. The IRSA trust policy's `:sub` StringEquals pins to this SA (in `namespace`) — scoping the assume-role credential to the MCP pod only (K9)."
+  type        = string
+  default     = "panoptes-mcp"
 }

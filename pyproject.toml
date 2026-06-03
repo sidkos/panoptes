@@ -27,6 +27,11 @@ dev = [
     "boto3-stubs[cloudwatch,logs,sts,sns]>=1.34",
     "types-PyYAML>=6.0",
     "yamllint>=1.35",
+    # Hermetic static `.tf` parsing for the Terraform plan-assertion test (Risk K3 — assert
+    # on the rendered config, never a live `apply`/creds). `python-hcl2` parses the module's
+    # HCL into plain dicts so the IRSA-scoping / resource-scoped-publish / no-wildcard-write
+    # invariants are asserted offline with no AWS access.
+    "python-hcl2>=4.3",
 ]
 
 [tool.setuptools.packages.find]
@@ -66,14 +71,14 @@ files = ["core", "examples", "tests"]
 # `kubernetes` ships no py.typed (Risk K5), so its import is untyped; the source wraps
 # the client surface behind a small local Protocol so `disallow_any_explicit` stays
 # satisfied (the `_FastMcpAdapter` pattern). Only deps without type stubs go here.
-module = ["fastmcp.*", "testcontainers.*", "respx.*", "kubernetes.*"]
+module = ["fastmcp.*", "testcontainers.*", "respx.*", "kubernetes.*", "hcl2.*"]
 ignore_missing_imports = true       # only for deps that ship no type stubs
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-markers"
 markers = [
     "integration: requires docker-compose / testcontainers (opt-in, slow)",
-    "terraform: requires the terraform binary; runs the hermetic IaC validate gate (opt-in)",
+    "terraform: the hermetic IaC gate (opt-in). Two kinds of marked test: hcl2-only static-parse plan-assertion tests (need NO terraform binary — they parse modules/stack/*.tf with python-hcl2) AND terraform-binary validate/fmt tests (need the terraform binary). The CI terraform job installs the binary and runs the full marked set.",
     "helm: requires the helm + kubeconform binaries; runs the hermetic chart render gate (opt-in)",
 ]
 testpaths = ["tests"]

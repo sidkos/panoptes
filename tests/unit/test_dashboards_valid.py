@@ -264,18 +264,25 @@ def test_provision_pings_grafana_when_url_configured(tmp_path: Path) -> None:
 # --- negative paths this phase owns ---------------------------------------------
 
 
-def test_git_selected_consumer_pack_raises_capability_error(tmp_path: Path) -> None:
-    """A git-selected consumer pack raises CapabilityError at provision (v0.2 deferral)."""
+def test_git_selected_consumer_pack_without_sha_pin_is_rejected(tmp_path: Path) -> None:
+    """A git-selected consumer pack with NO full-SHA pin is rejected (v0.2 security gate).
+
+    v0.2 implements the git path: the pinned ref MUST be a full 40-hex commit SHA (a
+    code-execution trust boundary). A git pack with no `git_ref` (or a non-SHA ref) is
+    rejected with a clear CapabilityError naming the SHA-pin requirement. The full git
+    acceptance/rejection matrix lives in `tests/unit/test_dashboards_git_injection.py`.
+    """
     git_pack = DashboardPack(
         id="consumer",
         tier="consumer",
         json_path=Path("https://example.invalid/repo.git"),
         selector="git",
+        git_ref=None,
     )
     with pytest.raises(CapabilityError) as excinfo:
         _provider(tmp_path / "provisioning").provision([git_pack])
-    assert "git injection is v0.2" in str(excinfo.value)
-    assert "`path`" in str(excinfo.value)
+    message = str(excinfo.value).lower()
+    assert "sha" in message or "immutable" in message
 
 
 def test_unknown_core_pack_id_fails_fast_naming_the_pack(tmp_path: Path) -> None:
