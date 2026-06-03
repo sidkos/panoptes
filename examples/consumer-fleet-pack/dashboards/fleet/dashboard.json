@@ -1,0 +1,91 @@
+{
+  "title": "Fleet",
+  "uid": null,
+  "tags": ["panoptes", "consumer", "fleet"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "templating": {
+    "list": [
+      {
+        "name": "env",
+        "type": "query",
+        "label": "Environment",
+        "datasource": "VictoriaMetrics",
+        "query": "label_values(panoptes_fleet_ready, env)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": false,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Ready replicas",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 0 },
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum (panoptes_fleet_ready{env=~\"$env\"})",
+          "legendFormat": "ready"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Allocated replicas",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 0 },
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum (panoptes_fleet_allocated{env=~\"$env\"})",
+          "legendFormat": "allocated"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Reserved replicas",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 0 },
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum (panoptes_fleet_reserved{env=~\"$env\"})",
+          "legendFormat": "reserved"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Fleet replicas over time",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
+      "datasource": "VictoriaMetrics",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum (panoptes_fleet_ready{env=~\"$env\"})",
+          "legendFormat": "ready"
+        },
+        {
+          "refId": "B",
+          "expr": "sum (panoptes_fleet_allocated{env=~\"$env\"})",
+          "legendFormat": "allocated"
+        },
+        {
+          "refId": "C",
+          "expr": "sum (panoptes_fleet_reserved{env=~\"$env\"})",
+          "legendFormat": "reserved"
+        }
+      ]
+    }
+  ]
+}

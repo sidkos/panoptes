@@ -67,6 +67,17 @@ warn_unreachable = true
 disallow_any_explicit = true        # enforces the no-Any discipline
 disallow_any_generics = true
 files = ["core", "examples", "tests"]
+# Each example consumer pack ships its own top-level `pack.py` under a HYPHENATED dir
+# (`examples/demo-pack/`, `examples/consumer-fleet-pack/`). A hyphen is not a valid module
+# identifier, so mypy cannot derive a distinct dotted name from the path and collapses both
+# to the bare stem `pack` — two modules with the same name in one run is a hard mypy error
+# (and `__init__.py` can't live under a hyphenated dir). So the example `pack.py` files are
+# EXCLUDED from the project-wide walk here and type-checked INDIVIDUALLY by the precommit
+# gate (one mypy invocation per pack — see `scripts/precommit.sh`), which keeps full strict
+# coverage on each pack while sidestepping the same-name collision. The runtime
+# `PANOPTES_CONSUMER_PACK` hook imports them by their hyphenated path via importlib, so the
+# dir names stay as-is.
+exclude = ['examples/[^/]+/pack\.py$']
 
 [[tool.mypy.overrides]]
 # `kubernetes` ships no py.typed (Risk K5), so its import is untyped; the source wraps

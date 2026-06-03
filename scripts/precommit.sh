@@ -12,10 +12,11 @@
 #   3. yamllint .                            -> lint-type:  `yamllint .`
 #   4. actionlint (best-effort local)        -> lint-type:  actionlint download-and-run
 #   5. mypy --strict .                       -> lint-type:  `mypy --strict .`
-#   6. pytest (--cov=core --fail-under=85)   -> unit:       first coverage run
-#   7. pytest (--cov=core.sources,core.mcp)  -> unit:       second (--cov-append) run
-#   8. boundary guards                       -> guards:     the two purity guards
-#   9. brand-neutrality grep                 -> (local-only invariant; CI has its own)
+#   6. mypy --strict (example packs)         -> lint-type:  one run per `examples/*/pack.py`
+#   7. pytest (--cov=core --fail-under=85)   -> unit:       first coverage run
+#   8. pytest (--cov=core.sources,core.mcp)  -> unit:       second (--cov-append) run
+#   9. boundary guards                       -> guards:     the two purity guards
+#  10. brand-neutrality grep                 -> (local-only invariant; CI has its own)
 # The integration suite maps to the `integration` job and runs via the `integration`
 # mode (Docker-gated), kept out of the default `sca` loop.
 #
@@ -135,16 +136,48 @@ run_actionlint_step() {
   fi
 }
 
+# Each example consumer pack ships a top-level `pack.py` under a HYPHENATED dir, so the two
+# `pack.py` files collide as one module name `pack` under a single `mypy .` run (and a
+# hyphenated dir can't host an `__init__.py`). They are EXCLUDED from the project-wide
+# `mypy --strict .` (pyproject `[tool.mypy] exclude`) and type-checked HERE — one strict
+# invocation PER pack — so each keeps full strict coverage without the same-name collision.
+run_example_packs_mypy_step() {
+  STEP_INDEX=$((STEP_INDEX + 1))
+  printf '[%d/%d] %s ... ' "${STEP_INDEX}" "${STEP_TOTAL}" "mypy --strict (example packs)"
+  local start_seconds
+  start_seconds="$(date +%s)"
+  local output=""
+  local run_status=0
+  local pack
+  # One mypy run per pack.py — separate invocations avoid the duplicate-module-name error.
+  for pack in examples/*/pack.py; do
+    [[ -e "${pack}" ]] || continue
+    output+="$("${MYPY}" --strict "${pack}" 2>&1)" || run_status=$?
+  done
+  local elapsed=$(( $(date +%s) - start_seconds ))
+  if [[ "${run_status}" -eq 0 ]]; then
+    printf 'PASS (%ds)\n' "${elapsed}"
+  else
+    printf 'FAIL (%ds)\n' "${elapsed}"
+    echo "----- mypy --strict (example packs) output -----"
+    echo "${output}"
+    echo "------------------------------------------------"
+    FAILED_STEP="mypy --strict (example packs)"
+    exit "${run_status}"
+  fi
+}
+
 # --- mode: sca (default) -----------------------------------------------------------
 run_sca() {
   echo "Panoptes pre-commit gate — sca (full local mirror of CI)"
-  STEP_TOTAL=9
+  STEP_TOTAL=10
   STEP_INDEX=0
   run_step "ruff check" "${RUFF}" check .
   run_step "ruff format --check" "${RUFF}" format --check .
   run_step "yamllint" "${YAMLLINT}" .
   run_actionlint_step
   run_step "mypy --strict" "${MYPY}" --strict .
+  run_example_packs_mypy_step
   run_step "pytest (core coverage >= 85%)" \
     "${PYTEST}" -m "not integration and not terraform and not helm" \
     --cov=core --cov-fail-under=85
@@ -159,16 +192,17 @@ run_sca() {
 
 # --- mode: fast --------------------------------------------------------------------
 # The tight inner loop: static analysis + guards + brand check, skipping the two
-# (slow) coverage pytest runs. Steps 1-5 + 8 + 9 of the sca sequence.
+# (slow) coverage pytest runs. Steps 1-6 + 9 + 10 of the sca sequence.
 run_fast() {
   echo "Panoptes pre-commit gate — fast (static + guards, no coverage)"
-  STEP_TOTAL=7
+  STEP_TOTAL=8
   STEP_INDEX=0
   run_step "ruff check" "${RUFF}" check .
   run_step "ruff format --check" "${RUFF}" format --check .
   run_step "yamllint" "${YAMLLINT}" .
   run_actionlint_step
   run_step "mypy --strict" "${MYPY}" --strict .
+  run_example_packs_mypy_step
   run_step "boundary guards" \
     "${PYTEST}" tests/unit/test_core_purity_guard.py tests/unit/test_no_write_actions_guard.py
   check_brand_neutral

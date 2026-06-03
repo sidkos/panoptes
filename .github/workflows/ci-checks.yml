@@ -14,6 +14,17 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
       - run: mypy --strict .
+      # Each example consumer pack ships a top-level `pack.py` under a HYPHENATED dir, so the
+      # two `pack.py` files collide as one module name under `mypy .` (and a hyphenated dir
+      # cannot host an `__init__.py`). They are excluded from `mypy --strict .` (pyproject
+      # `[tool.mypy] exclude`) and type-checked HERE — one strict run per pack — so each keeps
+      # full strict coverage without the duplicate-module-name error. Mirrors the local gate's
+      # `run_example_packs_mypy_step`.
+      - name: mypy --strict (example packs, one run per pack)
+        run: |
+          for pack in examples/*/pack.py; do
+            mypy --strict "$pack"
+          done
       # YAML lint runs after the Python gate. yamllint is installed via the
       # `.[dev]` extra in setup-panoptes, so it is on PATH here.
       - run: yamllint .
