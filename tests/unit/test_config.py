@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from core.alerts import Comparison
 from core.config import (
     PlaneRegistries,
     ResolvedConfig,
@@ -539,6 +540,100 @@ def test_unregistered_notifier_type_fails_fast(
         load_config(config_path, registries=_registries_with_correct_capabilities())
     assert isinstance(excinfo.value, UnknownAdapterError)
     assert "not-a-real-notifier" in str(excinfo.value)
+
+
+# --- v0.2: declarative alert rules (`alerts:` block) -----------------------------
+
+_ALERTS_BLOCK = """
+  alerts:
+    - name: crashloop-high
+      expr: panoptes_k8s_pods_crashloop
+      comparison: gt
+      threshold: 0
+      for_cycles: 3
+      severity: critical
+      envs: [dev, stage]
+      labels:
+        team: platform
+    - name: nodes-low
+      expr: panoptes_k8s_node_count
+      comparison: lt
+      threshold: 1
+"""
+
+
+def test_alerts_parse_to_typed_alert_rules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An `alerts:` block parses to typed `AlertRule`s — enum resolved, defaults applied."""
+    _set_reference_env(monkeypatch)
+    body = _REFERENCE_YAML + _ALERTS_BLOCK
+    config_path = _write_fixture(tmp_path, body)
+    resolved = load_config(config_path, registries=_registries_with_correct_capabilities())
+    assert len(resolved.alerts) == 2
+    by_name = {rule.name: rule for rule in resolved.alerts}
+
+    crashloop = by_name["crashloop-high"]
+    # The comparison string resolved to the Comparison enum.
+    assert crashloop.comparison is Comparison.GT
+    assert crashloop.threshold == 0.0
+    assert crashloop.for_cycles == 3
+    assert crashloop.severity == "critical"
+    assert crashloop.envs == ["dev", "stage"]
+    assert crashloop.labels == {"team": "platform"}
+
+    # The second rule exercises the DEFAULTS (for_cycles=1, severity=warning, envs=["all"]).
+    nodes_low = by_name["nodes-low"]
+    assert nodes_low.comparison is Comparison.LT
+    assert nodes_low.for_cycles == 1
+    assert nodes_low.severity == "warning"
+    assert nodes_low.envs == ["all"]
+    assert nodes_low.labels == {}
+
+
+def test_config_without_alerts_block_resolves_to_empty_alert_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A config with no `alerts:` block resolves to an empty alert list (not an error)."""
+    _set_reference_env(monkeypatch)
+    config_path = _write_fixture(tmp_path)  # the reference YAML has no alerts:
+    resolved = load_config(config_path, registries=_registries_with_correct_capabilities())
+    assert resolved.alerts == []
+
+
+def test_unknown_comparison_fails_fast(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unknown `comparison` fails fast with a clear PanoptesError (not stdlib ValueError)."""
+    _set_reference_env(monkeypatch)
+    bad_alert = (
+        "\n  alerts:\n"
+        "    - name: bogus\n"
+        "      expr: panoptes_k8s_node_count\n"
+        "      comparison: approximately-equals\n"
+        "      threshold: 1\n"
+    )
+    config_path = _write_fixture(tmp_path, _REFERENCE_YAML + bad_alert)
+    with pytest.raises(PanoptesError) as excinfo:
+        load_config(config_path, registries=_registries_with_correct_capabilities())
+    # Hierarchy-correct (a PanoptesError, never a stdlib ValueError escaping the handler).
+    assert not isinstance(excinfo.value, ValueError) or isinstance(excinfo.value, PanoptesError)
+    message = str(excinfo.value)
+    assert "bogus" in message
+    assert "approximately-equals" in message
+
+
+def test_alert_missing_required_field_fails_fast(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An alert rule missing a required field (here `threshold`) fails fast."""
+    _set_reference_env(monkeypatch)
+    missing_threshold = (
+        "\n  alerts:\n"
+        "    - name: no-threshold\n"
+        "      expr: panoptes_k8s_node_count\n"
+        "      comparison: gt\n"
+    )
+    config_path = _write_fixture(tmp_path, _REFERENCE_YAML + missing_threshold)
+    with pytest.raises(PanoptesError) as excinfo:
+        load_config(config_path, registries=_registries_with_correct_capabilities())
+    assert "threshold" in str(excinfo.value)
 
 
 # --- PlaneRegistries test-isolation seam -----------------------------------------

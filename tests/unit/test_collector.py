@@ -26,6 +26,7 @@ import threading
 from datetime import UTC, datetime
 
 import pytest
+from core.alerts import AlertRule, Comparison
 from core.collector import Collector
 from core.config import ResolvedConfig, ResolvedEnvironment, ResolvedSource
 from core.model import (
@@ -38,6 +39,7 @@ from core.model import (
     SourceHealth,
     TimeWindow,
 )
+from core.planes.notifier import Notifier
 
 
 def _now() -> datetime:
@@ -180,19 +182,34 @@ class _WriteFailingStore(_RecordingStore):
 
 
 class _FakeNotifier:
+    """A `Notifier` recording every `Alert` it is handed (for the alert-wiring tests)."""
+
     type = "logging"
 
+    def __init__(self) -> None:
+        self.alerts: list[Alert] = []
+
     def notify(self, alert: Alert) -> None:
-        return None
+        self.alerts.append(alert)
 
 
-def _config(environments: dict[str, ResolvedEnvironment], store: _RecordingStore) -> ResolvedConfig:
+def _config(
+    environments: dict[str, ResolvedEnvironment],
+    store: _RecordingStore,
+    *,
+    notifiers: list[_FakeNotifier] | None = None,
+    alerts: list[AlertRule] | None = None,
+) -> ResolvedConfig:
+    # Annotate the local as `list[Notifier]` so the invariant `ResolvedConfig.notifiers`
+    # field accepts our `_FakeNotifier`s (the structural-Protocol element widens here).
+    notifier_list: list[Notifier] = list(notifiers) if notifiers is not None else [_FakeNotifier()]
     return ResolvedConfig(
         environments=environments,
         store=store,
-        notifiers=[_FakeNotifier()],
+        notifiers=notifier_list,
         dashboard_packs=[],
         slos=[],
+        alerts=alerts if alerts is not None else [],
         mcp={},
     )
 
@@ -466,3 +483,273 @@ def test_scheduled_run_loops_until_sleep_breaks() -> None:
 
     # One fetch per cycle; the loop sleeps between cycles, breaking on the 3rd sleep.
     assert source.fetch_calls == 3
+
+
+# --- v0.2: alert-rule evaluation wiring ------------------------------------------
+
+
+class _QueryableStore(_RecordingStore):
+    """A `_RecordingStore` that ALSO answers PromQL with a fixed value per env.
+
+    `write` records batches (so the "evaluated AFTER the write" ordering can be asserted);
+    `query` returns a one-point series at `value_by_env[env]` for whichever env the rule
+    targets (the value is keyed by the env carried in the query's selector — here the test
+    sets one value per env directly).
+    """
+
+    def __init__(self, value: float, *, env: str = "dev") -> None:
+        super().__init__()
+        self._value = value
+        self._env = env
+        self.query_calls = 0
+        # Recorded so a test can assert rules were evaluated AFTER the store write.
+        self.write_then_query_order: list[str] = []
+
+    def write(self, signals: list[CanonicalSignal]) -> None:
+        super().write(signals)
+        self.write_then_query_order.append("write")
+
+    def query(self, query: MetricQuery) -> list[MetricSeries]:
+        self.query_calls += 1
+        self.write_then_query_order.append("query")
+        return [
+            MetricSeries(
+                metric="panoptes_k8s_pods_crashloop",
+                labels={"env": self._env},
+                points=[(_now(), self._value)],
+            )
+        ]
+
+
+def _crashloop_rule(
+    *, for_cycles: int = 1, envs: list[str] | None = None, threshold: float = 0.0
+) -> AlertRule:
+    return AlertRule(
+        name="crashloop-high",
+        expr="panoptes_k8s_pods_crashloop",
+        comparison=Comparison.GT,
+        threshold=threshold,
+        for_cycles=for_cycles,
+        severity="critical",
+        envs=envs if envs is not None else ["dev"],
+        labels={"team": "platform"},
+    )
+
+
+def test_rules_are_evaluated_after_the_store_write() -> None:
+    """Alert rules are evaluated AFTER the per-cycle fetch/store write (ordering)."""
+    store = _QueryableStore(5.0)  # 5 > 0 → breach
+    source = _FakeSource("dev", "cloudwatch")
+    env = _enabled_env("dev", [_resolved(source)])
+    collector = Collector(_config({"dev": env}, store, alerts=[_crashloop_rule()]))
+
+    collector.run_once()
+
+    # The store was written before any rule query ran this cycle.
+    assert store.write_then_query_order[0] == "write"
+    assert "query" in store.write_then_query_order
+    assert store.write_then_query_order.index("write") < store.write_then_query_order.index("query")
+
+
+def test_firing_rule_notifies_every_configured_notifier() -> None:
+    """A firing rule calls `notify()` on EVERY configured notifier with the alert."""
+    store = _QueryableStore(5.0)  # breach
+    source = _FakeSource("dev", "cloudwatch")
+    env = _enabled_env("dev", [_resolved(source)])
+    notifier_a = _FakeNotifier()
+    notifier_b = _FakeNotifier()
+    collector = Collector(
+        _config({"dev": env}, store, notifiers=[notifier_a, notifier_b], alerts=[_crashloop_rule()])
+    )
+
+    collector.run_once()
+
+    # Both notifiers received the fired alert.
+    assert len(notifier_a.alerts) == 1
+    assert len(notifier_b.alerts) == 1
+    fired = notifier_a.alerts[0]
+    assert fired.name == "crashloop-high"
+    assert fired.labels["env"] == "dev"
+    assert fired.labels["team"] == "platform"
+
+
+def test_for_cycles_debounce_fires_only_after_n_cycles() -> None:
+    """A `for_cycles=3` rule fires `notify()` only on the third consecutive breaching cycle."""
+    store = _QueryableStore(5.0)  # breach every cycle
+    source = _FakeSource("dev", "cloudwatch")
+    env = _enabled_env("dev", [_resolved(source)])
+    notifier = _FakeNotifier()
+    collector = Collector(
+        _config({"dev": env}, store, notifiers=[notifier], alerts=[_crashloop_rule(for_cycles=3)])
+    )
+
+    collector.run_once()  # cycle 1 breach — no fire
+    assert notifier.alerts == []
+    collector.run_once()  # cycle 2 breach — no fire
+    assert notifier.alerts == []
+    collector.run_once()  # cycle 3 breach — FIRE
+    assert len(notifier.alerts) == 1
+
+
+def test_resolve_fires_notify_once_on_the_transition() -> None:
+    """A non-breach cycle after firing fires `notify()` once (the resolve transition)."""
+
+    # A store whose value we flip between cycles via a mutable holder.
+    class _FlippingStore(_RecordingStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.value = 5.0  # start breaching
+
+        def query(self, query: MetricQuery) -> list[MetricSeries]:
+            return [
+                MetricSeries(
+                    metric="panoptes_k8s_pods_crashloop",
+                    labels={"env": "dev"},
+                    points=[(_now(), self.value)],
+                )
+            ]
+
+    store = _FlippingStore()
+    source = _FakeSource("dev", "cloudwatch")
+    env = _enabled_env("dev", [_resolved(source)])
+    notifier = _FakeNotifier()
+    collector = Collector(
+        _config({"dev": env}, store, notifiers=[notifier], alerts=[_crashloop_rule()])
+    )
+
+    collector.run_once()  # breach → FIRE (1 notify)
+    assert len(notifier.alerts) == 1
+    store.value = 0.0  # 0 > 0 is False → non-breach
+    collector.run_once()  # non-breach after firing → RESOLVE (1 more notify)
+    assert len(notifier.alerts) == 2
+    collector.run_once()  # still non-breach → no further notify (already resolved)
+    assert len(notifier.alerts) == 2
+
+
+def test_evaluate_raising_is_caught_and_does_not_abort_cycle(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An `evaluate` raising is caught + logged; OTHER rules/envs still process (resilience).
+
+    The store's `query` raises a NON-PanoptesError (a genuine bug shape, which `evaluate`
+    does NOT swallow), so the collector's own resilience boundary must catch it — one bad
+    rule never aborts the cycle.
+    """
+
+    class _ExplodingQueryStore(_RecordingStore):
+        def query(self, query: MetricQuery) -> list[MetricSeries]:
+            raise RuntimeError("query backend exploded")
+
+    store = _ExplodingQueryStore()
+    source = _FakeSource("dev", "cloudwatch")
+    env = _enabled_env("dev", [_resolved(source)])
+    notifier = _FakeNotifier()
+    collector = Collector(
+        _config({"dev": env}, store, notifiers=[notifier], alerts=[_crashloop_rule()])
+    )
+
+    with caplog.at_level(logging.ERROR, logger="core.collector"):
+        collector.run_once()  # must NOT raise
+
+    # The cycle completed (the source was still fetched + written); the bad eval was logged.
+    assert source.fetch_calls == 1
+    assert "crashloop-high" in caplog.text or "alert" in caplog.text.lower()
+
+
+def test_disabled_env_rules_are_not_evaluated() -> None:
+    """A rule scoped to a disabled env is never evaluated (disabled envs are inert)."""
+    store = _QueryableStore(5.0, env="stage")
+    live = _FakeSource("dev", "cloudwatch")
+    config = _config(
+        {
+            "dev": _enabled_env("dev", [_resolved(live)]),
+            "stage": ResolvedEnvironment(name="stage", enabled=False, sources=[]),
+        },
+        store,
+        alerts=[_crashloop_rule(envs=["stage"])],  # only targets the DISABLED env
+    )
+    notifier = config.notifiers[0]
+    assert isinstance(notifier, _FakeNotifier)
+    collector = Collector(config)
+
+    collector.run_once()
+
+    # The disabled env's rule never evaluated → no alert fired.
+    assert notifier.alerts == []
+
+
+def test_all_envs_rule_evaluated_for_every_enabled_env() -> None:
+    """An `envs:["all"]` rule is evaluated for EVERY enabled env (fans out)."""
+
+    # Both envs breach (the store returns the breaching value regardless of env selector).
+    class _AllEnvStore(_RecordingStore):
+        def query(self, query: MetricQuery) -> list[MetricSeries]:
+            # Return a breaching series for BOTH dev and stage so the all-envs rule fires
+            # once per enabled env.
+            return [
+                MetricSeries(
+                    metric="panoptes_k8s_pods_crashloop",
+                    labels={"env": "dev"},
+                    points=[(_now(), 5.0)],
+                ),
+                MetricSeries(
+                    metric="panoptes_k8s_pods_crashloop",
+                    labels={"env": "stage"},
+                    points=[(_now(), 5.0)],
+                ),
+            ]
+
+    store = _AllEnvStore()
+    config = _config(
+        {
+            "dev": _enabled_env("dev", [_resolved(_FakeSource("dev", "cloudwatch"))]),
+            "stage": _enabled_env("stage", [_resolved(_FakeSource("stage", "cloudwatch"))]),
+        },
+        store,
+        alerts=[_crashloop_rule(envs=["all"])],
+    )
+    notifier = config.notifiers[0]
+    assert isinstance(notifier, _FakeNotifier)
+    collector = Collector(config)
+
+    collector.run_once()
+
+    # The all-envs rule fired once for dev and once for stage (two distinct alerts).
+    assert len(notifier.alerts) == 2
+    fired_envs = {alert.labels["env"] for alert in notifier.alerts}
+    assert fired_envs == {"dev", "stage"}
+
+
+def test_notifier_delivery_failure_is_caught_and_other_notifiers_still_run(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A notifier raising on delivery is caught + logged; the OTHER notifiers still run.
+
+    One failing delivery channel (e.g. an SNS publish error) must not abort the cycle or
+    starve the remaining notifiers — the same per-channel resilience the collector applies
+    everywhere.
+    """
+
+    class _ExplodingNotifier(_FakeNotifier):
+        type = "exploding"
+
+        def notify(self, alert: Alert) -> None:
+            raise RuntimeError("delivery channel down")
+
+    exploding = _ExplodingNotifier()
+    healthy = _FakeNotifier()
+    store = _QueryableStore(5.0)  # breach → fire
+    source = _FakeSource("dev", "cloudwatch")
+    env = _enabled_env("dev", [_resolved(source)])
+    # The exploding notifier is first so a non-resilient impl would never reach `healthy`.
+    config = _config(
+        {"dev": env}, store, notifiers=[exploding, healthy], alerts=[_crashloop_rule()]
+    )
+    collector = Collector(config)
+
+    with caplog.at_level(logging.ERROR, logger="core.collector"):
+        collector.run_once()  # must NOT raise
+
+    # The healthy notifier still received the alert despite the exploding sibling.
+    assert len(healthy.alerts) == 1
+    assert "exploding" in caplog.text or "deliver" in caplog.text.lower()

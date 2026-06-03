@@ -48,8 +48,9 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 
+from core.alerts import AlertRule, AlertState, evaluate, rule_applies_to_env
 from core.config import ResolvedConfig, ResolvedSource, load_config
-from core.model import CanonicalSignal, TimeWindow
+from core.model import Alert, CanonicalSignal, TimeWindow
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -119,6 +120,11 @@ class Collector:
         # instance so it persists across run_once() calls (the test seam for driving
         # M cycles on ONE collector).
         self._failure_states: dict[tuple[str, str], _FailureState] = {}
+        # Per-(rule, env) alert debounce/firing state, keyed by (rule.name, env_name) —
+        # SAME lifetime pattern as `_failure_states`: held on the instance so the
+        # `for_cycles` debounce + fire/resolve transitions advance one cycle per
+        # `run_once()` call with NO wall-clock sleep (the alert test seam).
+        self._alert_states: dict[tuple[str, str], AlertState] = {}
 
     @staticmethod
     def _default_sleep(seconds: float) -> None:
@@ -147,17 +153,104 @@ class Collector:
             self._sleep(poll_interval_seconds)
 
     def run_once(self) -> None:
-        """Execute exactly one collection cycle across every enabled environment."""
+        """Execute exactly one collection cycle across every enabled environment.
+
+        For each enabled env: fetch + store every source, THEN evaluate every alert rule
+        that applies to the env against the freshly-written store (so a rule sees this
+        cycle's data). Disabled envs are wired-but-inert — no fetch, no rule evaluation.
+        """
         window = self._window_factory()
         # One short-lived executor per cycle bounds every fetch and is torn down at
         # the end of the cycle (a leaked slow worker thread cannot outlive the run).
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix="panoptes-fetch") as executor:
             for env in self._config.environments.values():
                 if not env.enabled:
-                    # Disabled envs are wired-but-inert: no health/fetch/write.
+                    # Disabled envs are wired-but-inert: no health/fetch/write, and no
+                    # rule evaluation (a rule scoped to a disabled env never evaluates).
                     continue
                 for resolved_source in env.sources:
                     self._collect_source(env.name, resolved_source, window, executor)
+                # Alert rules are evaluated AFTER this env's sources are written, so a
+                # rule reads the value this cycle just stored (not last cycle's).
+                self._evaluate_alerts_for_env(env.name)
+
+    def _evaluate_alerts_for_env(self, env_name: str) -> None:
+        """Evaluate every applicable alert rule for `env_name`, firing/resolving as needed.
+
+        For each rule whose `envs` includes this env (or `["all"]`): run `evaluate` against
+        the store, advance the per-`(rule, env)` `AlertState`, and call `notify()` on EVERY
+        configured notifier on a FIRE (the debounced breach run reaches `for_cycles`) and on
+        a RESOLVE (the first non-breach after firing). A rule whose evaluation RAISES (a
+        genuine bug — `evaluate` already swallows store-can't-answer as a non-breach) is
+        caught + logged here and skipped, so one bad rule never aborts the cycle (the same
+        resilience boundary the source loop uses).
+        """
+        for rule in self._config.alerts:
+            if not rule_applies_to_env(rule, env_name):
+                continue
+            try:
+                self._evaluate_one_rule(rule, env_name)
+            # Resilience boundary: a rule evaluation raising (e.g. the store backend itself
+            # erroring with a non-PanoptesError) is caught + logged; sibling rules + envs
+            # still process. `evaluate` already treats a store-can't-answer as a non-breach,
+            # so this catches only genuine bugs, never the expected no-data path.
+            except Exception as exc:
+                _LOGGER.error(
+                    f"alert rule '{rule.name}' evaluation failed for env={env_name}: {exc}; "
+                    f"skipping this rule for this cycle and continuing"
+                )
+
+    def _evaluate_one_rule(self, rule: AlertRule, env_name: str) -> None:
+        """Evaluate one rule for one env, advancing its `AlertState` and firing on transition.
+
+        Builds (or reuses) the per-`(rule, env)` `AlertState`, runs `evaluate`, and on a
+        FIRE or RESOLVE transition dispatches the alert to every notifier. The `AlertState`
+        persists across cycles on the collector instance, so the `for_cycles` debounce
+        advances one cycle per call with no sleep.
+        """
+        state = self._alert_states.setdefault((rule.name, env_name), AlertState())
+        alert = evaluate(rule, env_name, self._config.store)
+        if alert is not None:
+            # A breach this cycle: advance the debounce; fire on the transition.
+            if state.record_breach(rule.for_cycles):
+                self._dispatch_alert(alert)
+        # A non-breach this cycle: reset the counter; fire a RESOLVE on the transition.
+        elif state.record_non_breach():
+            self._dispatch_alert(self._resolve_alert(rule, env_name))
+
+    def _dispatch_alert(self, alert: Alert) -> None:
+        """Send `alert` to EVERY configured notifier, resiliently.
+
+        A notifier raising (e.g. an SNS publish error) is caught + logged so one failing
+        delivery channel never aborts the cycle or starves the other notifiers — the same
+        per-channel resilience the rest of the collector applies.
+        """
+        for notifier in self._config.notifiers:
+            try:
+                notifier.notify(alert)
+            # Resilience boundary: a notifier delivery failure is caught + logged; the
+            # remaining notifiers + the rest of the cycle still run.
+            except Exception as exc:
+                _LOGGER.error(
+                    f"notifier '{notifier.type}' failed to deliver alert "
+                    f"'{alert.name}': {exc}; continuing with the remaining notifiers"
+                )
+
+    @staticmethod
+    def _resolve_alert(rule: AlertRule, env_name: str) -> Alert:
+        """Build the RESOLVE-transition `Alert` for a rule that just stopped breaching.
+
+        Carries the rule's labels + env (mirroring a fired alert) with a `resolved` severity
+        marker and a clear resolve message, so a notifier sees the recovery distinctly from
+        the original fire.
+        """
+        labels: dict[str, str] = {**rule.labels, "env": env_name}
+        return Alert(
+            name=rule.name,
+            severity="resolved",
+            message=f"alert '{rule.name}' resolved in env {env_name} (no longer breaching)",
+            labels=labels,
+        )
 
     def _collect_source(
         self,

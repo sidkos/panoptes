@@ -22,12 +22,13 @@ fakes; production passes the four module registries (the default).
 import os
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypedDict, cast
 
 import yaml
 
+from core.alerts import AlertRule, Comparison
 from core.errors import CapabilityMismatchError, MissingEnvVarError, PanoptesError
 from core.model import DashboardPack, SignalKind
 from core.planes.dashboard import DashboardProvider
@@ -129,6 +130,25 @@ class McpConfig(TypedDict, total=False):
     tools: list[str]
 
 
+class AlertRuleConfig(TypedDict, total=False):
+    """One declarative alert rule entry under `alerts:` (spec § Alert-rule model).
+
+    `name`/`expr`/`comparison`/`threshold` are required; `for_cycles` (debounce, default
+    1), `severity` (default `warning`), `envs` (default `["all"]`), and `labels` are
+    optional. `comparison` is one of the `Comparison` enum values (`gt`/`ge`/`lt`/`le`);
+    an unknown value fails fast at resolve time.
+    """
+
+    name: str
+    expr: str
+    comparison: str
+    threshold: float
+    for_cycles: int
+    severity: str
+    envs: list[str]
+    labels: dict[str, str]
+
+
 class _PanoptesBody(TypedDict, total=False):
     """The body under the top-level `panoptes:` key."""
 
@@ -137,6 +157,7 @@ class _PanoptesBody(TypedDict, total=False):
     notifiers: list[NotifierConfig]
     dashboards: DashboardsConfig
     slos: list[SloConfig]
+    alerts: list[AlertRuleConfig]
     mcp: McpConfig
 
 
@@ -193,7 +214,15 @@ class ResolvedConfig:
     notifiers: list[Notifier]
     dashboard_packs: list[DashboardPack]
     slos: list[SloConfig]
-    mcp: McpConfig
+    # The declarative alert rules the collector evaluates each cycle (v0.2). Defaults to
+    # empty so the many existing keyword-arg construction sites (tests + the MCP query
+    # context) need not pass `alerts=[]`; `load_config` always supplies the resolved list.
+    # `mcp` is given a default too because a dataclass field with a default cannot precede
+    # one without — an mcp-less config is a valid (tool-less) server, so `{}` is correct.
+    alerts: list[AlertRule] = field(default_factory=list)
+    # `McpConfig()` (not `dict`) as the factory so the default is typed `McpConfig`, not
+    # `dict[Never, Never]` — `McpConfig` is `total=False`, so an empty instance is valid.
+    mcp: McpConfig = field(default_factory=McpConfig)
 
 
 @dataclass(frozen=True)
@@ -445,6 +474,77 @@ def _resolve_dashboard_packs(dashboards: DashboardsConfig) -> list[DashboardPack
     return packs
 
 
+def _resolve_alerts(raw_alerts: list[AlertRuleConfig]) -> list[AlertRule]:
+    """Parse the `alerts:` block into typed `AlertRule`s, failing fast on errors.
+
+    Each entry requires `name`, `expr`, `comparison`, and `threshold`; `for_cycles`
+    (default 1), `severity` (default `warning`), `envs` (default `["all"]`), and `labels`
+    (default `{}`) are optional. The `comparison` string is mapped onto the `Comparison`
+    enum; an unknown value raises a clear `PanoptesError` (hierarchy-correct, NOT a stdlib
+    `ValueError` that would escape a caller's `except PanoptesError`). String fields are
+    `${VAR}`-interpolated (so an alert can reference an env var, e.g. in a label value).
+    """
+    rules: list[AlertRule] = []
+    for index, raw in enumerate(raw_alerts):
+        where = f"alert rule #{index + 1}"
+        for required in ("name", "expr", "comparison", "threshold"):
+            _require_present(raw, required, where)
+        name = _interpolate(raw["name"])
+        expr = _interpolate(raw["expr"])
+        comparison = _resolve_comparison(raw["comparison"], name)
+        threshold = _resolve_threshold(raw["threshold"], name)
+        # Optional fields with their spec defaults.
+        for_cycles = raw.get("for_cycles", 1)
+        severity = _interpolate(raw.get("severity", "warning"))
+        envs = [_interpolate(env) for env in raw.get("envs", ["all"])]
+        labels = {key: _interpolate(value) for key, value in raw.get("labels", {}).items()}
+        rules.append(
+            AlertRule(
+                name=name,
+                expr=expr,
+                comparison=comparison,
+                threshold=threshold,
+                for_cycles=for_cycles,
+                severity=severity,
+                envs=envs,
+                labels=labels,
+            )
+        )
+    return rules
+
+
+def _resolve_comparison(raw_comparison: str, rule_name: str) -> Comparison:
+    """Map a `comparison` string onto the `Comparison` enum, failing fast if unknown.
+
+    A bad value raises a `PanoptesError` (NOT the stdlib `ValueError` that `Comparison(...)`
+    would raise, which escapes a caller's `except PanoptesError`), naming the rule + the
+    valid operators.
+    """
+    try:
+        return Comparison(raw_comparison)
+    except ValueError as exc:
+        valid = sorted(comparison.value for comparison in Comparison)
+        raise PanoptesError(
+            f"Alert rule '{rule_name}' has unknown comparison '{raw_comparison}'; "
+            f"valid comparisons are {valid}."
+        ) from exc
+
+
+def _resolve_threshold(raw_threshold: object, rule_name: str) -> float:
+    """Coerce a `threshold` to float, failing fast if it is not numeric.
+
+    YAML parses a numeric threshold as int/float; a non-numeric value (e.g. a string typo)
+    raises a clear `PanoptesError` naming the rule, never a downstream `TypeError`.
+    """
+    # bool is an int subclass; reject it so `threshold: true` is not silently read as 1.0.
+    if isinstance(raw_threshold, bool) or not isinstance(raw_threshold, int | float):
+        raise PanoptesError(
+            f"Alert rule '{rule_name}' has a non-numeric threshold {raw_threshold!r}; "
+            f"threshold must be a number."
+        )
+    return float(raw_threshold)
+
+
 def load_config(path: Path, registries: PlaneRegistries | None = None) -> ResolvedConfig:
     """Load + resolve a Panoptes config file into a fully-typed `ResolvedConfig`.
 
@@ -507,6 +607,7 @@ def load_config(path: Path, registries: PlaneRegistries | None = None) -> Resolv
         )
 
     dashboard_packs = _resolve_dashboard_packs(body.get("dashboards", {}))
+    alerts = _resolve_alerts(list(body.get("alerts", [])))
 
     return ResolvedConfig(
         environments=environments,
@@ -514,5 +615,6 @@ def load_config(path: Path, registries: PlaneRegistries | None = None) -> Resolv
         notifiers=notifiers,
         dashboard_packs=dashboard_packs,
         slos=list(body.get("slos", [])),
+        alerts=alerts,
         mcp=body.get("mcp", {}),
     )
