@@ -39,11 +39,7 @@ from core.model import (
     SourceHealth,
     TimeWindow,
 )
-from core.planes.dashboard import DashboardProvider
-from core.planes.notifier import Notifier
 from core.planes.source import Source
-from core.planes.store import Store
-from core.registry import Registry
 
 ConfigBlock = Mapping[str, str | int | bool | list[str]]
 
@@ -157,27 +153,25 @@ class _FakeDashboardProvider:
 
 
 def _registries_with_correct_capabilities() -> PlaneRegistries:
-    """Registries whose fake source capabilities MATCH the fixture's `provides:`."""
-    sources: Registry[Source] = Registry("source")
-    sources.register("cloudwatch")(_make_source_class({SignalKind.METRIC, SignalKind.LOG}))
-    sources.register("sentry")(_make_source_class({SignalKind.INCIDENT, SignalKind.METRIC}))
-    sources.register("http-health")(_make_source_class({SignalKind.METRIC}))
+    """Registries whose fake source capabilities MATCH the fixture's `provides:`.
 
-    stores: Registry[Store] = Registry("store")
-    stores.register("victoriametrics")(_FakeStore)
-
-    notifiers: Registry[Notifier] = Registry("notifier")
-    notifiers.register("logging")(_FakeNotifier)
-
-    providers: Registry[DashboardProvider] = Registry("dashboard")
-    providers.register("grafana")(_FakeDashboardProvider)
-
-    return PlaneRegistries(
-        sources=sources,
-        stores=stores,
-        notifiers=notifiers,
-        dashboard_providers=providers,
+    Built from the `PlaneRegistries.empty()` isolation seam (four fresh, plane-keyed
+    registries) — so this fixture is fully isolated from the `core.registry` module
+    globals, with no hand-written `Registry("source")`/… boilerplate or
+    discriminator-string-typo risk.
+    """
+    registries = PlaneRegistries.empty()
+    registries.sources.register("cloudwatch")(
+        _make_source_class({SignalKind.METRIC, SignalKind.LOG})
     )
+    registries.sources.register("sentry")(
+        _make_source_class({SignalKind.INCIDENT, SignalKind.METRIC})
+    )
+    registries.sources.register("http-health")(_make_source_class({SignalKind.METRIC}))
+    registries.stores.register("victoriametrics")(_FakeStore)
+    registries.notifiers.register("logging")(_FakeNotifier)
+    registries.dashboard_providers.register("grafana")(_FakeDashboardProvider)
+    return registries
 
 
 def _write_fixture(tmp_path: Path, body: str = _REFERENCE_YAML) -> Path:
@@ -357,3 +351,58 @@ def test_consumer_pack_git_only_parses_and_validates(
     consumer_packs = [p for p in resolved.dashboard_packs if p.tier == "consumer"]
     assert len(consumer_packs) == 1
     assert consumer_packs[0].selector == "git"
+
+
+# --- PlaneRegistries test-isolation seam -----------------------------------------
+#
+# `PlaneRegistries.empty()` is the documented canonical seam for obtaining a fully
+# ISOLATED registry set OUTSIDE the self-registration path (the `@SOURCES.register`
+# decorators + the demo pack keep using the module globals — those are load-bearing
+# for the self-registration design and untouched here). The factory removes the
+# four-line `Registry("source")`/`("store")`/`("notifier")`/`("dashboard")` boilerplate
+# (and the discriminator-string-typo risk) a test otherwise hand-writes, and proves
+# isolation: registering into an `empty()` set must not leak into the globals, and the
+# globals' adapters must not appear in the empty set.
+
+
+def test_plane_registries_empty_gives_four_fresh_isolated_registries() -> None:
+    """`empty()` returns four fresh, empty, correctly-keyed `Registry` instances."""
+    registries = PlaneRegistries.empty()
+    # Correctly keyed by plane (no discriminator-string typo possible at call sites).
+    assert registries.sources.kind == "source"
+    assert registries.stores.kind == "store"
+    assert registries.notifiers.kind == "notifier"
+    assert registries.dashboard_providers.kind == "dashboard"
+    # Genuinely empty — no adapters carried over from anywhere.
+    assert registries.sources.available() == []
+    assert registries.stores.available() == []
+    assert registries.notifiers.available() == []
+    assert registries.dashboard_providers.available() == []
+
+
+def test_plane_registries_empty_is_isolated_from_the_module_globals() -> None:
+    """Registering into an `empty()` set does not touch the `core.registry` globals."""
+    from core import SOURCES
+
+    registries = PlaneRegistries.empty()
+    fake_source_class = _make_source_class({SignalKind.METRIC})
+    registries.sources.register("isolated-fake")(fake_source_class)
+
+    # The fake registered into the isolated set is visible there...
+    assert "isolated-fake" in registries.sources.available()
+    # ...but did NOT leak into the global SOURCES registry (full test isolation).
+    assert "isolated-fake" not in SOURCES.available()
+    # ...and a fresh empty set is independent of the one we just mutated.
+    assert PlaneRegistries.empty().sources.available() == []
+
+
+def test_plane_registries_from_globals_mirrors_the_module_singletons() -> None:
+    """`from_globals()` returns the four `core.registry` module singletons (production seam)."""
+    from core import DASHBOARD_PROVIDERS, NOTIFIERS, SOURCES, STORES
+
+    registries = PlaneRegistries.from_globals()
+    # IS the production wiring — the same singleton objects the decorators register into.
+    assert registries.sources is SOURCES
+    assert registries.stores is STORES
+    assert registries.notifiers is NOTIFIERS
+    assert registries.dashboard_providers is DASHBOARD_PROVIDERS

@@ -198,22 +198,63 @@ class ResolvedConfig:
 
 @dataclass(frozen=True)
 class PlaneRegistries:
-    """The four plane registries the loader builds adapters from (injectable for tests)."""
+    """The four plane registries the loader builds adapters from (injectable for tests).
+
+    This is the documented canonical seam for everything OUTSIDE the self-registration
+    path. The `core.registry` module globals (`SOURCES`/`STORES`/`NOTIFIERS`/
+    `DASHBOARD_PROVIDERS`) remain load-bearing for the `@SOURCES.register(...)`
+    self-registration decorators (and the demo pack's `@STORES.register(...)`); for
+    everything else — most importantly test isolation — build a `PlaneRegistries` via
+    one of the two factories below and pass it to `load_config(registries=...)`.
+
+    Two factories cover the two needs:
+
+    - `empty()` — four FRESH, empty, correctly-keyed registries: full isolation from
+      the module globals, with no risk of mistyping a plane discriminator string.
+    - `from_globals()` — the four module singletons: the production wiring the
+      self-registration decorators populate (the `load_config` default).
+    """
 
     sources: Registry[Source]
     stores: Registry[Store]
     notifiers: Registry[Notifier]
     dashboard_providers: Registry[DashboardProvider]
 
+    @classmethod
+    def empty(cls) -> "PlaneRegistries":
+        """Four fresh, empty, plane-keyed registries — the test-isolation seam.
+
+        Each plane gets a brand-new `Registry` keyed by its discriminator, fully
+        independent of the `core.registry` module globals. A test obtains an ISOLATED
+        registry set (register fakes, pass to `load_config`) instead of registering
+        for-side-effect into the shared globals — so no test pollutes another.
+        """
+        return cls(
+            sources=Registry("source"),
+            stores=Registry("store"),
+            notifiers=Registry("notifier"),
+            dashboard_providers=Registry("dashboard"),
+        )
+
+    @classmethod
+    def from_globals(cls) -> "PlaneRegistries":
+        """The production registries — the four `core.registry` module singletons.
+
+        These are the registries the self-registration decorators populate at adapter
+        import, so this is the wiring production resolution uses (and the `load_config`
+        default). Distinct from `empty()`, which deliberately does NOT see them.
+        """
+        return cls(
+            sources=SOURCES,
+            stores=STORES,
+            notifiers=NOTIFIERS,
+            dashboard_providers=DASHBOARD_PROVIDERS,
+        )
+
 
 def _default_registries() -> PlaneRegistries:
-    """The production registries (the four `core.registry` module singletons)."""
-    return PlaneRegistries(
-        sources=SOURCES,
-        stores=STORES,
-        notifiers=NOTIFIERS,
-        dashboard_providers=DASHBOARD_PROVIDERS,
-    )
+    """The production registries (delegates to the `from_globals()` factory)."""
+    return PlaneRegistries.from_globals()
 
 
 # Map a `provides:` token to its `SignalKind`. `capabilities()` is authoritative, so
