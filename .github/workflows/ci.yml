@@ -1,0 +1,41 @@
+name: 🔍 CI
+on:
+  pull_request: { branches: [main] }
+  push: { branches: [main] }
+  workflow_dispatch:
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+permissions: { contents: read }
+jobs:
+  changes:                         # dorny/paths-filter: skip integration for docs-only
+    runs-on: ubuntu-latest
+    outputs: { code: ${{ steps.f.outputs.code }} }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v3
+        id: f
+        with:
+          filters: |
+            code:
+              - 'core/**'
+              - 'examples/**'
+              - 'tests/**'
+              - 'docker-compose.yml'
+              - 'pyproject.toml'
+  ci:
+    needs: changes
+    uses: ./.github/workflows/ci-checks.yml
+    with:
+      run-integration: ${{ needs.changes.outputs.code == 'true' }}
+  merge-gatekeeper:
+    name: 🚪 Merge Gatekeeper
+    needs: [ci]
+    if: ${{ always() }}              # run even when ci failed, so this is a real red check, not a skip
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          if ${{ contains(needs.*.result, 'failure') }}; then
+            echo "A required check failed."; exit 1
+          fi
+          echo "All checks passed."

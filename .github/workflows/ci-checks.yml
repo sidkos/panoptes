@@ -1,0 +1,64 @@
+name: '🛠️ CI Checks'
+on:
+  workflow_call:
+    inputs:
+      run-integration: { type: boolean, default: false }
+permissions: { contents: read }
+jobs:
+  lint-type:                       # ruff lint + format-check + mypy --strict
+    name: 🐍 Lint & Types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-panoptes
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy --strict .
+
+  unit:                            # fast; the coverage gate
+    name: 🧪 Unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-panoptes
+      # Global floor measures core only. examples/ is a test fixture (the demo
+      # pack), not shipped core — excluded from the global gate so a fixture
+      # coverage dip can neither mask nor inflate the core number.
+      - run: pytest -m "not integration" --cov=core --cov-fail-under=85
+      # Authoritative per-package floor (spec § Tests Coverage mandate): the two
+      # areas the design docs single out. This INTENTIONALLY re-executes the full
+      # unit suite a second time to recompute coverage scoped to core.sources +
+      # core.mcp; --cov-append keeps the second run from re-clobbering the first
+      # run's .coverage data file. The scoped percentage is therefore measured over
+      # the union of both runs' data (i.e. all unit tests touching those packages),
+      # not only sources/mcp-specific tests — this is expected. Trade-off accepted:
+      # the second full run roughly doubles unit-job wall time AND doubles the flake
+      # exposure of any nondeterministic unit test (so unit tests MUST be strictly
+      # deterministic — they are, given respx/botocore.stub everywhere) but keeps a
+      # single obvious gate command. Do NOT "optimize" it into a `coverage report
+      # --include=` post-step without re-verifying both floors still gate
+      # (`coverage combine` + two scoped `coverage report --include=` is the
+      # documented v0.2 optimization; the spec warns against doing it in v0.1).
+      - run: pytest -m "not integration" --cov=core.sources --cov=core.mcp --cov-append --cov-fail-under=80
+
+  guards:                          # the standalone-purity invariants
+    name: 🛡️ Boundary Guards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-panoptes
+      - run: pytest tests/unit/test_core_purity_guard.py tests/unit/test_no_write_actions_guard.py
+
+  integration:                     # compose/testcontainers; marker-gated, opt-in
+    name: 🐳 Integration (compose)
+    if: ${{ inputs.run-integration }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-panoptes
+      # Phases 0-7 collect zero integration tests; pytest exit code 5 ("no tests
+      # collected") would otherwise red-bar the skeleton. Tolerate exit-5 until
+      # Phase 8 lands real integration tests — then this tolerance is REMOVED
+      # (see § Rollout Phases Phase 8 exit criteria) so an empty integration
+      # collection becomes a failure again and the gate cannot rot to always-green.
+      - run: pytest -m integration || [ $? -eq 5 ]   # testcontainers spins VM+Grafana; Docker preinstalled on ubuntu-latest
