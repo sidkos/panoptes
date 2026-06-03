@@ -27,7 +27,8 @@ IMPORTANT (FastMCP / PEP-563): this module must NOT add
 generation for the nested-`TypedDict` return shapes defined here.
 """
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import TypedDict
 
 from core.config import ResolvedConfig, ResolvedEnvironment
@@ -93,6 +94,56 @@ class LogFanOut(TypedDict):
     """The `env="all"` log fan-out: a per-env partial result list."""
 
     results: list[LogFanOutEntry]
+
+
+@dataclass(frozen=True)
+class FanOutResult[ResultT]:
+    """One env's slice of an `env="all"` fan-out: its data XOR an error marker.
+
+    Generic over the per-env result type `ResultT` (PEP 695) so the iterate-and-mark
+    contract is written once and reused by every env-aware tool. Exactly one of
+    `data`/`error` is populated: a successful env carries `data` with `error=None`; an
+    env whose fetch raised a `CapabilityError` carries `error` (its detail) with
+    `data=None`. The tools project this into their own `IncidentFanOut`/`LogFanOut`
+    TypedDicts (an unanswerable env's `None` data becomes the TypedDict's empty list).
+    """
+
+    env: str
+    data: ResultT | None
+    error: str | None
+
+
+def fan_out_over_envs[ResultT](
+    config: ResolvedConfig, fetch_one: Callable[[ResolvedEnvironment], ResultT]
+) -> list[FanOutResult[ResultT]]:
+    """Run `fetch_one` for every enabled env, marking a per-env failure instead of failing.
+
+    The single home for the `env="all"` fan-out contract (spec § MCP server contract):
+    iterate every enabled env in declaration order, call `fetch_one(environment)`, and —
+    when `fetch_one` raises a `CapabilityError` (the env cannot answer this query) —
+    capture an explicit per-env error marker rather than failing the whole call. The
+    result is a partial result: answerable envs carry their data, unanswerable ones carry
+    their error.
+
+    Args:
+        config: The resolved config (its enabled environments are iterated).
+        fetch_one: The per-env fetch — given an environment, return its result. It may
+            raise `CapabilityError` to mark that env down without failing the fan-out.
+
+    Returns:
+        One `FanOutResult[ResultT]` per enabled env, each carrying data XOR an error.
+    """
+    results: list[FanOutResult[ResultT]] = []
+    for environment in _enabled_envs(config):
+        try:
+            results.append(
+                FanOutResult(env=environment.name, data=fetch_one(environment), error=None)
+            )
+        except CapabilityError as exc:
+            # The env cannot answer this query — mark it down (partial result), do not
+            # let one unanswerable env fail the whole fan-out.
+            results.append(FanOutResult(env=environment.name, data=None, error=exc.detail))
+    return results
 
 
 def _window_for(_window: str) -> TimeWindow:
@@ -199,19 +250,19 @@ def search_incidents(
     """
     time_window = _window_for(window)
     if env == _ALL_ENVS:
-        entries: list[IncidentFanOutEntry] = []
-        for environment in _enabled_envs(config):
-            try:
-                incidents = _filter_incidents(
-                    _fetch_incidents(environment, time_window), tag, level
-                )
-                entries.append(
-                    IncidentFanOutEntry(env=environment.name, incidents=incidents, error=None)
-                )
-            except CapabilityError as exc:
-                entries.append(
-                    IncidentFanOutEntry(env=environment.name, incidents=[], error=exc.detail)
-                )
+        # The generic helper owns the iterate-and-mark contract; this tool supplies only
+        # its per-env fetch + filter and projects each result into its TypedDict entry.
+        def _fetch_one(environment: ResolvedEnvironment) -> list[IncidentSignal]:
+            return _filter_incidents(_fetch_incidents(environment, time_window), tag, level)
+
+        entries = [
+            IncidentFanOutEntry(
+                env=result.env,
+                incidents=result.data if result.data is not None else [],
+                error=result.error,
+            )
+            for result in fan_out_over_envs(config, _fetch_one)
+        ]
         return IncidentFanOut(results=entries)
 
     environment = _require_env(config, env)
@@ -255,13 +306,18 @@ def search_logs(
     """
     time_window = _window_for(window)
     if env == _ALL_ENVS:
-        entries: list[LogFanOutEntry] = []
-        for environment in _enabled_envs(config):
-            try:
-                logs = _filter_logs(_fetch_logs(environment, time_window), query, level)
-                entries.append(LogFanOutEntry(env=environment.name, logs=logs, error=None))
-            except CapabilityError as exc:
-                entries.append(LogFanOutEntry(env=environment.name, logs=[], error=exc.detail))
+        # Same generic fan-out, projected into the log TypedDict entry shape.
+        def _fetch_one(environment: ResolvedEnvironment) -> list[LogSignal]:
+            return _filter_logs(_fetch_logs(environment, time_window), query, level)
+
+        entries = [
+            LogFanOutEntry(
+                env=result.env,
+                logs=result.data if result.data is not None else [],
+                error=result.error,
+            )
+            for result in fan_out_over_envs(config, _fetch_one)
+        ]
         return LogFanOut(results=entries)
 
     environment = _require_env(config, env)
