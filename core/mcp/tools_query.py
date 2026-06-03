@@ -1,0 +1,380 @@
+"""MCP query tools — the read-only "show me the signals" surface.
+
+These tools read live sources + the shared store over an explicit `ResolvedConfig`
+context (spec `## API Surface` → MCP server → Query):
+
+- `query_metric` — a thin PromQL passthrough to the store. It is the only tool
+  that reads the store directly with caller-supplied parameters, so it is the
+  natural surface for a `passthrough`-store `CapabilityError` (surfaced structured,
+  never crash / silent-empty).
+- `search_incidents` / `search_logs` — fetch the requested env's sources, filter to
+  the relevant signal kind, and return the matching signals.
+- `search_traces` — capability-negotiation surface: no v0.1 source provides TRACE,
+  so this always raises an explicit "no trace source" `CapabilityError`.
+- `describe_health` — the "one thing to look at" rollup: per-source reachability
+  (an unreachable source is INCLUDED, marked unreachable, never omitted) + the open
+  incident count.
+
+**Capability negotiation:** a query for a kind no configured source provides raises
+an explicit `CapabilityError("no source for X")` — never a silent-empty result.
+
+**`env="all"` fan-out:** when `env == "all"`, iterate every enabled env and return a
+per-env result; an env whose required source is down/unconfigured is included with
+an explicit per-env error marker rather than failing the whole call (partial result).
+
+IMPORTANT (FastMCP / PEP-563): this module must NOT add
+`from __future__ import annotations` — deferred annotations break FastMCP's schema
+generation for the nested-`TypedDict` return shapes defined here.
+"""
+
+from collections.abc import Mapping
+from typing import TypedDict
+
+from core.config import ResolvedConfig, ResolvedEnvironment
+from core.errors import CapabilityError
+from core.model import (
+    IncidentSignal,
+    LogSignal,
+    MetricQuery,
+    MetricSeries,
+    SignalKind,
+    TimeWindow,
+)
+
+# `env="all"` is the fan-out sentinel — iterate every enabled env (spec § MCP
+# server contract — "Accept and respect an `env` argument (or `all`)").
+_ALL_ENVS = "all"
+
+# Default query window for the live-source fetch tools. The MCP `window` argument is
+# a human string in v0.1 (e.g. "15m"); v0.1 maps an unparsed/default window to the
+# trailing N minutes so the tools have a bounded fetch without a full duration parser.
+_DEFAULT_WINDOW_MINUTES = 15
+
+
+class SourceHealthInfo(TypedDict):
+    """One source's reachability within a `describe_health` rollup."""
+
+    type: str
+    reachable: bool
+    detail: str
+
+
+class HealthRollup(TypedDict):
+    """The 'one thing to look at': per-source reachability + open-incident count."""
+
+    env: str
+    sources: list[SourceHealthInfo]
+    open_incident_count: int
+
+
+class IncidentFanOutEntry(TypedDict):
+    """One env's slice of an `env="all"` incident fan-out (data OR an error marker)."""
+
+    env: str
+    incidents: list[IncidentSignal]
+    error: str | None
+
+
+class IncidentFanOut(TypedDict):
+    """The `env="all"` incident fan-out: a per-env partial result list."""
+
+    results: list[IncidentFanOutEntry]
+
+
+class LogFanOutEntry(TypedDict):
+    """One env's slice of an `env="all"` log fan-out (data OR an error marker)."""
+
+    env: str
+    logs: list[LogSignal]
+    error: str | None
+
+
+class LogFanOut(TypedDict):
+    """The `env="all"` log fan-out: a per-env partial result list."""
+
+    results: list[LogFanOutEntry]
+
+
+def _window_for(_window: str) -> TimeWindow:
+    """Resolve the MCP `window` string to a `TimeWindow` (v0.1: trailing N minutes).
+
+    v0.1 does not ship a full duration-string parser; every window resolves to the
+    default trailing window. The argument is accepted (and forwarded) so the tool
+    signature is forward-compatible when a parser lands in v0.2.
+    """
+    return TimeWindow.last(minutes=_DEFAULT_WINDOW_MINUTES)
+
+
+def _enabled_envs(config: ResolvedConfig) -> list[ResolvedEnvironment]:
+    """The enabled environments, in declaration order (disabled envs are inert)."""
+    return [env for env in config.environments.values() if env.enabled]
+
+
+def _require_env(config: ResolvedConfig, env: str) -> ResolvedEnvironment:
+    """Resolve a single env by name, failing explicitly if it is unknown/disabled."""
+    environment = config.environments.get(env)
+    if environment is None:
+        available = ", ".join(config.environments.keys()) or "(none)"
+        raise CapabilityError(f"No environment named '{env}'. Available environments: {available}.")
+    if not environment.enabled:
+        raise CapabilityError(
+            f"Environment '{env}' is disabled (enabled: false) and has no live sources."
+        )
+    return environment
+
+
+def _sources_providing(environment: ResolvedEnvironment, kind: SignalKind) -> list[object]:
+    """The env's sources whose `capabilities()` include `kind` (may be empty)."""
+    return [
+        resolved.source
+        for resolved in environment.sources
+        if kind in resolved.source.capabilities()
+    ]
+
+
+def _fetch_incidents(environment: ResolvedEnvironment, window: TimeWindow) -> list[IncidentSignal]:
+    """Fetch + filter the env's incident signals, requiring an incident source.
+
+    Raises:
+        CapabilityError: no source in the env provides `INCIDENT` (capability
+            negotiation — "no source for incidents", never a silent-empty list).
+    """
+    providers = _sources_providing(environment, SignalKind.INCIDENT)
+    if not providers:
+        raise CapabilityError(
+            f"No source in environment '{environment.name}' provides incident signals; "
+            f"cannot answer an incident query."
+        )
+    incidents: list[IncidentSignal] = []
+    for source in providers:
+        for signal in source.fetch(window):  # type: ignore[attr-defined]
+            if isinstance(signal, IncidentSignal):
+                incidents.append(signal)
+    return incidents
+
+
+def _fetch_logs(environment: ResolvedEnvironment, window: TimeWindow) -> list[LogSignal]:
+    """Fetch + filter the env's log signals, requiring a log source.
+
+    Raises:
+        CapabilityError: no source in the env provides `LOG`.
+    """
+    providers = _sources_providing(environment, SignalKind.LOG)
+    if not providers:
+        raise CapabilityError(
+            f"No source in environment '{environment.name}' provides log signals; "
+            f"cannot answer a log query."
+        )
+    logs: list[LogSignal] = []
+    for source in providers:
+        for signal in source.fetch(window):  # type: ignore[attr-defined]
+            if isinstance(signal, LogSignal):
+                logs.append(signal)
+    return logs
+
+
+def search_incidents(
+    config: ResolvedConfig,
+    env: str,
+    window: str,
+    tag: str | None,
+    level: str | None,
+) -> list[IncidentSignal] | IncidentFanOut:
+    """Search incident signals for `env` (or fan out across all enabled envs).
+
+    Args:
+        config: The resolved config.
+        env: A single environment name, or `"all"` to fan out.
+        window: The query window string (v0.1: trailing default window).
+        tag: Optional label-value filter (matched against any incident label value).
+        level: Optional incident-level filter (matched against the incident level).
+
+    Returns:
+        For a single env: a `list[IncidentSignal]`. For `env="all"`: an
+        `IncidentFanOut` with a per-env partial result (an unanswerable env carries
+        an explicit error marker rather than failing the whole call).
+
+    Raises:
+        CapabilityError: a single-env query whose env provides no incident source.
+    """
+    time_window = _window_for(window)
+    if env == _ALL_ENVS:
+        entries: list[IncidentFanOutEntry] = []
+        for environment in _enabled_envs(config):
+            try:
+                incidents = _filter_incidents(
+                    _fetch_incidents(environment, time_window), tag, level
+                )
+                entries.append(
+                    IncidentFanOutEntry(env=environment.name, incidents=incidents, error=None)
+                )
+            except CapabilityError as exc:
+                entries.append(
+                    IncidentFanOutEntry(env=environment.name, incidents=[], error=exc.detail)
+                )
+        return IncidentFanOut(results=entries)
+
+    environment = _require_env(config, env)
+    return _filter_incidents(_fetch_incidents(environment, time_window), tag, level)
+
+
+def _filter_incidents(
+    incidents: list[IncidentSignal], tag: str | None, level: str | None
+) -> list[IncidentSignal]:
+    """Apply the optional `tag` (any label value) + `level` filters."""
+    filtered = incidents
+    if level is not None:
+        filtered = [i for i in filtered if i.level.value == level]
+    if tag is not None:
+        filtered = [i for i in filtered if tag in i.labels.values()]
+    return filtered
+
+
+def search_logs(
+    config: ResolvedConfig,
+    env: str,
+    query: str,
+    window: str,
+    level: str | None,
+) -> list[LogSignal] | LogFanOut:
+    """Search log signals for `env` (or fan out across all enabled envs).
+
+    Args:
+        config: The resolved config.
+        env: A single environment name, or `"all"` to fan out.
+        query: A substring filter matched against each log message.
+        window: The query window string (v0.1: trailing default window).
+        level: Optional log-level filter (matched against the log level).
+
+    Returns:
+        For a single env: a `list[LogSignal]`. For `env="all"`: a `LogFanOut` with a
+        per-env partial result (an unanswerable env carries an explicit error marker).
+
+    Raises:
+        CapabilityError: a single-env query whose env provides no log source.
+    """
+    time_window = _window_for(window)
+    if env == _ALL_ENVS:
+        entries: list[LogFanOutEntry] = []
+        for environment in _enabled_envs(config):
+            try:
+                logs = _filter_logs(_fetch_logs(environment, time_window), query, level)
+                entries.append(LogFanOutEntry(env=environment.name, logs=logs, error=None))
+            except CapabilityError as exc:
+                entries.append(LogFanOutEntry(env=environment.name, logs=[], error=exc.detail))
+        return LogFanOut(results=entries)
+
+    environment = _require_env(config, env)
+    return _filter_logs(_fetch_logs(environment, time_window), query, level)
+
+
+def _filter_logs(logs: list[LogSignal], query: str, level: str | None) -> list[LogSignal]:
+    """Apply the substring `query` (message) + optional `level` filters."""
+    filtered = [log for log in logs if query in log.message]
+    if level is not None:
+        filtered = [log for log in filtered if log.level.value == level]
+    return filtered
+
+
+def search_traces(config: ResolvedConfig, env: str, window: str) -> list[object]:
+    """Capability-negotiation surface for traces — always fails explicitly in v0.1.
+
+    No v0.1 source provides TRACE (spec § Data Model), so this surfaces an explicit
+    "no trace source" `CapabilityError` rather than returning an empty list (which
+    would be indistinguishable from "no traces in window").
+
+    Raises:
+        CapabilityError: always — no configured source provides trace signals.
+    """
+    # Consult the per-env source capabilities exactly like the other tools, so the
+    # negotiation is real (not a hardcoded raise): no source advertises TRACE.
+    for environment in _enabled_envs(config):
+        if _sources_providing(environment, SignalKind.TRACE):
+            # Defensive: if a future source ever adds TRACE, fetch from it instead of
+            # falsely claiming none. v0.1 has none, so this branch is never taken.
+            traces: list[object] = []
+            for source in _sources_providing(environment, SignalKind.TRACE):
+                traces.extend(source.fetch(_window_for(window)))  # type: ignore[attr-defined]
+            return traces
+    raise CapabilityError(
+        f"No configured source provides trace signals (requested env '{env}'); "
+        f"no trace source is available in v0.1."
+    )
+
+
+def query_metric(
+    config: ResolvedConfig,
+    env: str,
+    name: str,
+    window: str,
+    filters: Mapping[str, str] | None,
+) -> list[MetricSeries]:
+    """Run a PromQL passthrough query for metric `name` against the store.
+
+    This is the only tool that reads the store directly with caller-supplied query
+    parameters, so a `passthrough`-store misconfiguration surfaces its
+    `CapabilityError` here (structured, never crash / silent-empty).
+
+    Args:
+        config: The resolved config (its `store` answers the query).
+        env: The environment to scope the query to (added as an `env=` label matcher).
+        name: The metric name to query.
+        window: The query window string (v0.1: trailing default window).
+        filters: Optional additional label matchers applied to the PromQL selector.
+
+    Returns:
+        The resolved `MetricSeries` list (possibly empty — empty is a legitimate
+        "no data in window" answer, distinct from the passthrough `CapabilityError`).
+
+    Raises:
+        CapabilityError: the configured store cannot answer queries (e.g. passthrough).
+    """
+    selectors = [f'env="{env}"']
+    if filters:
+        selectors.extend(f'{key}="{value}"' for key, value in sorted(filters.items()))
+    expr = f"{name}{{{','.join(selectors)}}}"
+    metric_query = MetricQuery(
+        expr=expr, window=_window_for(window), step_seconds=_DEFAULT_WINDOW_MINUTES * 60
+    )
+    # A passthrough store raises CapabilityError here — it propagates as the
+    # structured MCP error the read-only contract requires (never swallowed).
+    return config.store.query(metric_query)
+
+
+def describe_health(config: ResolvedConfig, env: str) -> HealthRollup:
+    """Roll up per-source reachability + open-incident count for `env`.
+
+    Every configured source is INCLUDED in the rollup with its reachability — an
+    unreachable source is marked `reachable: False`, never omitted, so "the one
+    thing to look at" actually shows what is down (the tool's core promise).
+
+    Args:
+        config: The resolved config.
+        env: The environment to roll up.
+
+    Returns:
+        A `HealthRollup` with per-source health + the open-incident count (0 when no
+        source provides incidents — health is still answerable from reachability).
+    """
+    environment = _require_env(config, env)
+    sources: list[SourceHealthInfo] = []
+    for resolved in environment.sources:
+        health = resolved.source.health()
+        sources.append(
+            SourceHealthInfo(
+                type=resolved.source.type,
+                reachable=health.reachable,
+                detail=health.detail,
+            )
+        )
+
+    # Open incidents are a best-effort enrichment: if the env has an incident source,
+    # count its incidents; if not, health is still answerable (count stays 0) — we do
+    # NOT raise here, because reachability is the rollup's mandatory promise.
+    open_incident_count = 0
+    if _sources_providing(environment, SignalKind.INCIDENT):
+        open_incident_count = len(
+            _fetch_incidents(environment, TimeWindow.last(minutes=_DEFAULT_WINDOW_MINUTES))
+        )
+
+    return HealthRollup(env=env, sources=sources, open_incident_count=open_incident_count)
