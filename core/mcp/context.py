@@ -145,7 +145,8 @@ class QueryContext:
         """
         # The escape is the security invariant (F7): never interpolate `env` raw.
         expr = f'{metric}{{env="{escape_promql_value(env)}"}}'
-        return self._config.store.query(
+        # Go through the `store` property (the single store-access seam), not `_config.store`.
+        return self.store.query(
             MetricQuery(
                 expr=expr, window=_window_for(window), step_seconds=_step_seconds_for(window)
             )

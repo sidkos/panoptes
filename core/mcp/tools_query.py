@@ -542,10 +542,13 @@ def query_metric(
     # `env="all"` is the across-env query: omit the `env=` matcher entirely (F1). Pinning
     # `env="all"` would select a literal label value no signal carries → silent-empty,
     # which the spec forbids. The metrics already carry their own `env` label, so a
-    # matcher-free selector returns series across every env. (`env` is a validated env
-    # name here, so it needs no value escaping.)
+    # matcher-free selector returns series across every env. The `env` is ESCAPED before
+    # interpolation (F7) — its membership is validated upstream, but env names are raw YAML
+    # keys (never identifier-checked), so a quote/backslash-bearing name must not break out of
+    # the selector. This is the SAME escape `read_series`, the filter values, and the dashboard
+    # `$env` substitution apply — one canonical primitive, no bypass.
     if env != _ALL_ENVS:
-        selectors.append(f'env="{env}"')
+        selectors.append(f'env="{escape_promql_value(env)}"')
     if filters:
         for key, value in sorted(filters.items()):
             if not _PROMQL_IDENTIFIER_RE.match(key):
@@ -594,25 +597,31 @@ def get_cluster_state(context: QueryContext, env: str) -> ClusterState:
     # with a clear error rather than silently returning an unreachable snapshot.
     environment = context.require_env(env)
 
-    # The three cluster-wide gauges are single-value scalars → `read_gauge` (which owns the
-    # F7 escape, swallows a passthrough store's CapabilityError to None, and folds to the
-    # latest value). `None` means "no data for this gauge".
-    node_count = context.read_gauge(_K8S_NODE_COUNT, environment.name)
-    pods_pending = context.read_gauge(_K8S_PODS_PENDING, environment.name)
-    pods_crashloop = context.read_gauge(_K8S_PODS_CRASHLOOP, environment.name)
-    # `pod_restarts_total` is PER-NAMESPACE — the per-namespace sum (+ the cluster label) need
-    # the full series, so read it via `read_series`. `read_series` PROPAGATES a CapabilityError,
-    # but this tool must stay answerable on a passthrough store, so swallow it locally (the same
-    # "report unreachable, never crash" contract the cluster-wide gauges get for free).
+    # `panoptes_k8s_node_count` is read via `read_series` (NOT `read_gauge`) because the
+    # `cluster` LABEL must come from a cluster-wide gauge that is ALWAYS present: the kubernetes
+    # source emits node_count even at 0 (one series per env carrying {env, cluster}), whereas
+    # `pod_restarts_total` is PER-NAMESPACE and a cluster with nodes but no pods emits NO restart
+    # series. Reading the label only off the restart series regressed `cluster` to '' for that
+    # case (the deepening-B regression this restores). node_count's scalar is derived from the
+    # series via `_latest_value`. `read_series` PROPAGATES a CapabilityError; both series reads
+    # are wrapped in one local swallow so the tool stays answerable on a passthrough store (the
+    # "report unreachable, never crash" contract).
     try:
+        node_series = context.read_series(_K8S_NODE_COUNT, environment.name)
         restarts_series = context.read_series(_K8S_POD_RESTARTS_TOTAL, environment.name)
     except CapabilityError:
+        node_series = []
         restarts_series = []
+    node_count = _latest_value(node_series)
+    # pending/crashloop stay on `read_gauge` (single scalars; their label is not needed — the
+    # cluster name is resolved from node_count, the always-present gauge). `read_gauge` owns the
+    # F7 escape + swallows the passthrough CapabilityError to None.
+    pods_pending = context.read_gauge(_K8S_PODS_PENDING, environment.name)
+    pods_crashloop = context.read_gauge(_K8S_PODS_CRASHLOOP, environment.name)
 
     # The cluster is reachable in the store's eyes iff ANY k8s gauge produced data for the env:
     # a non-None cluster-wide gauge value, OR a non-empty per-namespace restart series. A
-    # passthrough store yields None for the three (swallowed) + an empty restarts list, so it
-    # reads as unreachable — never a crash.
+    # passthrough store yields None/empty for all, so it reads as unreachable — never a crash.
     reachable = (
         node_count is not None
         or pods_pending is not None
@@ -622,9 +631,9 @@ def get_cluster_state(context: QueryContext, env: str) -> ClusterState:
 
     return ClusterState(
         env=environment.name,
-        # The cluster name is carried on every k8s gauge's labels; read it from the per-
-        # namespace restart series (empty string when nothing was collected).
-        cluster=_cluster_label(restarts_series),
+        # The cluster name comes from the ALWAYS-present node_count series first; fall back to
+        # the per-namespace restart series, then '' when nothing was collected.
+        cluster=_cluster_label(node_series) or _cluster_label(restarts_series) or "",
         node_count=node_count or 0.0,
         pods_pending=pods_pending or 0.0,
         pods_crashloop=pods_crashloop or 0.0,

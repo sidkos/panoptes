@@ -22,6 +22,7 @@ from core.config import (
     ResolvedConfig,
     ResolvedEnvironment,
     ResolvedSource,
+    SloConfig,
 )
 from core.mcp.server import build_server
 from core.model import (
@@ -139,6 +140,7 @@ def _build_config(
     sentry_signals: list[CanonicalSignal] | None = None,
     cloudwatch_signals: list[CanonicalSignal] | None = None,
     mcp: McpConfig | None = None,
+    slos: list[SloConfig] | None = None,
 ) -> ResolvedConfig:
     """A single enabled `dev` env wiring the three core sources + one dashboard pack."""
 
@@ -168,7 +170,7 @@ def _build_config(
         store=store,
         notifiers=[_NoopNotifier()],
         dashboard_packs=dashboard_packs,
-        slos=[],
+        slos=slos if slos is not None else [],
         mcp=mcp if mcp is not None else {},
     )
 
@@ -263,6 +265,69 @@ def test_describe_health_tool_invoker_returns_rollup(tmp_path: Path) -> None:
     # Every configured source is rolled up; all are reachable in this fake.
     assert rollup["env"] == "dev"
     assert all(source["reachable"] for source in rollup["sources"])
+
+
+# --- v0.2/v0.3 real tools END-TO-END through the registered, signature-DERIVED invoker ------
+#
+# The `_make_invoker`-derived invokers for `get_slo`/`compare_envs`/`get_cluster_state` were
+# only ever exercised by calling the core fns directly — never through the registered wrapper.
+# The `get_slo` invoker carries the highest-risk derivation: the `slo_name` tool param is
+# renamed to `name` INSIDE the tool fn, so a faithful derivation must forward `slo_name=...`.
+# These three drive `server.tool_callable(name)(**kwargs)` end to end, proving the derived
+# invoker forwards each tool's kwargs (incl. the rename) through the real registration path.
+
+
+def test_get_slo_tool_invoker_forwards_slo_name_rename(tmp_path: Path) -> None:
+    """`tool_callable('get_slo')(env, slo_name)` reaches `get_slo(..., name=slo_name)`.
+
+    The `slo_name → name` rename is internal to the tool fn, so this proves the derived invoker
+    forwards `slo_name` correctly through the registered wrapper (the highest-risk derivation).
+    """
+    slo: SloConfig = {"name": "uptime", "objective": 0.99}
+    # The store answers any query with a single 1.0 sample → a measurable actual attainment.
+    config = _build_config(
+        store=_FakeStore([_series("dev")]), dashboard_packs=[_pack(tmp_path)], slos=[slo]
+    )
+    server = build_server(config)
+
+    result = server.tool_callable("get_slo")(env="dev", slo_name="uptime")
+
+    assert isinstance(result, dict)
+    assert result["name"] == "uptime", "the slo_name kwarg must reach get_slo under name="
+    assert result["env"] == "dev"
+    assert result["objective"] == 0.99
+    # The fake store's 1.0 actual meets the 0.99 objective.
+    assert result["actual"] == 1.0
+    assert result["met"] is True
+
+
+def test_compare_envs_tool_invoker_returns_comparison(tmp_path: Path) -> None:
+    """`tool_callable('compare_envs')(metric, window)` returns the per-env comparison."""
+    config = _build_config(store=_FakeStore([_series("dev")]), dashboard_packs=[_pack(tmp_path)])
+    server = build_server(config)
+
+    result = server.tool_callable("compare_envs")(metric="panoptes_health_up", window="15m")
+
+    assert isinstance(result, dict)
+    assert result["metric"] == "panoptes_health_up"
+    assert result["window"] == "15m"
+    # The single enabled `dev` env answered (its series under per_env), no errors.
+    assert "dev" in result["per_env"]
+    assert result["errors"] == {}
+
+
+def test_get_cluster_state_tool_invoker_returns_state(tmp_path: Path) -> None:
+    """`tool_callable('get_cluster_state')(env)` returns the snapshot through the real wrapper."""
+    config = _build_config(store=_FakeStore([_series("dev")]), dashboard_packs=[_pack(tmp_path)])
+    server = build_server(config)
+
+    state = server.tool_callable("get_cluster_state")(env="dev")
+
+    assert isinstance(state, dict)
+    assert state["env"] == "dev"
+    # The fake store answers every k8s query with the same 1.0 series → reachable + counted.
+    assert state["reachable"] is True
+    assert state["node_count"] == 1.0
 
 
 def _pack(tmp_path: Path) -> DashboardPack:

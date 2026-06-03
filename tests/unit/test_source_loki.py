@@ -266,3 +266,76 @@ def test_non_success_status_in_envelope_yields_no_signals() -> None:
     payload = {"status": "error", "errorType": "bad_data", "error": "invalid query"}
     respx.get(_QUERY_RANGE_URL).mock(return_value=httpx.Response(200, json=payload))
     assert _source().fetch(_WINDOW) == []
+
+
+# --- malformed-payload defensive paths (the normalizer skips bad data, never raises) --------
+
+
+@respx.mock
+def test_non_dict_payload_yields_no_signals() -> None:
+    """A non-dict top-level payload (a JSON list) is skipped, not crashed."""
+    respx.get(_QUERY_RANGE_URL).mock(return_value=httpx.Response(200, json=["not", "a", "dict"]))
+    assert _source().fetch(_WINDOW) == []
+
+
+@respx.mock
+def test_non_dict_data_yields_no_signals() -> None:
+    """A `success` envelope whose `data` is not a dict yields no signals."""
+    payload = {"status": "success", "data": "not-a-dict"}
+    respx.get(_QUERY_RANGE_URL).mock(return_value=httpx.Response(200, json=payload))
+    assert _source().fetch(_WINDOW) == []
+
+
+@respx.mock
+def test_non_list_result_yields_no_signals() -> None:
+    """A `data.result` that is not a list yields no signals."""
+    payload = {"status": "success", "data": {"resultType": "streams", "result": "not-a-list"}}
+    respx.get(_QUERY_RANGE_URL).mock(return_value=httpx.Response(200, json=payload))
+    assert _source().fetch(_WINDOW) == []
+
+
+@respx.mock
+def test_bad_value_pair_and_non_str_message_lines_are_skipped() -> None:
+    """A short value pair AND a non-str message line are SKIPPED; a valid line survives."""
+    payload = {
+        "status": "success",
+        "data": {
+            "resultType": "streams",
+            "result": [
+                {
+                    "stream": {"job": "api", "level": "info"},
+                    "values": [
+                        [_TS_0],  # too-short pair (no message) → skipped
+                        [_TS_0, 12345],  # non-str message → skipped
+                        [_TS_1, "valid line"],  # the one good line
+                    ],
+                }
+            ],
+        },
+    }
+    respx.get(_QUERY_RANGE_URL).mock(return_value=httpx.Response(200, json=payload))
+    logs = [s for s in _source().fetch(_WINDOW) if isinstance(s, LogSignal)]
+    assert [log.message for log in logs] == ["valid line"]
+
+
+@respx.mock
+def test_unparseable_ns_timestamp_line_is_skipped() -> None:
+    """A line whose ns timestamp is unparseable is SKIPPED (no crash), a valid line survives."""
+    payload = {
+        "status": "success",
+        "data": {
+            "resultType": "streams",
+            "result": [
+                {
+                    "stream": {"job": "api", "level": "info"},
+                    "values": [
+                        ["not-a-number", "bad ts line"],  # unparseable ns ts → skipped
+                        [_TS_1, "good ts line"],
+                    ],
+                }
+            ],
+        },
+    }
+    respx.get(_QUERY_RANGE_URL).mock(return_value=httpx.Response(200, json=payload))
+    logs = [s for s in _source().fetch(_WINDOW) if isinstance(s, LogSignal)]
+    assert [log.message for log in logs] == ["good ts line"]

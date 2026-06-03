@@ -7,17 +7,15 @@ read-shaped name and there is no write path of any kind (the structural read-onl
 test in `tests/unit/test_mcp_query.py` enforces both the exact tool set and the
 no-mutation-verb-name invariant).
 
-Three registration concerns live here:
+Two registration concerns live here:
 
 1. **Core tools** — the fully-implemented discovery + query tools, registered for
    every tool name the config lists that Panoptes implements (the v0.1 trio + v0.2's
-   `get_cluster_state`/`get_slo`/`compare_envs` + v0.3's `get_cost`).
-2. **Future-tool stubs** — `_V0_2_STUB_TOOLS` lists tool names that are valid FUTURE
-   tools (not unknown adapters), so listing them is NOT a config-resolve failure;
-   they register as stubs raising "not available" AT CALL TIME. As of v0.3 Phase 3
-   this set is EMPTY (`get_cost`, the last stub, was promoted to a real tool), so the
-   stub path is dormant — retained as the seam for the next version's planned tools.
-3. **Consumer-pack hook** — if `PANOPTES_CONSUMER_PACK` names a module path, import
+   `get_cluster_state`/`get_slo`/`compare_envs` + v0.3's `get_cost`). EVERY shipped tool
+   is real — the v0.2 call-time "not available" stub machinery was DELETED once `get_cost`
+   (the last stub) shipped in v0.3, so there is no longer a stub path. A future planned-but-
+   unimplemented tool would reinstate that seam at that time.
+2. **Consumer-pack hook** — if `PANOPTES_CONSUMER_PACK` names a module path, import
    it and call its `register_tools(mcp_server)` so an injected pack can add its own
    read-only tools (default unset = core-only). This keeps `core` free of any
    consumer import — the pack is injected, never bundled (spec § Consumer-pack
@@ -41,7 +39,7 @@ from typing import Protocol
 from fastmcp import FastMCP
 
 from core.config import ResolvedConfig
-from core.errors import CapabilityError, PanoptesError
+from core.errors import PanoptesError
 from core.mcp.context import QueryContext
 from core.mcp.tools_discovery import (
     DashboardData,
@@ -159,15 +157,11 @@ class _FastMcpAdapter:
         return app
 
 
-# The future-tool stub set is now EMPTY: v0.3 Phase 3 promoted the last stub (`get_cost`)
-# to a real registrar (the Cost dashboard + the CE/budgets read grant shipped). The
-# mechanism stays in place (a future-listed tool would register as a call-time stub), but
-# no tool is currently a stub — the structural read-only test asserts this is empty.
-_V0_2_STUB_TOOLS: tuple[str, ...] = ()
-
-# The exact implemented read-only tool set (catalog / discovery / query). The structural
-# read-only test asserts a default-config server registers EXACTLY these (plus any
-# injected-pack tools); a future write tool under any name would break it.
+# The exact implemented read-only tool set (catalog / discovery / query). EVERY shipped tool
+# is real — there are no call-time stubs (the v0.2 stub machinery was deleted once `get_cost`,
+# the last stub, shipped in v0.3). The structural read-only test asserts a default-config server
+# registers EXACTLY these (plus any injected-pack tools); a future write tool under any name
+# would break it.
 KNOWN_READ_ONLY_TOOLS: tuple[str, ...] = (
     "describe_signal_catalog",
     "list_dashboards",
@@ -176,13 +170,12 @@ KNOWN_READ_ONLY_TOOLS: tuple[str, ...] = (
     "search_incidents",
     "search_logs",
     "describe_health",
-    # v0.2 — get_cluster_state is a REAL read-only tool (renders the kubernetes snapshot
-    # from the store), NOT a `_V0_2_STUB_TOOLS` entry.
+    # v0.2 — get_cluster_state renders the kubernetes snapshot from the store.
     "get_cluster_state",
-    # v0.2 Phase 4 — promoted from stubs to real read-only tools.
+    # v0.2 Phase 4 — get_slo + compare_envs.
     "get_slo",
     "compare_envs",
-    # v0.3 Phase 3 — get_cost promoted from the last stub to a real read-only tool.
+    # v0.3 Phase 3 — get_cost (the last tool to be promoted from a stub).
     "get_cost",
 )
 
@@ -226,30 +219,15 @@ class PanoptesMcpServer:
         it is stored in `_callables` so a synchronous unit test can invoke that tool
         directly via `tool_callable(name)(...)` — without driving FastMCP's async stdio
         transport. FastMCP rejects `*args`/`**kwargs` tools, so the introspectable `fn`
-        and the uniform `invoker` must be two separate handles (mirroring
-        `_register_stub`). It stays OPTIONAL so the documented consumer-pack seam —
-        `server._register_tool(name, fn)` — keeps working unchanged; a pack that wants
-        the same synchronous invocability passes its own invoker.
+        and the uniform `invoker` must be two separate handles. It stays OPTIONAL so the
+        documented consumer-pack seam — `server._register_tool(name, fn)` — keeps working
+        unchanged; a pack that wants the same synchronous invocability passes its own invoker
+        (the core registrars derive theirs from the tool fn via `_make_invoker`).
         """
         self.mcp.tool(name, fn)
         self._tool_names.append(name)
         if invoker is not None:
             self._callables[name] = invoker
-
-    def _register_stub[**ToolParams](
-        self, name: str, fastmcp_fn: Callable[ToolParams, object], invoker: _ToolCallable
-    ) -> None:
-        """Register a v0.2 call-time stub under `name`.
-
-        FastMCP rejects `*args`/`**kwargs` tools, so the stub presents a concrete
-        (typed) signature to FastMCP via `fastmcp_fn`, while a separate uniform
-        `_ToolCallable` `invoker` (arbitrary read-only args → raise) is stored in
-        `_callables` so the v0.2-stub test can invoke it directly under any keyword
-        shape. Both raise the same explicit not-available `CapabilityError`.
-        """
-        self.mcp.tool(name, fastmcp_fn)
-        self._tool_names.append(name)
-        self._callables[name] = invoker
 
     def tool_names(self) -> list[str]:
         """The names of every registered tool (synchronous; the read-only test seam)."""
@@ -339,11 +317,10 @@ def build_server(
         registrar = core_registrars.get(name)
         if registrar is not None:
             registrar(server, name)
-        elif name in _V0_2_STUB_TOOLS:
-            _register_v0_2_stub(server, name)
-        # An unknown tool name that is neither a v0.1 core tool nor a known v0.2 stub
-        # is ignored here — config-level adapter validation is the loader's job; the
-        # MCP server only wires the tools it knows. (No silent write path is created.)
+        # An unknown tool name (not a registered core tool) is ignored here — config-level
+        # adapter validation is the loader's job; the MCP server only wires the tools it knows.
+        # (No silent write path is created.) Every shipped tool is now real — the v0.2 call-time
+        # "not available" stub machinery was deleted once the last stub (`get_cost`) shipped.
 
     _load_consumer_pack(server, resolve=pack_resolver)
     return server
@@ -419,12 +396,15 @@ def _coercer_for_annotation(annotation: object) -> _ParamCoercer:
         non_none = tuple(member for member in members if member is not type(None))
         if len(non_none) == 1:
             (inner,) = non_none
-            if inner is str:
-                return _opt_str_kwarg
             # `dict[str, str]` is a generic alias whose origin is the builtin `dict`.
             if typing.get_origin(inner) is dict:
                 return _str_dict_kwarg
-    # Unrecognized annotation → coerce as a required str (the dominant param shape).
+            # `str | None` AND any other UNRECOGNIZED `X | None` route to the OPTIONAL coercer
+            # (NIT-9): an `| None` param is optional, so an absent value must forward as `None`
+            # rather than raising — using the required-str coercer for an unrecognized optional
+            # would be the footgun. `_opt_str_kwarg` still type-checks a present value as str.
+            return _opt_str_kwarg
+    # An unrecognized NON-optional annotation → coerce as a required str (the dominant shape).
     return _str_kwarg
 
 
@@ -622,33 +602,6 @@ def _core_registrars(
         "compare_envs": functools.partial(_register_compare_envs, context),
         "get_cost": functools.partial(_register_get_cost, context),
     }
-
-
-def _register_v0_2_stub(server: PanoptesMcpServer, name: str) -> None:
-    """Register a v0.2-listed tool as a call-time 'not available' stub.
-
-    Listing a v0.2 tool is a valid (future) tool reference, not an unknown adapter,
-    so it does NOT fail config resolution. The stub raises an explicit
-    `CapabilityError` AT CALL TIME so a caller gets a clear not-available error
-    rather than a missing-attribute crash. The stub accepts arbitrary keyword
-    arguments so any invocation shape reaches the explicit error.
-    """
-
-    message = f"Tool '{name}' is not available in v0.1 (ships v0.2)."
-
-    def v0_2_stub_tool(env: str = "all") -> object:
-        """A v0.2 tool not implemented in v0.1 — raises an explicit not-available error.
-
-        Carries a concrete `env` parameter (FastMCP rejects `*args`/`**kwargs` tools)
-        so it presents a valid schema; the body always raises regardless of args.
-        """
-        raise CapabilityError(message)
-
-    def v0_2_stub_invoker(*_args: object, **_kwargs: object) -> object:
-        """The uniform-shape invoker stored for the synchronous v0.2-stub test."""
-        raise CapabilityError(message)
-
-    server._register_stub(name, v0_2_stub_tool, v0_2_stub_invoker)
 
 
 def _load_consumer_pack(

@@ -240,3 +240,57 @@ def test_non_success_status_in_envelope_yields_no_signals() -> None:
     respx.get(_QUERY_RANGE_URL).mock(return_value=httpx.Response(200, json=payload))
     # No samples to emit; the source returns nothing for that query rather than crashing.
     assert _source().fetch(_WINDOW) == []
+
+
+# --- malformed-payload defensive paths (the normalizer skips bad data, never raises) --------
+
+
+@respx.mock
+def test_non_dict_payload_yields_no_signals() -> None:
+    """A non-dict top-level payload (a JSON list) is skipped, not crashed."""
+    respx.get(_QUERY_RANGE_URL).mock(return_value=httpx.Response(200, json=["not", "a", "dict"]))
+    assert _source().fetch(_WINDOW) == []
+
+
+@respx.mock
+def test_non_dict_data_yields_no_signals() -> None:
+    """A `success` envelope whose `data` is not a dict yields no signals."""
+    payload = {"status": "success", "data": "not-a-dict"}
+    respx.get(_QUERY_RANGE_URL).mock(return_value=httpx.Response(200, json=payload))
+    assert _source().fetch(_WINDOW) == []
+
+
+@respx.mock
+def test_non_list_result_yields_no_signals() -> None:
+    """A `data.result` that is not a list yields no signals."""
+    payload = {"status": "success", "data": {"resultType": "matrix", "result": "not-a-list"}}
+    respx.get(_QUERY_RANGE_URL).mock(return_value=httpx.Response(200, json=payload))
+    assert _source().fetch(_WINDOW) == []
+
+
+@respx.mock
+def test_bad_value_pair_and_unparseable_sample_are_skipped() -> None:
+    """A matrix series with a bad ts AND a bad value sample SKIPS the bad ones, keeps the good.
+
+    A non-numeric timestamp and a non-numeric value each fail `_parse_sample` and are skipped;
+    the one well-formed `[unix, "value"]` sample survives — `fetch()` never raises.
+    """
+    payload = {
+        "status": "success",
+        "data": {
+            "resultType": "matrix",
+            "result": [
+                {
+                    "metric": {"__name__": "up", "job": "api"},
+                    "values": [
+                        ["not-a-number", "1"],  # non-numeric ts → skipped
+                        [1735689660, "not-a-float"],  # non-numeric value → skipped
+                        [1735689720, "0.5"],  # the one good sample
+                    ],
+                }
+            ],
+        },
+    }
+    respx.get(_QUERY_RANGE_URL).mock(return_value=httpx.Response(200, json=payload))
+    metrics = [s for s in _source().fetch(_WINDOW) if isinstance(s, MetricSignal)]
+    assert [m.value for m in metrics] == [0.5]

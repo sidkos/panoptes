@@ -154,6 +154,43 @@ def test_unrecognized_annotation_falls_back_to_str_coercion() -> None:
     assert received["env"] == "dev"
 
 
+# --- coercer wrong-type negative paths (the untrusted-kwargs validation boundary) -----------
+#
+# The derived invoker is the boundary between untrusted MCP kwargs and the typed tool fns:
+# `_opt_str_kwarg`/`_str_dict_kwarg` MUST reject a wrong-typed value with a clear TypeError
+# rather than forwarding it. These pin the raise branches that were otherwise uncovered.
+
+
+def test_optional_str_coercer_raises_on_a_non_str_value() -> None:
+    """An optional-str param given a NON-str value (not None) → a clear TypeError."""
+
+    def search_tool(env: str, level: str | None = None) -> str:
+        return f"{env}/{level}"
+
+    with pytest.raises(TypeError, match=r"str\|None"):
+        _make_invoker(search_tool)(env="dev", level=42)
+
+
+def test_dict_coercer_raises_when_value_is_not_a_dict() -> None:
+    """A dict param given a non-dict value (`filters=42`) → a TypeError naming 'dict'."""
+
+    def filtered_tool(env: str, filters: dict[str, str] | None = None) -> str:
+        return env
+
+    with pytest.raises(TypeError, match="dict"):
+        _make_invoker(filtered_tool)(env="dev", filters=42)
+
+
+def test_dict_coercer_raises_on_a_non_str_inner_value() -> None:
+    """A dict param with a non-str inner value (`{'job': 123}`) → a `dict[str, str]` TypeError."""
+
+    def filtered_tool(env: str, filters: dict[str, str] | None = None) -> str:
+        return env
+
+    with pytest.raises(TypeError, match=r"dict\[str, str\]"):
+        _make_invoker(filtered_tool)(env="dev", filters={"job": 123})
+
+
 # --- the PEP-563 liveness guard (load-bearing) ----------------------------------
 
 

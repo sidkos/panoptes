@@ -592,10 +592,13 @@ class CloudWatchSource:
         try:
             spend = self._fetch_cost_spend(window)
             burn = self._fetch_budget_burn()
-        except (ClientError, BotoCoreError):
+        except (ClientError, BotoCoreError, PanoptesError):
             # An auth/transport failure on the cost feed is non-fatal: leave the cadence
             # marker un-advanced (do NOT call mark_done) so the next cycle retries, and emit
-            # nothing this cycle.
+            # nothing this cycle. `PanoptesError` is included because `_resolve_account_id`
+            # raises a bare PanoptesError when STS returns no Account — that must be contained
+            # by the SAME "cost error is non-fatal, retry next cycle" contract, not escape
+            # `fetch()` and drop the cycle's already-collected metric/log signals.
             return []
         # Only advance the cadence marker on a SUCCESSFUL read, so a failed call retries
         # next cycle rather than blacking out cost for a full interval.

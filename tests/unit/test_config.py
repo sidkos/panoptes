@@ -261,6 +261,27 @@ def test_unknown_adapter_type_fails_fast(tmp_path: Path, monkeypatch: pytest.Mon
     assert "does-not-exist" in str(excinfo.value)
 
 
+def test_non_identifier_env_name_fails_fast(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MINOR-4 root-cause: a non-identifier env name is rejected at config-load.
+
+    An env name is stamped UNQUOTED as a PromQL label value (`env="<name>"`) and as the `env`
+    label on every emitted signal, so a name with a breakout char (here a hyphen, outside
+    `[A-Za-z0-9_:]`) must fail fast with a clear PanoptesError rather than silently corrupting a
+    downstream selector/label. The valid `dev`/`stage`/`prod` names continue to load.
+    """
+    _set_reference_env(monkeypatch)
+    # Rename the `dev` env to a hyphenated (non-identifier) name; keep its block intact.
+    body = _REFERENCE_YAML.replace("    dev:", "    dev-prod:", 1)
+    config_path = _write_fixture(tmp_path, body)
+    with pytest.raises(PanoptesError) as excinfo:
+        load_config(config_path, registries=_registries_with_correct_capabilities())
+    message = str(excinfo.value)
+    assert "dev-prod" in message
+    assert "identifier" in message.lower()
+
+
 def test_disabled_env_produces_no_adapters(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _set_reference_env(monkeypatch)
     config_path = _write_fixture(tmp_path)

@@ -13,13 +13,12 @@ Covers (spec `## Tests` → MCP bullet / playbook Phase 6 table):
   `CapabilityError`, never an empty list (no v0.1 source provides TRACE).
 - **`env="all"` fan-out** including the **one-env-down → per-env partial result
   with an explicit per-env error marker** case (the call does not wholesale-fail).
-- **No call-time stub tools remain** — v0.2 promoted `compare_envs`/`get_slo` and
-  v0.3 promoted `get_cost` (the last stub), so `_V0_2_STUB_TOOLS` is now empty and
-  `get_cost` is a REAL tool returning a `CostBreakdown` rather than raising.
-- **STRUCTURAL read-only assertion** — with the default v0.1 config (no v0.2
-  stubs) the registered tool set is EXACTLY the known read-only set AND no
-  registered tool NAME matches the mutation-verb regex, so a future write tool
-  under ANY name fails.
+- **No stub machinery remains** — v0.2 promoted `compare_envs`/`get_slo` and v0.3
+  promoted `get_cost` (the last stub), so the call-time-stub machinery was DELETED
+  (NIT-11) and `get_cost` is a REAL tool returning a `CostBreakdown` rather than raising.
+- **STRUCTURAL read-only assertion** — with the default config the registered tool
+  set is EXACTLY the known read-only set AND no registered tool NAME matches the
+  mutation-verb regex, so a future write tool under ANY name fails.
 
 All tests are synchronous and deterministic — the query functions take an explicit
 context and the server exposes its registered tool names + raw callables for sync
@@ -41,7 +40,6 @@ from core.config import (
 from core.errors import CapabilityError
 from core.mcp.context import QueryContext
 from core.mcp.server import (
-    _V0_2_STUB_TOOLS,
     KNOWN_READ_ONLY_TOOLS,
     PanoptesMcpServer,
     build_server,
@@ -607,6 +605,47 @@ def test_query_metric_escapes_backslash_in_filter_value() -> None:
     assert r'path="a\\b"' in captured[0]
 
 
+def test_query_metric_escapes_a_quote_bearing_env_in_the_selector() -> None:
+    """MINOR-4: the `env=` matcher is ESCAPED, not spliced raw (defense-in-depth, F7).
+
+    `query_metric` was the one selector site that interpolated `env` UNESCAPED. Config-load now
+    rejects non-identifier env names (the root-cause fix), but the splice ALSO escapes as
+    defense-in-depth: a config built in-memory with a quote-bearing env name (bypassing the
+    loader) must still reach the store as the single closed string `env="a\\"b"`, never breaking
+    out of the selector. The env passes membership (it IS a declared env), so this exercises the
+    escape path itself.
+    """
+    captured: list[str] = []
+
+    class _RecordingStore:
+        type = "recording"
+
+        def write(self, signals: list[CanonicalSignal]) -> None:
+            return None
+
+        def query(self, query: MetricQuery) -> list[MetricSeries]:
+            captured.append(query.expr)
+            return []
+
+    # A config whose declared env name itself carries a quote (in-memory, bypassing the loader's
+    # env-name validation) so the env passes membership and the escape-at-splice path runs.
+    quote_env = 'a"b'
+    config = _config(
+        {
+            quote_env: ResolvedEnvironment(
+                name=quote_env,
+                enabled=True,
+                sources=[_resolved_source("http-health", {SignalKind.METRIC})],
+            ),
+        },
+        store=_RecordingStore(),
+    )
+    query_metric(
+        QueryContext(config), env=quote_env, name="panoptes_health_up", window="15m", filters=None
+    )
+    assert captured and r'env="a\"b"' in captured[0]
+
+
 def test_query_metric_rejects_unknown_env() -> None:
     """An env not in the config (and not the `all` sentinel) is rejected (F7)."""
     config, _ = _selector_recording_config()
@@ -839,18 +878,80 @@ def test_get_cluster_state_passthrough_store_is_unreachable_not_crash() -> None:
     assert state["reachable"] is False
 
 
+def test_get_cluster_state_cluster_label_from_node_count_when_restarts_absent() -> None:
+    """REGRESSION (deepening B): the cluster label resolves from the ALWAYS-present node gauge.
+
+    A cluster with nodes but NO pods emits a `panoptes_k8s_node_count` series (carrying
+    {env, cluster}) but NO per-namespace `pod_restarts_total` series. Reading the label only
+    off the (empty) restart series regressed `ClusterState.cluster` to ''. This pins the fix:
+    with node_count present (cluster label "c1") and restarts EMPTY, `cluster` is the real
+    name (not '') AND node_count is correct.
+    """
+    store = _K8sGaugeStore(
+        {
+            "panoptes_k8s_node_count": [_k8s_series("panoptes_k8s_node_count", "dev", "c1", 3.0)],
+            # pending/crashloop present (single-value), but NO pod_restarts_total series.
+            "panoptes_k8s_pods_pending": [
+                _k8s_series("panoptes_k8s_pods_pending", "dev", "c1", 0.0)
+            ],
+            "panoptes_k8s_pods_crashloop": [
+                _k8s_series("panoptes_k8s_pods_crashloop", "dev", "c1", 0.0)
+            ],
+        }
+    )
+    state = get_cluster_state(QueryContext(_k8s_config(store)), env="dev")
+    assert state["cluster"] == "c1", (
+        "the cluster label must come from the always-present node gauge"
+    )
+    assert state["node_count"] == 3.0
+    assert state["pod_restarts_total"] == 0.0  # no restart series → zero, not a crash
+    assert state["reachable"] is True
+
+
+def test_get_cluster_state_reachable_when_only_restarts_present() -> None:
+    """MINOR-5: ONLY a `pod_restarts_total` series present → reachable via the restarts term.
+
+    Exercises the `or bool(restarts_series)` deciding-term of `reachable`: no node/pending/
+    crashloop gauge, only per-namespace restart series. The three scalars default to 0.0, the
+    restart total is the per-namespace sum, and `reachable` is True (the cluster IS observed).
+    """
+    store = _K8sGaugeStore(
+        {
+            "panoptes_k8s_pod_restarts_total": [
+                _k8s_series("panoptes_k8s_pod_restarts_total", "dev", "c1", 4.0, namespace="ns-a"),
+                _k8s_series("panoptes_k8s_pod_restarts_total", "dev", "c1", 6.0, namespace="ns-b"),
+            ],
+        }
+    )
+    state = get_cluster_state(QueryContext(_k8s_config(store)), env="dev")
+    assert state["reachable"] is True
+    assert state["pod_restarts_total"] == 10.0
+    assert state["node_count"] == 0.0
+    assert state["pods_pending"] == 0.0
+    assert state["pods_crashloop"] == 0.0
+    # The cluster label still resolves (falls back to the restart series' {cluster} label).
+    assert state["cluster"] == "c1"
+
+
 # --- v0.x stub tools -------------------------------------------------------------
 
 
-def test_no_call_time_stub_tools_remain() -> None:
-    """The v0.x call-time-stub set is EMPTY — every shipped tool is fully implemented.
+def test_no_stub_machinery_remains() -> None:
+    """The call-time-stub machinery is DELETED — every shipped tool is fully implemented.
 
-    v0.2 Phase 4 promoted `compare_envs`/`get_slo`; v0.3 Phase 3 promoted `get_cost` (the
-    last stub) into a REAL tool rendering from the stored `panoptes_cost_*` gauges. With
-    `get_cost` real, `_V0_2_STUB_TOOLS` collapses to the empty tuple — no name resolves to a
-    not-available stub any more.
+    v0.2 Phase 4 promoted `compare_envs`/`get_slo`; v0.3 Phase 3 promoted `get_cost` (the last
+    stub) into a REAL tool. With no stub left, the v0.2 stub machinery was removed (NIT-11): the
+    `_V0_2_STUB_TOOLS` tuple, the `_register_v0_2_stub` function, and the `PanoptesMcpServer.
+    _register_stub` method no longer exist. This pins that they are GONE (a re-introduction
+    would fail here), while the structural exact-set test proves the registered set is unchanged.
     """
-    assert _V0_2_STUB_TOOLS == ()
+    import core.mcp.server as server_module
+
+    assert not hasattr(server_module, "_V0_2_STUB_TOOLS"), "the _V0_2_STUB_TOOLS tuple must be gone"
+    assert not hasattr(server_module, "_register_v0_2_stub"), "_register_v0_2_stub must be gone"
+    assert not hasattr(PanoptesMcpServer, "_register_stub"), (
+        "the _register_stub method must be gone"
+    )
 
 
 def test_get_cost_is_a_real_tool_not_a_call_time_stub() -> None:

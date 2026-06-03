@@ -371,6 +371,93 @@ def test_cost_transport_error_is_swallowed_and_cadence_not_advanced() -> None:
         stub.assert_no_pending_responses()
 
 
+def _add_cost_spend_only(ce_stub: Stubber) -> None:
+    """Queue ONLY the CE GetCostAndUsage spend response (no budgets/STS) — for the spend leg."""
+    ce_stub.add_response(
+        "get_cost_and_usage",
+        {
+            "ResultsByTime": [
+                {
+                    "TimePeriod": {"Start": "2025-12-02", "End": "2026-01-01"},
+                    "Total": {},
+                    "Groups": [
+                        {
+                            "Keys": ["AmazonEC2"],
+                            "Metrics": {"UnblendedCost": {"Amount": "120.50", "Unit": "USD"}},
+                        }
+                    ],
+                    "Estimated": False,
+                }
+            ]
+        },
+    )
+
+
+def test_cost_panoptes_error_from_account_id_is_swallowed_and_cadence_not_advanced() -> None:
+    """NIT-10: a bare PanoptesError from account-id resolution is non-fatal (cost dropped, retry).
+
+    `_resolve_account_id` raises a bare `PanoptesError` when STS GetCallerIdentity returns no
+    `Account`. That must be contained by the SAME "cost error is non-fatal, retry next cycle"
+    contract as the boto errors — it must NOT escape `fetch()` and drop the cycle's already-
+    collected metric/log signals, and it must NOT advance the cadence marker.
+
+    Steps:
+        1. Cycle 1: CE spend succeeds, then STS returns an identity with NO `Account` →
+           `_resolve_account_id` raises PanoptesError (budgets never reached).
+        2. Cycle 1 fetch: no crash, no cost gauges, but the (empty) metric/log feeds still ran.
+        3. Advance the clock UNDER the interval; cycle 2 retries (marker not advanced) and the
+           full cost read succeeds.
+    """
+    cw, logs = _cloudwatch_client(), _logs_client()
+    ce, budgets, sts = _ce_client(), _budgets_client(), _sts_client()
+    cw_stub, logs_stub = Stubber(cw), Stubber(logs)
+    ce_stub, budgets_stub, sts_stub = Stubber(ce), Stubber(budgets), Stubber(sts)
+
+    for _ in range(2):
+        _empty_feeds(cw_stub, logs_stub)
+
+    # Cycle 1: CE spend OK, then STS identity with NO `Account` → _resolve_account_id raises a
+    # bare PanoptesError (budgets never reached, so no cycle-1 budgets response).
+    _add_cost_spend_only(ce_stub)
+    sts_stub.add_response("get_caller_identity", {"UserId": "U", "Arn": "arn:aws:iam::x:user/p"})
+    # Cycle 2: a full successful read.
+    _add_cost_responses(ce_stub, budgets_stub, sts_stub)
+
+    for stub in (cw_stub, logs_stub, ce_stub, budgets_stub, sts_stub):
+        stub.activate()
+
+    clock = _FakeClock(_CLOCK_START)
+    source = CloudWatchSource(
+        _config(cost_budget_name=_BUDGET_NAME, cost_poll_interval_seconds=_POLL_INTERVAL_SECONDS),
+        cloudwatch_client=cw,
+        logs_client=logs,
+        ce_client=ce,
+        budgets_client=budgets,
+        sts_client=sts,
+        clock=clock.now,
+    )
+
+    def _cost_count(signals: list[object]) -> int:
+        return sum(
+            1
+            for s in signals
+            if isinstance(s, MetricSignal) and s.name.startswith("panoptes_cost_")
+        )
+
+    # Cycle 1 — the PanoptesError is swallowed: no crash, no cost gauges. `fetch()` STILL returns
+    # (the metric/log feeds ran — here they are empty, so the whole fetch is an empty list, but
+    # crucially it did not RAISE and the cycle was not dropped).
+    cycle_1 = source.fetch(_WINDOW)
+    assert _cost_count(list(cycle_1)) == 0
+
+    # Cycle 2 — WITHIN the interval, but due because the failed read never advanced the marker.
+    clock.advance(_POLL_INTERVAL_SECONDS - 1)
+    assert _cost_count(list(source.fetch(_WINDOW))) > 0
+
+    for stub in (ce_stub, budgets_stub, sts_stub):
+        stub.assert_no_pending_responses()
+
+
 # --- _PollGate — the extracted cadence seam (direct unit tests) ------------------
 #
 # `_PollGate` is the module-private cadence concern the cost path delegates to: `is_due()`
