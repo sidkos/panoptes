@@ -19,9 +19,16 @@ one source instance per env and threads the env into each block. This adapter
 consumes a flat `env` config field rather than coupling to a Phase-1 loader change
 (Phase-7 YAML/loader wiring supplies it; tests pass it directly).
 
+This adapter is the LIGHT delegate to `core.rest`: it shares only the injectable
+`httpx.Client` construction seam (via `RestClient`). It deliberately does NOT use the
+shared raise/failure-surfacing path, because a probe failure is NOT an error to raise
+— every down shape (5xx / connection-refused / timeout) must map to `up=0.0` with a
+latency still recorded, not a `PanoptesError`. So it drives the raw client and keeps
+its own up/down branching.
+
 httpx is mocked in tests with `respx`, which patches the transport globally, so the
-default `httpx.Client()` is intercepted without an injected client; the client is
-still exposed as a constructor seam for explicit control.
+`RestClient`'s default `httpx.Client()` is intercepted without an injected client; the
+client is still threaded as a constructor seam for explicit control.
 """
 
 import time
@@ -37,6 +44,7 @@ from core.model import (
     TimeWindow,
 )
 from core.registry import SOURCES, ConfigBlock
+from core.rest import RestClient
 from core.sources._config import require_str_field
 
 # Derived-metric names (spec `## Data Model` — `panoptes_` prefix avoids colliding
@@ -60,13 +68,15 @@ class HttpHealthSource:
 
         The `client` seam keeps the source unit-testable without monkeypatching;
         under `respx` a default `httpx.Client()` is intercepted globally, so
-        production code passes no client and tests need not inject one.
+        production code passes no client and tests need not inject one. The client is
+        threaded into the shared `RestClient` (sharing only the construction seam —
+        see the module docstring on why this probe keeps its own up/down branching).
         """
         self._url = require_str_field(config, "url", self.type)
         # `env` is mandatory because every emitted signal must carry an `env` label
         # (model invariant). Read it from the per-env config block the loader builds.
         self._env = require_str_field(config, "env", self.type)
-        self._client = client if client is not None else httpx.Client()
+        self._rest = RestClient(client)
 
     def capabilities(self) -> set[SignalKind]:
         """http-health only ever emits metric signals (the two health gauges)."""
@@ -123,7 +133,7 @@ class HttpHealthSource:
         timestamp = datetime.now(UTC)
         start = time.perf_counter()
         try:
-            response = self._client.get(self._url, timeout=_REQUEST_TIMEOUT_SECONDS)
+            response = self._rest.http.get(self._url, timeout=_REQUEST_TIMEOUT_SECONDS)
             # raise_for_status turns a 5xx into an HTTPStatusError (an HTTPError),
             # collapsing the 5xx case into the same down branch as transport errors.
             response.raise_for_status()

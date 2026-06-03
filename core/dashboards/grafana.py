@@ -21,8 +21,10 @@ injected consumer pack whose `json_path` is a mounted dir) and:
    Risk R6; this is local file I/O, not a boto3 mutation).
 3. **Pings** the Grafana HTTP API (`GET /api/search`) to confirm the dashboards
    loaded — but ONLY when a `url` is configured. With no url (the unit-test default)
-   the ping is skipped so the sync is verifiable fully offline. The httpx client is
-   an injectable seam mirroring the VM store, so `respx` intercepts it in tests.
+   the ping is skipped so the sync is verifiable fully offline. The ping delegates to
+   the shared `core.rest.RestClient`, so it gains the both-branch failure surfacing
+   (the upstream body on an HTTP-status error) for free; `respx` intercepts the
+   `RestClient`'s default client in tests, and the client is still an injectable seam.
 
 Grafana assigns each dashboard a uid from its file; collisions across packs are
 avoided by syncing each pack into a per-pack subdir keyed on the pack id + the
@@ -36,6 +38,7 @@ import httpx
 from core.errors import CapabilityError, PanoptesError
 from core.model import DashboardPack
 from core.registry import DASHBOARD_PROVIDERS, ConfigBlock
+from core.rest import RestClient
 
 # The consumer-pack dir is globbed for this pattern; a core pack's `json_path`
 # already points straight at its `dashboard.json`.
@@ -69,7 +72,8 @@ class GrafanaDashboardProvider:
                 skipped, so the sync is verifiable fully offline.
             client: an optional injected httpx client (mirrors the VM store seam). A
                 default `httpx.Client()` is intercepted globally by `respx` in tests,
-                so production passes none.
+                so production passes none. It is threaded into the shared `RestClient`,
+                which owns the ping transport + failure surfacing.
         """
         provisioning_dir = config.get("provisioning_dir")
         if isinstance(provisioning_dir, str) and provisioning_dir:
@@ -80,7 +84,7 @@ class GrafanaDashboardProvider:
         url = config.get("url")
         # An empty/absent url disables the ping (the offline unit-test default).
         self._grafana_url = url.rstrip("/") if isinstance(url, str) and url else None
-        self._client = client if client is not None else httpx.Client()
+        self._rest = RestClient(client)
 
     def provision(self, packs: list[DashboardPack]) -> None:
         """Resolve, sync, and (when a url is configured) confirm every pack's JSON.
@@ -147,13 +151,15 @@ class GrafanaDashboardProvider:
     def _ping_grafana(self) -> None:
         """GET the Grafana search API to confirm the provisioned dashboards loaded.
 
-        A non-2xx response or a transport error is surfaced as a `PanoptesError`
-        carrying the endpoint — a provisioning sync that Grafana never picked up is a
-        real failure the operator must see, not a silent success.
+        A non-2xx response or a transport error is surfaced as a `PanoptesError` via the
+        shared `RestClient` — so the ping now carries the upstream response body on an
+        HTTP-status error (the deeper failure surfacing it gains for free), naming the
+        endpoint. A provisioning sync that Grafana never picked up is a real failure the
+        operator must see, not a silent success.
         """
         endpoint = f"{self._grafana_url}{_SEARCH_PATH}"
-        try:
-            response = self._client.get(endpoint)
-            response.raise_for_status()
-        except httpx.HTTPError as exc:
-            raise PanoptesError(f"Grafana provisioning ping failed ({endpoint}): {exc}") from exc
+        self._rest.send(
+            lambda http: http.get(endpoint),
+            prefix="Grafana provisioning ping failed",
+            identifier=endpoint,
+        )

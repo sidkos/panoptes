@@ -15,15 +15,22 @@ Three REST-client behaviors the spec mandates:
   (`sleep`) so a unit test can assert the value was read/respected without stalling on
   a real wall-clock sleep.
 - **Failure body surfaced.** A non-429 4xx/5xx raises a typed `PanoptesError` whose
-  message carries the trimmed upstream response body via `_format_failure` (the bare
-  status code omits *which* field/token the upstream rejected — spec
-  `## Performance Constraints`). A 401 (bad token) or 404 (wrong project) therefore
-  raises rather than returning a silently-empty incident list.
+  message carries the trimmed upstream response body via the shared `core.rest`
+  failure surfacing (the bare status code omits *which* field/token the upstream
+  rejected — spec `## Performance Constraints`). A 401 (bad token) or 404 (wrong
+  project) therefore raises rather than returning a silently-empty incident list.
 - **`env` stamped.** Every emitted signal carries the configured `env` (model
   invariant); the derived gauge's exact label set is `{env, level, project}`.
 
-httpx is mocked in tests with `respx`; the default `httpx.Client()` is intercepted
-globally, and is exposed as a constructor seam for explicit control.
+The transport plumbing (the injectable `httpx.Client` seam, `raise_for_status`, and
+the both-branch failure surfacing) lives once in `core.rest`; this source keeps only
+its own URL building, the `Retry-After` honor, and the issue normalization. The
+Retry-After flow needs to inspect a 429 status BEFORE deciding to retry, so it drives
+the raw client (`RestClient.http`) for the GETs and funnels the FINAL response through
+`RestClient.send` for the shared raise + failure surfacing.
+
+httpx is mocked in tests with `respx`; the `RestClient`'s default `httpx.Client()` is
+intercepted globally, and is threaded as a constructor seam for explicit control.
 """
 
 import time
@@ -43,6 +50,7 @@ from core.model import (
     TimeWindow,
 )
 from core.registry import SOURCES, ConfigBlock
+from core.rest import RestClient
 from core.sources._config import require_str_field
 
 # Derived-metric name (spec `## Data Model` — `panoptes_` prefix avoids PromQL
@@ -52,10 +60,6 @@ _METRIC_INCIDENT_COUNT = "panoptes_sentry_incident_count"
 # Default Sentry SaaS base; overridable per-deployment (self-hosted Sentry) via the
 # `base_url` config field.
 _DEFAULT_BASE_URL = "https://sentry.io"
-
-# Trim length for the surfaced upstream response body (spec ~800 chars): enough to
-# carry the rejected-field/token detail without dumping an unbounded error page.
-_BODY_TRIM_CHARS = 800
 
 # Cap the `Retry-After` honor so a hostile/huge header can never stall the collector
 # cycle unbounded; beyond this we give up and surface the rate-limit as a failure.
@@ -100,7 +104,7 @@ class SentrySource:
         self._base_url = (
             base_url.rstrip("/") if isinstance(base_url, str) and base_url else _DEFAULT_BASE_URL
         )
-        self._client = client if client is not None else httpx.Client()
+        self._rest = RestClient(client)
         self._sleep = sleep if sleep is not None else time.sleep
 
     def capabilities(self) -> set[SignalKind]:
@@ -150,26 +154,21 @@ class SentrySource:
         params = {"environment": self._env}
         headers = {"Authorization": f"Bearer {self._token}"}
 
-        # The whole request flow is wrapped so a transport error (connection refused /
-        # timeout) on EITHER the initial GET or the post-Retry-After retry surfaces as a
-        # typed PanoptesError, never a raw httpx exception leaking past the source.
-        try:
-            response = self._client.get(endpoint, params=params, headers=headers)
+        # The Retry-After flow needs to inspect a 429 status BEFORE deciding to retry, so
+        # the GETs run on the raw client; the FINAL response is funneled through the shared
+        # `RestClient.send` for the raise_for_status + both-branch failure surfacing (a
+        # transport error on EITHER GET surfaces as a typed PanoptesError, never raw httpx).
+        def _request(http: httpx.Client) -> httpx.Response:
+            response = http.get(endpoint, params=params, headers=headers)
             if response.status_code == httpx.codes.TOO_MANY_REQUESTS:
                 # Read + respect Retry-After, then retry exactly once.
                 self._honor_retry_after(response)
-                response = self._client.get(endpoint, params=params, headers=headers)
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            # 4xx/5xx — the response body names the rejected field/token.
-            raise PanoptesError(
-                self._format_failure("sentry issues fetch failed", endpoint, exc)
-            ) from exc
-        except httpx.HTTPError as exc:
-            # Connection/timeout — no response body to surface; the helper copes.
-            raise PanoptesError(
-                self._format_failure("sentry issues fetch failed", endpoint, exc)
-            ) from exc
+                response = http.get(endpoint, params=params, headers=headers)
+            return response
+
+        response = self._rest.send(
+            _request, prefix="sentry issues fetch failed", identifier=endpoint
+        )
         return self._parse_issues(response.json())
 
     def _honor_retry_after(self, response: httpx.Response) -> None:
@@ -283,21 +282,3 @@ class SentrySource:
             except ValueError:
                 pass
         return datetime.fromtimestamp(0, tz=UTC)
-
-    @staticmethod
-    def _format_failure(prefix: str, identifier: str, exc: httpx.HTTPError) -> str:
-        """Build a diagnosable failure message, appending the upstream body when present.
-
-        Mirrors the store's `_format_failure` convention: an `HTTPStatusError` carries
-        a response whose trimmed body names the rejected field/token; a connection
-        error has no response and falls back to the exception text without touching the
-        absent `.response`.
-        """
-        response = getattr(exc, "response", None)
-        if response is not None:
-            body = response.text[:_BODY_TRIM_CHARS]
-            return (
-                f"{prefix} ({identifier}): HTTP {response.status_code}. "
-                f"Upstream response body: {body}"
-            )
-        return f"{prefix} ({identifier}): {exc}"

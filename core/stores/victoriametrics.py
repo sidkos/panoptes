@@ -12,14 +12,17 @@ Two deliberate design points:
   ignores other kinds rather than trying to encode them.
 - **Failures surface the upstream response body.** A 4xx/5xx from VictoriaMetrics
   carries *which field/value it rejected* in the response text; `str(HTTPStatusError)`
-  only has URL + status code. `_format_failure` appends the trimmed body so a write
-  rejection is diagnosable in one cycle (spec `## Performance Constraints` — the
-  REST-client convention). The same helper copes with a connection error, where
-  there is no response to read — it must not itself crash on the missing `.response`.
+  only has URL + status code. The shared `core.rest.RestClient` appends the trimmed
+  body so a write rejection is diagnosable in one cycle (spec `## Performance
+  Constraints` — the REST-client convention). It also copes with a connection error,
+  where there is no response to read — it must not crash on the missing `.response`.
 
-httpx mocking in tests is done with `respx`, which patches the transport globally,
-so a plain `httpx.Client()` constructed here is intercepted without an injected
-client. The client is still exposed as a constructor seam for explicit injection.
+The transport plumbing (the injectable `httpx.Client` seam, `raise_for_status`, and
+the both-branch failure surfacing) lives once in `core.rest`; this store keeps only
+its own URL building, the VM import-line serialization, and the matrix parse. httpx
+mocking in tests is done with `respx`, which patches the transport globally, so the
+`RestClient`'s default `httpx.Client()` is intercepted without an injected client.
+The client is still threaded through as a constructor seam for explicit injection.
 """
 
 import json
@@ -30,15 +33,12 @@ import httpx
 from core.errors import PanoptesError
 from core.model import CanonicalSignal, MetricQuery, MetricSeries, MetricSignal
 from core.registry import STORES, ConfigBlock
+from core.rest import RestClient
 
 # VictoriaMetrics endpoints (Risk R9: JSON-line import for writes, PromQL range for
 # reads — chosen because the import line shape is byte-exact-assertable in tests).
 _IMPORT_PATH = "/api/v1/import"
 _QUERY_RANGE_PATH = "/api/v1/query_range"
-
-# Trim length for the surfaced upstream response body (spec ~800 chars): enough to
-# carry the rejected-field detail without dumping an unbounded error page into logs.
-_BODY_TRIM_CHARS = 800
 
 
 @STORES.register("victoriametrics")
@@ -53,7 +53,8 @@ class VictoriaMetricsStore:
         The `client` seam keeps the store unit-testable without monkeypatching; under
         `respx` a default `httpx.Client()` is intercepted globally, so production code
         passes no client and tests need not inject one — the seam exists for explicit
-        control where wanted.
+        control where wanted. The client is threaded into the shared `RestClient`, which
+        owns the transport + failure surfacing.
         """
         url = config.get("url")
         if not isinstance(url, str) or not url:
@@ -63,7 +64,7 @@ class VictoriaMetricsStore:
             )
         # Normalize away a trailing slash so endpoint joins produce a single slash.
         self._base_url = url.rstrip("/")
-        self._client = client if client is not None else httpx.Client()
+        self._rest = RestClient(client)
 
     def write(self, signals: list[CanonicalSignal]) -> None:
         """Serialize metric signals to VM import lines and POST them.
@@ -79,14 +80,13 @@ class VictoriaMetricsStore:
             return
         body = "\n".join(lines)
         endpoint = f"{self._base_url}{_IMPORT_PATH}"
-        try:
-            response = self._client.post(endpoint, content=body.encode("utf-8"))
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise PanoptesError(self._format_failure("VM import failed", endpoint, exc)) from exc
-        except httpx.HTTPError as exc:
-            # Connection/timeout errors carry no response — the helper handles that.
-            raise PanoptesError(self._format_failure("VM import failed", endpoint, exc)) from exc
+        # Delegate the POST + raise_for_status + both-branch failure surfacing to the
+        # shared RestClient; only the URL + the import-line body are VM-specific here.
+        self._rest.send(
+            lambda http: http.post(endpoint, content=body.encode("utf-8")),
+            prefix="VM import failed",
+            identifier=endpoint,
+        )
 
     def query(self, query: MetricQuery) -> list[MetricSeries]:
         """Run a PromQL range query and parse the matrix result into `MetricSeries`.
@@ -102,14 +102,11 @@ class VictoriaMetricsStore:
             "end": str(int(query.window.end.timestamp())),
             "step": str(query.step_seconds),
         }
-        try:
-            response = self._client.get(endpoint, params=params)
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise PanoptesError(self._format_failure("VM query failed", endpoint, exc)) from exc
-        except httpx.HTTPError as exc:
-            raise PanoptesError(self._format_failure("VM query failed", endpoint, exc)) from exc
-        return self._parse_matrix(response.json())
+        # The shared RestClient GETs + raises + parses JSON; the matrix shape is VM's.
+        payload = self._rest.get_json(
+            endpoint, prefix="VM query failed", identifier=endpoint, params=params
+        )
+        return self._parse_matrix(payload)
 
     @staticmethod
     def _to_import_line(signal: MetricSignal) -> str:
@@ -187,24 +184,3 @@ class VictoriaMetricsStore:
             timestamp = datetime.fromtimestamp(float(epoch_seconds), tz=UTC)
             points.append((timestamp, float(value_text)))
         return points
-
-    @staticmethod
-    def _format_failure(prefix: str, identifier: str, exc: httpx.HTTPError) -> str:
-        """Build a diagnosable failure message, appending the upstream body when present.
-
-        Handles both branches:
-        - **response present** (an `HTTPStatusError`): append the trimmed response
-          body, which carries the rejected field/value the bare status code omits.
-        - **no response** (a connection/timeout error such as `httpx.ConnectError`):
-          there is nothing to read, so fall back to the exception's own message — and
-          critically, do not touch `exc.response` (it is absent and would crash).
-        """
-        response = getattr(exc, "response", None)
-        if response is not None:
-            body = response.text[:_BODY_TRIM_CHARS]
-            return (
-                f"{prefix} ({identifier}): HTTP {response.status_code}. "
-                f"Upstream response body: {body}"
-            )
-        # Connection error — no response object; surface the underlying exception text.
-        return f"{prefix} ({identifier}): {exc}"
