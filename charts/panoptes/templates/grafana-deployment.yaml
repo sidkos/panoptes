@@ -43,7 +43,10 @@ spec:
             - name: http
               containerPort: 3000
           volumeMounts:
-            # The dashboard provisioning config + the dashboard JSON, mounted from ConfigMaps.
+            # The datasource provisioning (the VictoriaMetrics datasource) + the dashboard
+            # provisioning config + the dashboard JSON, all mounted from ConfigMaps.
+            - name: datasources
+              mountPath: /etc/grafana/provisioning/datasources
             - name: provisioning
               mountPath: /etc/grafana/provisioning/dashboards
             - name: dashboards
@@ -51,6 +54,9 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
+        - name: datasources
+          configMap:
+            name: {{ include "panoptes.fullname" . }}-grafana-datasources
         - name: provisioning
           configMap:
             name: {{ include "panoptes.fullname" . }}-grafana-provisioning
@@ -88,3 +94,25 @@ data:
   # The dashboard JSON is synced into this ConfigMap at release time (the core + injected
   # packs); left as a placeholder key here so the ConfigMap renders schema-clean offline.
   .keep: ""
+---
+# The Grafana DATASOURCE provisioning — wires the in-cluster VictoriaMetrics store as the
+# default Prometheus-compatible datasource so panels resolve out of the box. A live deploy
+# showed the hosted chart shipped NO datasource (compose mounts one; the chart did not), so
+# Grafana came up with zero datasources. Grafana reads this at /etc/grafana/provisioning/datasources.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "panoptes.fullname" . }}-grafana-datasources
+  labels:
+    {{- include "panoptes.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grafana
+data:
+  panoptes-datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: VictoriaMetrics
+        type: prometheus
+        access: proxy
+        url: http://{{ include "panoptes.fullname" . }}-victoriametrics:8428
+        isDefault: true
+        editable: false

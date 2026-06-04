@@ -23,6 +23,18 @@ hostname: panoptes.example.com
 ingress:
   className: nginx
   clusterIssuer: letsencrypt-prod
+  # Create the cert-manager ClusterIssuer named above (Let's Encrypt ACME, HTTP-01 solved via
+  # the nginx ingress). Default false: it needs the cert-manager CRDs (the Terraform module
+  # installs cert-manager) AND a real ACME contact email. A live deploy showed the chart
+  # REFERENCED clusterIssuer but never CREATED it, so the Certificate stayed Pending with no
+  # issuer. An operator who manages their own issuer leaves this false and references it by name.
+  createClusterIssuer: false
+  # REQUIRED when createClusterIssuer is true — the ACME registration contact (Let's Encrypt
+  # rejects an empty contact). The template fails the render if it is empty.
+  acmeEmail: ""
+  # The ACME directory URL (Let's Encrypt PRODUCTION default; use the staging URL
+  # https://acme-staging-v02.api.letsencrypt.org/directory while testing to avoid prod rate limits).
+  acmeServer: https://acme-v02.api.letsencrypt.org/directory
 
 # The IRSA role ARN the collector + MCP ServiceAccounts are annotated with
 # (`eks.amazonaws.com/role-arn`) — the Terraform module's `irsa_role_arn` output. Their
@@ -45,6 +57,22 @@ victoriametrics:
   image: victoriametrics/victoria-metrics:v1.103.0
   retention: 15d
   storageSize: 10Gi
+  # The VM storageClassName. Defaults to gp3 (the EBS-CSI StorageClass the Terraform module
+  # makes the cluster default). Override for a different CSI class; empty uses the cluster default.
+  storageClassName: ""
+  # VictoriaMetrics' upstream image runs as ROOT by default, which the base pod
+  # `runAsNonRoot: true` REJECTS at the kubelet ("container has runAsNonRoot and image will run
+  # as root") — a real-cluster failure `helm template` cannot surface. So the VM StatefulSet uses
+  # this dedicated pod securityContext: a numeric runAsUser/runAsGroup makes it non-root, and
+  # fsGroup chowns the PVC-backed /storage volume to the group so the non-root process can write
+  # its TSDB. The other workloads' images are already non-root, so only VM needs this override.
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
 
 # Grafana: the read-only dashboard face (provisioned core + injected packs).
 grafana:

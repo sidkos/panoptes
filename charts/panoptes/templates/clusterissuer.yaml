@@ -1,0 +1,36 @@
+{{- if .Values.ingress.createClusterIssuer }}
+{{- /*
+The cert-manager ClusterIssuer (Let's Encrypt ACME) the Ingress references for its TLS cert.
+
+A live deploy surfaced that the chart REFERENCED .Values.ingress.clusterIssuer on the Ingress
++ Certificate but never CREATED the ClusterIssuer, so the Certificate stayed `Ready: False`
+with "issuer not found". This renders it when createClusterIssuer is true (opt-in, because it
+needs the cert-manager CRDs the Terraform module installs AND a real ACME contact email; an
+operator who manages their own issuer leaves it false and references it by name).
+
+The HTTP-01 challenge is solved through the nginx ingress class; cert-manager answers the ACME
+challenge on the gated host once DNS resolves to the ingress LoadBalancer. The issuer itself
+becomes Ready as soon as the ACME account registers (no DNS needed) — only the per-host
+Certificate waits on DNS.
+*/ -}}
+{{- if not .Values.ingress.acmeEmail }}
+{{- fail "ingress.acmeEmail is REQUIRED when ingress.createClusterIssuer is true — Let's Encrypt rejects an empty ACME registration contact." }}
+{{- end }}
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: {{ .Values.ingress.clusterIssuer }}
+  labels:
+    {{- include "panoptes.labels" . | nindent 4 }}
+spec:
+  acme:
+    server: {{ .Values.ingress.acmeServer | quote }}
+    email: {{ .Values.ingress.acmeEmail | quote }}
+    # The ACME account private key cert-manager stores after registration.
+    privateKeySecretRef:
+      name: {{ .Values.ingress.clusterIssuer }}-account-key
+    solvers:
+      - http01:
+          ingress:
+            class: {{ .Values.ingress.className }}
+{{- end }}

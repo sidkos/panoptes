@@ -30,8 +30,10 @@ spec:
       # The VM store talks only to the collector/Grafana over HTTP — it needs no K8s API
       # token, so the SA token is NOT automounted (token blast-radius reduction).
       automountServiceAccountToken: false
+      # VM-specific pod securityContext (runAsUser + fsGroup) — the upstream VM image runs as
+      # root, so the shared runAsNonRoot base would reject it; see values.yaml victoriametrics.
       securityContext:
-        {{- include "panoptes.podSecurityContext" . | nindent 8 }}
+        {{- toYaml .Values.victoriametrics.podSecurityContext | nindent 8 }}
       containers:
         - name: victoriametrics
           image: {{ .Values.victoriametrics.image | quote }}
@@ -56,6 +58,9 @@ spec:
         name: storage
       spec:
         accessModes: ["ReadWriteOnce"]
+        {{- with .Values.victoriametrics.storageClassName }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
         resources:
           requests:
             storage: {{ .Values.victoriametrics.storageSize }}

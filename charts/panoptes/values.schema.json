@@ -31,7 +31,10 @@
       "type": "object",
       "properties": {
         "className": { "type": "string", "minLength": 1 },
-        "clusterIssuer": { "type": "string", "minLength": 1 }
+        "clusterIssuer": { "type": "string", "minLength": 1 },
+        "createClusterIssuer": { "type": "boolean", "description": "Create the cert-manager ClusterIssuer (default false); requires cert-manager CRDs + a non-empty acmeEmail." },
+        "acmeEmail": { "type": "string", "description": "ACME registration contact email; REQUIRED (enforced in-template) when createClusterIssuer is true." },
+        "acmeServer": { "type": "string", "minLength": 1, "description": "ACME directory URL (Let's Encrypt production default; use staging while testing)." }
       }
     },
     "kubernetesRbac": {
