@@ -31,3 +31,13 @@ RUN pip install --no-cache-dir .
 # Source last: a plain edit under core/ invalidates only this cheap final layer,
 # not the dependency install above.
 COPY core ./core
+
+# Run as a non-root user (numeric UID 1000) so the Helm chart's `runAsNonRoot: true` pod
+# securityContext is satisfied — the kubelet REJECTS a root-running image when runAsNonRoot is
+# set ("container has runAsNonRoot and image will run as root"), which a real cluster deploy
+# surfaces even though `helm template` cannot. A numeric UID lets the kubelet verify non-root
+# without a passwd lookup; the baked install under /usr/local is root-owned but only READ at
+# runtime, so a non-root user + the chart's readOnlyRootFilesystem both work. PYTHONDONTWRITEBYTECODE
+# stops Python writing .pyc into the read-only root filesystem.
+ENV PYTHONDONTWRITEBYTECODE=1
+USER 1000
