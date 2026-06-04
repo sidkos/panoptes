@@ -94,7 +94,7 @@ class DemoSyntheticStore:
     def __init__(self, config: ConfigBlock) -> None:
         # The single-positional-`ConfigBlock` constructor is the locked registry
         # construction convention; the synthetic store needs no config of its own.
-        self._config = config
+        del config
 
     def write(self, signals: list[CanonicalSignal]) -> None:
         """No-op: the synthetic store persists nothing (read-only demo)."""

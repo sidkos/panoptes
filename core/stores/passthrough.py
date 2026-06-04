@@ -20,10 +20,10 @@ class PassthroughStore:
     type = "passthrough"
 
     def __init__(self, config: ConfigBlock) -> None:
-        # The config block is unused (the passthrough store needs no endpoint), but
-        # the single-positional-`ConfigBlock` constructor signature is the locked
-        # registry construction convention — every adapter takes it uniformly.
-        self._config = config
+        # The config block is unused (the passthrough store needs no endpoint); it is
+        # accepted only to satisfy the locked single-positional-`ConfigBlock` registry
+        # construction convention every adapter shares.
+        del config
         # Records what the most recent `write` was handed; starts empty so a caller
         # can distinguish "nothing written yet" ([]) from a real recorded batch.
         self.last_batch: list[CanonicalSignal] = []

@@ -398,6 +398,33 @@ def test_no_trace_source_capability_negotiation() -> None:
     assert "trace" in str(excinfo.value).lower()
 
 
+def test_search_traces_fetches_from_a_source_advertising_trace() -> None:
+    """A source advertising TRACE is consulted — the defensive fetch branch returns its signals.
+
+    v0.1 ships no TRACE source, so the test above covers the raise path; this pins the OTHER
+    side of the capability negotiation: if a future source advertises TRACE, `search_traces`
+    fetches from it instead of falsely claiming none. The payload is an opaque `CanonicalSignal`
+    (v0.1 has no TraceSignal model) — `search_traces` returns `list[object]` and never inspects
+    the kind, so any signal proves the fetch-and-aggregate path is wired.
+    """
+    from core.mcp.tools_query import search_traces
+
+    trace_payload = _log("dev")  # opaque stand-in: search_traces returns the fetched list verbatim
+    config = _config(
+        {
+            "dev": ResolvedEnvironment(
+                name="dev",
+                enabled=True,
+                sources=[
+                    _resolved_source("otel-traces", {SignalKind.TRACE}, signals=[trace_payload])
+                ],
+            )
+        }
+    )
+    traces = search_traces(QueryContext(config), env="dev", window="15m")
+    assert traces == [trace_payload]
+
+
 # --- env="all" fan-out -----------------------------------------------------------
 
 

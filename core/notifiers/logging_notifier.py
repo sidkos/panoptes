@@ -24,10 +24,10 @@ class LoggingNotifier:
     type = "logging"
 
     def __init__(self, config: ConfigBlock) -> None:
-        # The config block is unused (the logging notifier needs no destination
-        # endpoint), but the single-positional-`ConfigBlock` constructor signature is
-        # the locked registry construction convention — every adapter takes it.
-        self._config = config
+        # The logging notifier needs no destination endpoint, so `config` is accepted
+        # only to satisfy the locked single-positional-`ConfigBlock` registry
+        # construction convention every adapter shares — there is nothing to store.
+        del config
 
     def notify(self, alert: Alert) -> None:
         """Render the alert to a single structured log line.

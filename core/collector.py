@@ -78,7 +78,6 @@ class _FailureState:
 class _SlowFetchTimeout(Exception):
     """Internal marker: a source's fetch exceeded its `fetch_timeout_seconds`."""
 
-    source_type: str
     timeout_seconds: int
 
 
@@ -300,7 +299,7 @@ class Collector:
         # shared executor; `future.result(timeout=...)` abandons a fetch that overruns.
         future: Future[list[CanonicalSignal]] = executor.submit(source.fetch, window)
         try:
-            signals = self._await_fetch(future, source.type, resolved_source.fetch_timeout_seconds)
+            signals = self._await_fetch(future, resolved_source.fetch_timeout_seconds)
         except _SlowFetchTimeout as timeout:
             self._record_failure(
                 env_name,
@@ -329,7 +328,7 @@ class Collector:
             )
 
     def _await_fetch(
-        self, future: Future[list[CanonicalSignal]], source_type: str, timeout_seconds: int
+        self, future: Future[list[CanonicalSignal]], timeout_seconds: int
     ) -> list[CanonicalSignal]:
         """Await a fetch future bounded by `timeout_seconds`, raising on overrun.
 
@@ -342,7 +341,7 @@ class Collector:
         """
         done, _pending = wait([future], timeout=timeout_seconds, return_when=FIRST_COMPLETED)
         if future not in done:
-            raise _SlowFetchTimeout(source_type=source_type, timeout_seconds=timeout_seconds)
+            raise _SlowFetchTimeout(timeout_seconds=timeout_seconds)
         # The fetch completed within the bound — surface its result or its exception.
         return future.result()
 

@@ -164,6 +164,29 @@ def test_unrecognized_annotation_falls_back_to_str_coercion() -> None:
         _make_invoker(odd_tool)()  # `env` absent → required-str coercer raises
 
 
+def test_multi_member_union_annotation_falls_back_to_str_coercion() -> None:
+    """A `UnionType` with TWO non-`None` members (`str | int`) routes to the required-str fallback.
+
+    `_coercer_for_annotation` recognizes only the SINGLE-non-`None`-member union shapes
+    (`str | None`, `dict[str, str] | None`); a union with more than one non-`None` member is
+    unrecognized and must fall through to `_str_kwarg`. Distinct from the bare-`int` case above:
+    this is a `types.UnionType` whose `len(non_none) != 1`, exercising the UnionType branch's
+    fall-through rather than the non-union path.
+    """
+    received: dict[str, object] = {}
+
+    def odd_union_tool(env: str | int) -> str:  # UnionType, 2 non-None members → unrecognized
+        received["env"] = env
+        return "ok"
+
+    # Falls back to _str_kwarg, which requires a str — a str value forwards fine.
+    _make_invoker(odd_union_tool)(env="dev")
+    assert received["env"] == "dev"
+    # The fallback is the REQUIRED-str coercer: an ABSENT arg raises (not silently optional).
+    with pytest.raises(TypeError):
+        _make_invoker(odd_union_tool)()  # `env` absent → required-str coercer raises
+
+
 # --- coercer wrong-type negative paths (the untrusted-kwargs validation boundary) -----------
 #
 # The derived invoker is the boundary between untrusted MCP kwargs and the typed tool fns:

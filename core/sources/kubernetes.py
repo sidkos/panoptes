@@ -37,7 +37,6 @@ override; the client surface is confined behind the local Protocols below so
 `disallow_any_explicit` stays satisfied without any `Any` leaking into the source.
 """
 
-from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Protocol
 
@@ -408,9 +407,3 @@ def _build_real_api_client() -> _CoreV1ApiClient:
         config.load_kube_config()
     built: _CoreV1ApiClient = client.CoreV1Api()
     return built
-
-
-# Re-export the lazy builder under a name a future caller could override for testing
-# the real-client construction path without a live cluster (kept here so the seam is
-# discoverable). It is a module-private factory, not part of the public source API.
-_REAL_API_BUILDER: Callable[[], _CoreV1ApiClient] = _build_real_api_client

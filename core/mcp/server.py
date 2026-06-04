@@ -197,7 +197,7 @@ class PanoptesMcpServer:
         # are mirrored here to keep the read-only assertion fully synchronous.
         self._tool_names: list[str] = []
         # The uniform `_ToolCallable` invokers for tools a test invokes directly
-        # (currently the v0.2 stubs, which already match the `_ToolCallable` shape).
+        # (every shipped tool registers one; consumer-pack tools may add their own).
         self._callables: dict[str, _ToolCallable] = {}
 
     def _register_tool[**ToolParams](
@@ -236,8 +236,8 @@ class PanoptesMcpServer:
     def tool_callable(self, name: str) -> _ToolCallable:
         """The bound uniform-shape callable for a registered tool (synchronous test seam).
 
-        Covers both the real v0.1 tools (their `invoker` handle) and the v0.2 stubs, so a
-        unit test can invoke either directly without driving FastMCP's async transport.
+        Covers every shipped tool that registered an `invoker` handle, so a unit test can
+        invoke it directly without driving FastMCP's async transport.
         """
         return self._callables[name]
 

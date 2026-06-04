@@ -162,7 +162,6 @@ class RestClient:
         constructed default client; an injected client keeps its own configured timeout
         (the injector owns it).
         """
-        self._default_timeout = default_timeout
         self._client = client if client is not None else httpx.Client(timeout=default_timeout)
 
     @property
