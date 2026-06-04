@@ -28,15 +28,21 @@ variable "vpc_cidr" {
 # --- EKS control plane + node group (single small MANAGED spot group — decision #2) -
 
 variable "cluster_version" {
-  description = "The EKS control-plane Kubernetes version for the dedicated Panoptes cluster."
+  description = "The EKS control-plane Kubernetes version for the dedicated Panoptes cluster. Pin a version still in EKS STANDARD support: a version in EXTENDED support bills ~6x the standard control-plane rate (~$0.60 vs ~$0.10 per cluster-hr). 1.30 leaves standard support on 2026-07-23; 1.33+ keeps the longest standard-support runway (AWS's 'avoid extended support' recommendation)."
   type        = string
-  default     = "1.30"
+  default     = "1.33"
 }
 
 variable "node_instance_type" {
   description = "Instance type for the single small managed node group (decision #2: a fixed, small, always-on stack — store + Grafana + collector + MCP + proxy — nothing to autoscale). A small default keeps cost discipline."
   type        = string
   default     = "t4g.small"
+}
+
+variable "ami_type" {
+  description = "EKS managed-node-group AMI type. MUST match node_instance_type's CPU architecture: the default node_instance_type (t4g.small) is ARM/Graviton, so this defaults to the ARM AL2023 AMI. Override to AL2023_x86_64_STANDARD if node_instance_type is an x86 family (e.g. t3.small) — a mismatch makes EKS reject CreateNodegroup with InvalidParameterException at apply time (terraform validate/plan cannot catch it)."
+  type        = string
+  default     = "AL2023_ARM_64_STANDARD"
 }
 
 variable "node_min" {

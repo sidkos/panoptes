@@ -55,6 +55,11 @@ resource "aws_eks_node_group" "panoptes" {
 
   capacity_type  = var.capacity_type
   instance_types = [var.node_instance_type]
+  # The AMI architecture MUST match the instance family (ARM for the t4g/Graviton
+  # default). Without an explicit ami_type, EKS picks the x86_64 AL2023 AMI and
+  # rejects an ARM instance type at CreateNodegroup — a failure terraform plan
+  # cannot surface (only the EKS API validates the pairing).
+  ami_type = var.ami_type
 
   scaling_config {
     desired_size = var.node_min
