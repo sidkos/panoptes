@@ -638,7 +638,7 @@ def _resource_blocks_by_name(
 
 
 def test_node_group_runs_in_the_private_subnets_only() -> None:
-    """The node group's `subnet_ids` are the PRIVATE pair — nodes never get a public IP (HIGH #2)."""
+    """Node group subnet_ids = the PRIVATE pair — nodes get no public IP (HIGH #2)."""
     node_groups = _resource_blocks(_load_tf("nodegroup.tf"), "aws_eks_node_group")
     assert node_groups, "modules/stack must declare the managed node group"
     subnet_ids = str(node_groups[0].get("subnet_ids", ""))
@@ -686,7 +686,7 @@ def test_eks_public_endpoint_is_cidr_allowlisted_not_wide_open() -> None:
 
 
 def test_endpoint_cidr_var_is_required_and_rejects_wildcards() -> None:
-    """The endpoint allowlist var has NO default (fail-closed) AND its validation rejects 0.0.0.0/0."""
+    """The endpoint allowlist var has no default and rejects 0.0.0.0/0 (fail-closed)."""
     variables_tf = _load_tf("variables.tf")
     found = False
     for entry in _as_list(variables_tf.get("variable")):
