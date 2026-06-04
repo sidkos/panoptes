@@ -25,5 +25,11 @@ terraform {
       source  = "hashicorp/tls"
       version = ">= 4.0"
     }
+    # `kubernetes` backs the gp3 default StorageClass + the gp2 default-class patch (ebs_csi.tf)
+    # — the working default storage class the EBS CSI driver needs on modern k8s.
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = ">= 2.20"
+    }
   }
 }

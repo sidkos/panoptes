@@ -58,15 +58,15 @@ variable "ami_type" {
 }
 
 variable "node_min" {
-  description = "Minimum node count for the managed node group (a one-node monitoring stack; min 1 keeps the workloads always-on)."
+  description = "Minimum node count for the managed node group. Defaults to 2: a live deploy showed the FULL stack (VictoriaMetrics + Grafana + collector + MCP + oauth2-proxy + the nginx-ingress/cert-manager/ebs-csi controllers + kube-system) is ~16 pods, which exceeds a single t4g.small's ~11-pod ENI cap. Two small spot nodes (still cost-disciplined, ~$8/mo) hold the stack with headroom across the two private AZs; raising node_instance_type or enabling VPC-CNI prefix delegation is the alternative if a single node is required."
   type        = number
-  default     = 1
+  default     = 2
 }
 
 variable "node_max" {
-  description = "Maximum node count for the managed node group (a small headroom of 2 for a rolling node replacement; NOT an autoscaling target — decision #2 is no Karpenter)."
+  description = "Maximum node count for the managed node group (headroom of 1 over node_min for a rolling node replacement; NOT an autoscaling target — decision #2 is no Karpenter)."
   type        = number
-  default     = 2
+  default     = 3
 }
 
 variable "capacity_type" {

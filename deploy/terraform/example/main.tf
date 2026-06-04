@@ -23,6 +23,10 @@ terraform {
       source  = "hashicorp/tls"
       version = ">= 4.0"
     }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = ">= 2.20"
+    }
   }
 }
 
@@ -38,6 +42,12 @@ provider "helm" {
   kubernetes {
     config_path = "~/.kube/config"
   }
+}
+
+# The kubernetes provider targets the same new cluster (gp3 StorageClass + the gp2 default-class
+# patch in the module). Wired to the kubeconfig like the helm provider — same two-phase apply.
+provider "kubernetes" {
+  config_path = "~/.kube/config"
 }
 
 provider "tls" {}

@@ -495,6 +495,9 @@ _ALLOWED_MANAGED_POLICY_NAMES = frozenset(
         "AmazonEKSWorkerNodePolicy",
         "AmazonEKS_CNI_Policy",
         "AmazonEC2ContainerRegistryReadOnly",
+        # The EBS CSI driver controller's managed policy (ebs_csi.tf) — note the `service-role/`
+        # path segment, which the substring check below requires verbatim.
+        "service-role/AmazonEBSCSIDriverPolicy",
     }
 )
 # The forbidden-write action regex (reused module-wide). A wildcard action OR any
@@ -725,3 +728,49 @@ def test_subnets_carry_the_per_cluster_discovery_tag() -> None:
             "every subnet must carry a kubernetes.io/cluster/<name> tag so the in-tree provider "
             "discovers it for LoadBalancer placement"
         )
+
+
+# --- (h) EBS CSI driver — persistent storage works out of the box (a live-deploy fix) ---------
+#
+# A live deploy showed the module shipped NO storage driver, so the VictoriaMetrics PVC stayed
+# Pending (the in-tree gp2 provisioner is gone on k8s 1.30+). These pin the fix: the managed
+# aws-ebs-csi-driver addon (with its own IRSA role, not the node instance role) + a gp3 CSI
+# StorageClass as the cluster default.
+
+
+def test_provisions_the_ebs_csi_driver_with_a_gp3_storageclass() -> None:
+    """The module installs the EBS CSI addon (own IRSA role) + a gp3 CSI StorageClass."""
+    ebs_tf = _load_tf("ebs_csi.tf")
+    addons = _resource_blocks(ebs_tf, "aws_eks_addon")
+    assert any("aws-ebs-csi-driver" in str(addon.get("addon_name", "")) for addon in addons), (
+        "the module must install the aws-ebs-csi-driver EKS addon (PVCs need a CSI driver on "
+        "k8s 1.30+ — the in-tree gp2 provisioner is gone)"
+    )
+    # The addon must use its DEDICATED IRSA role (not the node instance role — the IMDS-via-node
+    # path CrashLooped the controller behind the default IMDS hop limit).
+    sa_role = str(addons[0].get("service_account_role_arn", ""))
+    assert "aws_iam_role.ebs_csi" in sa_role, (
+        "the EBS CSI addon must use its dedicated IRSA role via service_account_role_arn"
+    )
+    storage_classes = _resource_blocks(ebs_tf, "kubernetes_storage_class_v1")
+    assert storage_classes, "the module must create a gp3 CSI StorageClass"
+    assert "ebs.csi.aws.com" in str(storage_classes[0].get("storage_provisioner", "")), (
+        "the gp3 StorageClass must use the ebs.csi.aws.com provisioner"
+    )
+
+
+def test_ebs_csi_irsa_trust_is_scoped_to_the_controller_sa() -> None:
+    """The EBS CSI IRSA trust pins :sub to kube-system:ebs-csi-controller-sa (least privilege)."""
+    docs = _data_blocks(_load_tf("ebs_csi.tf"), "aws_iam_policy_document")
+    subjects: list[str] = []
+    for doc in docs:
+        for statement in _as_list(doc.get("statement")):
+            for condition in _as_list(_as_dict(statement).get("condition")):
+                condition_dict = _as_dict(condition)
+                if _unquote(str(condition_dict.get("variable", ""))).endswith(":sub"):
+                    subjects.extend(
+                        _unquote(str(value)) for value in _as_list(condition_dict.get("values"))
+                    )
+    assert "system:serviceaccount:kube-system:ebs-csi-controller-sa" in " ".join(subjects), (
+        "the EBS CSI IRSA trust must pin :sub to the ebs-csi-controller-sa (no broader scope)"
+    )
