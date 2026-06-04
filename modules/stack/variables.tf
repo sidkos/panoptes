@@ -28,9 +28,21 @@ variable "vpc_cidr" {
 # --- EKS control plane + node group (single small MANAGED spot group — decision #2) -
 
 variable "cluster_version" {
-  description = "The EKS control-plane Kubernetes version for the dedicated Panoptes cluster. Pin a version still in EKS STANDARD support: a version in EXTENDED support bills ~6x the standard control-plane rate (~$0.60 vs ~$0.10 per cluster-hr). 1.30 leaves standard support on 2026-07-23; 1.33+ keeps the longest standard-support runway (AWS's 'avoid extended support' recommendation)."
+  description = "The EKS control-plane Kubernetes version. Pin a version in EKS STANDARD support — EXTENDED support bills ~6x the standard rate (~$0.60 vs ~$0.10/cluster-hr). Per `aws eks describe-cluster-versions` (checked 2026-06): standard support ends 2026-07-29 (1.33), 2026-12-02 (1.34), 2027-03-27 (1.35, the EKS default), 2027-08-02 (1.36). Pinned to 1.34 — AWS's recommended upgrade and ONE minor above the deploy-validated 1.33, so the pinned ingress-nginx (4.11.3) + cert-manager (1.16.1) charts in ingress.tf stay compatible. Going to 1.35/1.36 for longer runway ALSO needs those chart versions bumped (their tested k8s range is the real ceiling) + a re-validation deploy."
   type        = string
-  default     = "1.33"
+  default     = "1.34"
+}
+
+variable "cluster_endpoint_public_access_cidrs" {
+  description = "REQUIRED allowlist of CIDRs that may reach the EKS PUBLIC API server endpoint. There is deliberately NO default: the AWS default is 0.0.0.0/0 (the whole internet), so an implicit value is the HIGH-severity exposure this variable closes. Set it to your operator IP/CIDR (e.g. [\"203.0.113.4/32\"]). Nodes always reach the API over the PRIVATE endpoint (endpoint_private_access=true in eks.tf), so this gates only human/CI kubectl access."
+  type        = list(string)
+
+  validation {
+    condition = length(var.cluster_endpoint_public_access_cidrs) > 0 && alltrue([
+      for cidr in var.cluster_endpoint_public_access_cidrs : cidr != "0.0.0.0/0" && cidr != "::/0"
+    ])
+    error_message = "cluster_endpoint_public_access_cidrs must be a NON-EMPTY allowlist that does NOT contain 0.0.0.0/0 or ::/0 — an empty list falls back to, and a wildcard explicitly re-creates, the wide-open public API endpoint this guards. Use a specific operator IP/CIDR (e.g. [\"203.0.113.4/32\"])."
+  }
 }
 
 variable "node_instance_type" {

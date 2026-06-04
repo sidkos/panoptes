@@ -51,7 +51,9 @@ resource "aws_eks_node_group" "panoptes" {
   cluster_name    = aws_eks_cluster.panoptes.name
   node_group_name = "panoptes"
   node_role_arn   = aws_iam_role.node.arn
-  subnet_ids      = local.panoptes_subnet_ids
+  # Nodes run in the PRIVATE subnets only — no public IPs, egress via the NAT gateway
+  # (vpc.tf). This is the HIGH-severity fix: the kubelet is never internet-routable.
+  subnet_ids = local.panoptes_private_subnet_ids
 
   capacity_type  = var.capacity_type
   instance_types = [var.node_instance_type]
@@ -72,6 +74,9 @@ resource "aws_eks_node_group" "panoptes" {
     aws_iam_role_policy_attachment.node_worker,
     aws_iam_role_policy_attachment.node_cni,
     aws_iam_role_policy_attachment.node_ecr,
+    # Private-subnet nodes need NAT egress (image pulls, ECR/STS) to join — the NAT route
+    # must exist before the nodes boot, or they never reach Ready.
+    aws_route_table_association.private,
   ]
 
   tags = {

@@ -19,6 +19,12 @@ variable "image_tag" {
   default     = "v0.2.0"
 }
 
+variable "cluster_endpoint_public_access_cidrs" {
+  description = "Allowlist of CIDRs permitted to reach the EKS PUBLIC API endpoint (operator kubectl). REPLACE the placeholder with your own IP/CIDR — it is an RFC5737 documentation range that reaches nothing, so a forgotten value fails CLOSED rather than exposing the API to 0.0.0.0/0."
+  type        = list(string)
+  default     = ["203.0.113.4/32"]
+}
+
 variable "github_oauth_client_id" {
   description = "GitHub OAuth app client id for oauth2-proxy."
   type        = string

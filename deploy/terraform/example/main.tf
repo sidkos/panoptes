@@ -49,6 +49,8 @@ module "panoptes" {
   hostname    = var.hostname
   image_tag   = var.image_tag
 
+  cluster_endpoint_public_access_cidrs = var.cluster_endpoint_public_access_cidrs
+
   github_oauth_client_id = var.github_oauth_client_id
   github_org             = var.github_org
   github_team            = var.github_team

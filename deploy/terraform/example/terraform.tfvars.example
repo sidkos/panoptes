@@ -7,6 +7,11 @@ home_region = "us-east-1"
 hostname    = "panoptes.example.com"
 image_tag   = "v0.2.0" # an IMMUTABLE tag, never :latest
 
+# REQUIRED allowlist for the EKS public API endpoint — REPLACE with your operator IP/CIDR.
+# The module has NO default here (the AWS default is 0.0.0.0/0 = the whole internet); the
+# placeholder is an RFC5737 doc range that reaches nothing, so a forgotten value fails closed.
+cluster_endpoint_public_access_cidrs = ["203.0.113.4/32"]
+
 github_oauth_client_id = "Iv1.0123456789abcdef"
 github_org = "your-github-org"
 # github_team = "platform"             # optional finer gate

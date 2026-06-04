@@ -37,7 +37,15 @@ resource "aws_eks_cluster" "panoptes" {
   role_arn = aws_iam_role.cluster.arn
 
   vpc_config {
-    subnet_ids = local.panoptes_subnet_ids
+    subnet_ids = local.panoptes_cluster_subnet_ids
+
+    # Harden the API server endpoint (the AWS default is public 0.0.0.0/0):
+    # - private access ON so the in-VPC nodes reach the API over the PRIVATE endpoint;
+    # - public access stays ON for operator kubectl, but RESTRICTED to an explicit CIDR
+    #   allowlist (var.cluster_endpoint_public_access_cidrs), never the wide-open default.
+    endpoint_private_access = true
+    endpoint_public_access  = true
+    public_access_cidrs     = var.cluster_endpoint_public_access_cidrs
   }
 
   # The control-plane policy attachment must exist before the cluster is created.

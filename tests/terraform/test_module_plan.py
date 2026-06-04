@@ -604,3 +604,124 @@ def test_no_inline_role_policy_or_iam_user_anywhere() -> None:
         "the module must NOT declare an aws_iam_user (no long-lived static credential in an "
         "IRSA-based stack)"
     )
+
+
+# --- (g) NETWORK HARDENING — the two HIGH-severity fixes, locked so they can't silently regress -
+#
+# A prior network-security audit found two HIGH exposures: (1) the EKS API server endpoint was
+# the AWS-default public 0.0.0.0/0, and (2) the nodes ran in PUBLIC subnets with public IPs (the
+# kubelet internet-routable). Both were fixed (private subnets + NAT egress; a required CIDR
+# allowlist for the API endpoint). These assertions PIN the fixes against the rendered config so a
+# future edit that re-exposes either path (flip subnet_ids back to public, set map_public_ip=true,
+# route private egress at the IGW, or allow a 0.0.0.0/0 endpoint) red-bars here.
+
+
+def _first(value: object) -> object:
+    """The first element of a python-hcl2 block list (single blocks render as one-item lists)."""
+    if isinstance(value, list) and value:
+        return value[0]
+    return value
+
+
+def _resource_blocks_by_name(
+    tf: dict[str, object], resource_type: str
+) -> dict[str, dict[str, object]]:
+    """Map each resource NAME to its body for `resource "<type>" "<name>"` blocks (unquoted)."""
+    by_name_out: dict[str, dict[str, object]] = {}
+    for entry in _as_list(tf.get("resource")):
+        for raw_type, by_name in _as_dict(entry).items():
+            if _unquote(raw_type) != resource_type:
+                continue
+            for name, body in _as_dict(by_name).items():
+                by_name_out[_unquote(name)] = _as_dict(body)
+    return by_name_out
+
+
+def test_node_group_runs_in_the_private_subnets_only() -> None:
+    """The node group's `subnet_ids` are the PRIVATE pair — nodes never get a public IP (HIGH #2)."""
+    node_groups = _resource_blocks(_load_tf("nodegroup.tf"), "aws_eks_node_group")
+    assert node_groups, "modules/stack must declare the managed node group"
+    subnet_ids = str(node_groups[0].get("subnet_ids", ""))
+    assert "panoptes_private_subnet_ids" in subnet_ids, (
+        "the node group must run in local.panoptes_private_subnet_ids so the kubelet is never "
+        "internet-routable — NEVER local.panoptes_public_subnet_ids / a mixed set"
+    )
+
+
+def test_private_subnets_do_not_auto_assign_public_ips() -> None:
+    """The private subnets set `map_public_ip_on_launch = false` (no public IP on the nodes)."""
+    private_subnet = _resource_blocks_by_name(_load_tf("vpc.tf"), "aws_subnet").get("private")
+    assert private_subnet is not None, "vpc.tf must declare the private subnet pair"
+    value = str(private_subnet.get("map_public_ip_on_launch", "")).lower()
+    assert "false" in value, (
+        "private subnets must set map_public_ip_on_launch = false (no public IP on nodes)"
+    )
+
+
+def test_private_route_table_egress_is_via_nat_not_the_igw() -> None:
+    """The private route table's default route targets the NAT gateway, not the IGW (HIGH #2)."""
+    private_rt = _resource_blocks_by_name(_load_tf("vpc.tf"), "aws_route_table").get("private")
+    assert private_rt is not None, "vpc.tf must declare the private route table"
+    route = _as_dict(_first(private_rt.get("route")))
+    assert "nat_gateway_id" in route, (
+        "the private route table's 0.0.0.0/0 route must target the NAT gateway (egress without "
+        "ingress) — routing it at the IGW (gateway_id) would re-expose the private nodes"
+    )
+    assert "gateway_id" not in route, "the private route must NOT use the IGW (gateway_id)"
+
+
+def test_eks_public_endpoint_is_cidr_allowlisted_not_wide_open() -> None:
+    """The EKS API endpoint is private + CIDR-allowlisted, never the 0.0.0.0/0 default (HIGH #1)."""
+    clusters = _resource_blocks(_load_tf("eks.tf"), "aws_eks_cluster")
+    assert clusters, "eks.tf must declare the cluster"
+    vpc_config = _as_dict(_first(clusters[0].get("vpc_config")))
+    assert "true" in str(vpc_config.get("endpoint_private_access", "")).lower(), (
+        "endpoint_private_access must be true so nodes reach the API over the PRIVATE endpoint"
+    )
+    public_cidrs = str(vpc_config.get("public_access_cidrs", ""))
+    assert "cluster_endpoint_public_access_cidrs" in public_cidrs, (
+        "public_access_cidrs must come from var.cluster_endpoint_public_access_cidrs (the operator "
+        "allowlist), never the implicit AWS 0.0.0.0/0 default"
+    )
+
+
+def test_endpoint_cidr_var_is_required_and_rejects_wildcards() -> None:
+    """The endpoint allowlist var has NO default (fail-closed) AND its validation rejects 0.0.0.0/0."""
+    variables_tf = _load_tf("variables.tf")
+    found = False
+    for entry in _as_list(variables_tf.get("variable")):
+        for raw_name, body in _as_dict(entry).items():
+            if _unquote(raw_name) != "cluster_endpoint_public_access_cidrs":
+                continue
+            found = True
+            body_dict = _as_dict(body)
+            # No default → omitting the value hard-errors at plan, never a silent 0.0.0.0/0.
+            assert "default" not in body_dict, (
+                "cluster_endpoint_public_access_cidrs must have NO default (fail-closed)"
+            )
+            # The validation must explicitly reject the wildcard CIDR (not only the empty list).
+            validation = _as_dict(_first(body_dict.get("validation")))
+            condition = str(validation.get("condition", ""))
+            assert "0.0.0.0/0" in condition, (
+                "the validation must explicitly reject 0.0.0.0/0 (an explicit wildcard, not only "
+                "an empty list, would otherwise re-create the wide-open endpoint)"
+            )
+    assert found, "variables.tf must declare cluster_endpoint_public_access_cidrs"
+
+
+def test_subnets_carry_the_per_cluster_discovery_tag() -> None:
+    """Both subnet pairs carry `kubernetes.io/cluster/<name>` for in-tree LB subnet discovery.
+
+    No AWS Load Balancer Controller is installed, so the EKS-default in-tree cloud provider
+    discovers ELB subnets via this per-cluster tag; without it the public nginx LoadBalancer can
+    fail to provision (stuck `<pending>` EXTERNAL-IP) against the mixed public/private subnet set.
+    """
+    subnets = _resource_blocks(_load_tf("vpc.tf"), "aws_subnet")
+    assert len(subnets) >= 2, "vpc.tf must declare the public + private subnet pairs"
+    for subnet in subnets:
+        tags = _as_dict(subnet.get("tags"))
+        cluster_tag = [key for key in tags if "kubernetes.io/cluster/" in _unquote(str(key))]
+        assert cluster_tag, (
+            "every subnet must carry a kubernetes.io/cluster/<name> tag so the in-tree provider "
+            "discovers it for LoadBalancer placement"
+        )
