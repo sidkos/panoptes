@@ -25,12 +25,15 @@ output "grafana_url" {
   value       = "https://${var.hostname}/grafana"
 }
 
-# --- Helm-install handoff: the config values the chart (Phase 7) consumes -----------
+# --- Helm-install handoff: the NON-SECRET config values the chart consumes -----------
 #
-# These pass the module's input config through to the Helm install (the chart's
-# values.yaml binds them: the image tag, the GitHub OAuth allowlist for oauth2-proxy, the
-# Slack webhook for the notifier). Surfaced as outputs so the deploy wiring reads ONE
-# source of truth (the module's resolved inputs), and so the inputs are genuinely consumed.
+# These surface the module's non-secret inputs (image tag, region, the GitHub OAuth
+# allowlist) so the deploy wiring reads one source of truth. The two SECRETS the chart
+# needs — the GitHub OAuth client secret and the Slack webhook — are deliberately NOT
+# outputs: a sensitive output is still written to the Terraform state file in plaintext
+# (it is only redacted in console output), so anyone with state read could recover them.
+# The operator pipes those two values straight into the out-of-band Kubernetes Secrets the
+# chart references (`panoptes-oauth2-proxy` / `panoptes-app-secrets`), never via TF state.
 
 output "region" {
   description = "The AWS region the cluster runs in (the operator targets it with kubectl/Helm)."
@@ -47,12 +50,6 @@ output "github_oauth_client_id" {
   value       = var.github_oauth_client_id
 }
 
-output "github_oauth_client_secret" {
-  description = "The GitHub OAuth client secret the chart wires into oauth2-proxy (decision #5). Sensitive — redacted in output."
-  value       = var.github_oauth_client_secret
-  sensitive   = true
-}
-
 output "github_org" {
   description = "The GitHub org allowlist the chart wires into oauth2-proxy (decision #5)."
   value       = var.github_org
@@ -61,10 +58,4 @@ output "github_org" {
 output "github_team" {
   description = "The optional GitHub team allowlist the chart wires into oauth2-proxy (decision #5)."
   value       = var.github_team
-}
-
-output "slack_webhook_url" {
-  description = "The Slack webhook the slack notifier delivers alerts to (a Panoptes-owned sink). Sensitive — redacted in output."
-  value       = var.slack_webhook_url
-  sensitive   = true
 }

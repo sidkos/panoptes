@@ -49,14 +49,12 @@ module "panoptes" {
   hostname    = var.hostname
   image_tag   = var.image_tag
 
-  github_oauth_client_id     = var.github_oauth_client_id
-  github_oauth_client_secret = var.github_oauth_client_secret
-  github_org                 = var.github_org
-  github_team                = var.github_team
+  github_oauth_client_id = var.github_oauth_client_id
+  github_org             = var.github_org
+  github_team            = var.github_team
 
-  read_role_arns    = var.read_role_arns
-  alert_topic_arn   = var.alert_topic_arn
-  slack_webhook_url = var.slack_webhook_url
+  read_role_arns  = var.read_role_arns
+  alert_topic_arn = var.alert_topic_arn
 }
 
 output "cluster_name" {

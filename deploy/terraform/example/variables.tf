@@ -25,13 +25,6 @@ variable "github_oauth_client_id" {
   default     = ""
 }
 
-variable "github_oauth_client_secret" {
-  description = "GitHub OAuth app client secret for oauth2-proxy (sensitive)."
-  type        = string
-  default     = ""
-  sensitive   = true
-}
-
 variable "github_org" {
   description = "The GitHub org allowlist that gates access."
   type        = string
@@ -54,11 +47,4 @@ variable "alert_topic_arn" {
   description = "The single Panoptes-owned SNS alert topic ARN (resource-scoped publish)."
   type        = string
   default     = ""
-}
-
-variable "slack_webhook_url" {
-  description = "The Slack incoming-webhook URL for alert delivery (sensitive)."
-  type        = string
-  default     = ""
-  sensitive   = true
 }

@@ -77,13 +77,6 @@ variable "github_oauth_client_id" {
   default     = ""
 }
 
-variable "github_oauth_client_secret" {
-  description = "GitHub OAuth app client secret for oauth2-proxy (decision #5). Sensitive — redacted in plan/apply output and never logged."
-  type        = string
-  default     = ""
-  sensitive   = true
-}
-
 variable "github_org" {
   description = "The GitHub ORG allowlist that gates access via oauth2-proxy (decision #5 — the org/team allowlist is the access boundary)."
   type        = string
@@ -115,13 +108,6 @@ variable "alert_topic_arn" {
   description = "The single Panoptes-OWNED SNS alert topic ARN. The IRSA role grants `sns:Publish` on THIS ARN ONLY (resource-scoped — the one write grant in the system, on a Panoptes-owned resource). Empty = no publish grant."
   type        = string
   default     = ""
-}
-
-variable "slack_webhook_url" {
-  description = "The Slack incoming-webhook URL for alert delivery (a Panoptes-owned sink, not an observed system). Sensitive — redacted in plan/apply output. Consumed by the slack notifier via Helm values, not an IAM grant."
-  type        = string
-  default     = ""
-  sensitive   = true
 }
 
 # --- Kubernetes namespace + service-account names (the IRSA trust-scope subjects) ---

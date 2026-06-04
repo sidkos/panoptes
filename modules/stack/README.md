@@ -17,18 +17,20 @@ module "panoptes" {
   hostname        = "panoptes.example.com"
   image_tag       = "v0.2.0" # an IMMUTABLE tag, never :latest (Risk K11)
 
-  # GitHub SSO (oauth2-proxy github provider — the access gate at the ingress)
-  github_oauth_client_id     = var.github_oauth_client_id
-  github_oauth_client_secret = var.github_oauth_client_secret # sensitive
-  github_org                 = "your-github-org"
+  # GitHub SSO (oauth2-proxy github provider — the access gate at the ingress). The client
+  # SECRET is not a module input (it would leak into TF state) — it goes into the chart's
+  # out-of-band `panoptes-oauth2-proxy` Kubernetes Secret instead.
+  github_oauth_client_id = var.github_oauth_client_id
+  github_org             = "your-github-org"
 
   # The per-env read-roles the IRSA role may assume, IN-ACCOUNT. Empty = no grants
   # (stage/prod stay disabled stubs until a non-empty list is supplied — no code change).
   read_role_arns  = ["arn:aws:iam::111122223333:role/PanoptesReadRole-dev"]
 
   # The single Panoptes-OWNED SNS alert topic the IRSA role may publish to (resource-scoped).
-  alert_topic_arn   = "arn:aws:sns:us-east-1:111122223333:panoptes-alerts"
-  slack_webhook_url = var.slack_webhook_url # sensitive
+  alert_topic_arn = "arn:aws:sns:us-east-1:111122223333:panoptes-alerts"
+  # (the Slack webhook is not a module input either — it goes into the chart's
+  #  out-of-band `panoptes-app-secrets` Kubernetes Secret.)
 }
 ```
 
@@ -80,5 +82,7 @@ only (the anonymous-bypass guard).
 ## Outputs
 
 `cluster_name`, `irsa_role_arn`, `ingress_class`, `mcp_url`, `grafana_url`, plus the
-Helm-handoff config values (`region`, `image_tag`, the GitHub OAuth allowlist, the Slack
-webhook) the chart consumes.
+non-secret Helm-handoff config values (`region`, `image_tag`, the GitHub OAuth allowlist)
+the chart consumes. The two secrets the chart needs (GitHub OAuth client secret + Slack
+webhook) are deliberately NOT outputs — a sensitive output still lands in Terraform state
+in plaintext, so the operator pipes them straight into the out-of-band Kubernetes Secrets.

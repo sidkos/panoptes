@@ -115,9 +115,8 @@ module "panoptes" {
   hostname    = "panoptes.example.com"
   image_tag   = "v0.2.0"                              # an IMMUTABLE tag, never :latest
 
-  github_oauth_client_id     = var.github_oauth_client_id
-  github_oauth_client_secret = var.github_oauth_client_secret  # sensitive
-  github_org                 = "your-github-org"      # the access allowlist (in-account)
+  github_oauth_client_id = var.github_oauth_client_id
+  github_org             = "your-github-org"          # the access allowlist (in-account)
 
   read_role_arns  = ["arn:aws:iam::1234:role/PanoptesReadRole-dev"]  # empty = no grants
   alert_topic_arn = "arn:aws:sns:us-east-1:1234:panoptes-alerts"     # the ONE write grant
