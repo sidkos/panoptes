@@ -35,10 +35,17 @@ MCP/AI-ops, typed Python.
 
 ---
 
-## v0.2 — hosted, the deployed single pane
+## v0.2 — hosted, the deployed single pane (DEPLOY-PROVEN)
 
 **Goal:** stand the stack up in its own always-on home — a **dedicated,
 right-sized Panoptes EKS cluster** (never an observed cluster) — and gate access.
+
+> **Status: DEPLOY-PROVEN.** The Terraform module + Helm chart now stand up a
+> working stack end-to-end on real EKS — validated across **5 live apply →
+> verify → destroy cycles** on the FIDA AWS account, with all 8 components
+> functional out-of-box (VictoriaMetrics on gp3 storage, collector pipeline, MCP,
+> Grafana with an auto-provisioned datasource, oauth2-proxy, nginx-ingress ELB,
+> cert-manager ClusterIssuer, IRSA) and **zero orphaned resources on teardown**.
 
 - **Terraform module** that provisions a **dedicated VPC + dedicated EKS cluster**
   (control plane + a minimal **managed** node group, spot-eligible) **in the SAME AWS

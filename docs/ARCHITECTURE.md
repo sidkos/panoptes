@@ -186,20 +186,53 @@ hosted HTTP/SSO layer.
 
 ## 7. Deployment home
 
-The recommended home is **one small, cheap, always-on host, provisioned by
-Terraform, running the stack via docker-compose** (normalized store + Grafana +
-collector + MCP server + auth proxy). Rationale:
+The home is a **small, cost-disciplined, always-on EKS cluster, provisioned by
+Terraform, running the stack via a Helm chart** (normalized store + Grafana +
+collector + MCP server + oauth2-proxy, alongside the nginx-ingress, cert-manager,
+and EBS CSI controllers). The cluster lives in its **own dedicated VPC**, never
+inside an observed cluster — failure-domain independence is the load-bearing
+constraint (see §1), so Panoptes must survive the very environments it watches,
+including scheduled teardowns. Rationale:
 
-- A dedicated Kubernetes cluster for Panoptes is overkill and undercuts cost
-  discipline.
 - Deploying inside an observed cluster violates failure-domain independence.
-- A single Terraform-managed host still demonstrates IaC, networking,
-  cross-account roles, container orchestration (compose), and GitOps — without
-  a large bill.
+- A dedicated VPC keeps the blast radius and the networking story self-contained,
+  while still demonstrating IaC, networking, cross-account roles, container
+  orchestration, and GitOps — without a large bill.
 
-The **local dev loop** is the same `docker-compose.yml` run on a laptop, pointed
-at a live environment — zero cloud cost. The Terraform layer provisions the host
-and the per-environment read-roles.
+### Network topology — public/private split, one NAT
+
+The dedicated VPC is laid out as a **public/private subnet pair** across two AZs:
+
+- The **public** subnet pair carries only the internet-facing nginx
+  `LoadBalancer` (the ingress ELB) and a single, cost-disciplined **NAT
+  gateway**. Both subnet pairs carry `kubernetes.io/cluster/panoptes=owned`
+  (public also `kubernetes.io/role/elb`, private `kubernetes.io/role/internal-elb`)
+  so the in-tree cloud provider can discover LoadBalancer subnets — no AWS Load
+  Balancer Controller is installed.
+- The **private** subnet pair runs the managed node group with
+  `map_public_ip_on_launch=false` — **nodes are not internet-routable**. Their
+  egress is via the **single NAT gateway** (one NAT for the whole VPC, not
+  per-AZ, to hold the bill down — ~$32/mo for the NAT + EIP).
+
+The **EKS API server endpoint is hardened**: private access is on (nodes reach
+the API over the private endpoint), and public access is **restricted to a
+required, validated CIDR allowlist** — *not* the AWS-default wide-open
+`0.0.0.0/0`. The allowlist variable has no default and its validation fails
+closed: an empty list, or an explicit `0.0.0.0/0` / `::/0`, is rejected.
+
+### Persistent storage — EBS CSI driver, gp3 default
+
+Persistent volumes (the VictoriaMetrics PVC) are backed by the EKS-managed
+**aws-ebs-csi-driver** addon, with its own **IRSA** role scoped to the
+`kube-system:ebs-csi-controller-sa` service account, and a **gp3 CSI
+StorageClass set as the cluster default** (the legacy in-tree `gp2` default is
+unmarked). This is required on Kubernetes 1.30+, where the in-tree
+`kubernetes.io/aws-ebs` provisioner is gone — without the driver the
+VictoriaMetrics PVC stays `Pending`.
+
+The **local dev loop** is the same stack run on a laptop via docker-compose,
+pointed at a live environment — zero cloud cost. The Terraform layer provisions
+the cluster, the VPC, the storage, and the per-environment read-roles.
 
 Distribution: Panoptes ships as a **Terraform module** (consumer imports it) and
 a **Python package / container image** (the runnable stack). See

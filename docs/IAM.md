@@ -161,10 +161,34 @@ The v0.1 local path (`docker-compose`) keeps the `AWS_PROFILE` + `PANOPTES_ASSUM
 config seam unchanged — IRSA replaces the home-principal credential SOURCE on EKS, not the
 per-env assume-role mechanism.
 
+### Cluster-infrastructure IRSA — the EBS CSI driver
+
+Separate from the Panoptes home principal, the dedicated EKS cluster carries **one
+infrastructure IRSA role** for the EKS-managed `aws-ebs-csi-driver` addon
+(`modules/stack/ebs_csi.tf`). Its trust policy pins the OIDC provider's `:sub` to EXACTLY
+`system:serviceaccount:kube-system:ebs-csi-controller-sa` (and `:aud` to `sts.amazonaws.com`),
+and it attaches **only** the AWS-managed `AmazonEBSCSIDriverPolicy`. This role lets the CSI
+controller provision/attach EBS volumes for cluster PVCs (the gp3 default StorageClass backing
+the VictoriaMetrics PVC) on k8s 1.30+, where the in-tree `kubernetes.io/aws-ebs` provisioner is
+gone. It is **not** a Panoptes-runtime credential — it never assumes a read-role and never
+touches an observed environment; it is cluster plumbing for the home cluster's own storage,
+scoped to its single controller SA. The §A read-only-wrt-observed boundary is unaffected.
+
 MCP **clients** never use these AWS credentials. Clients authenticate to the MCP server at
 the **GitHub-gated nginx ingress** (oauth2-proxy `github` provider, org/team allowlist — no
 anonymous access; see [`ARCHITECTURE.md`](ARCHITECTURE.md) §6); the server holds the AWS
 identity (via IRSA) and validates no client token — the ingress is the boundary.
+
+### EKS API access posture — hardened endpoint
+
+The dedicated cluster's Kubernetes API endpoint is **not** the AWS-default wide-open
+`0.0.0.0/0`. Private access is on (nodes in the private subnet pair reach the API server over
+the private endpoint), and public access is **restricted to a required, no-default,
+validated `cluster_endpoint_public_access_cidrs` allowlist** (`modules/stack/eks.tf`). The
+variable validation **fails closed** — it rejects an empty list AND an explicit `0.0.0.0/0` /
+`::/0` — so the cluster cannot be applied with an internet-wide management surface. This is
+the IAM/network boundary for `kubectl`/control-plane access; it is independent of, and
+complementary to, the GitHub-gated ingress that fronts the MCP server above.
 
 ---
 

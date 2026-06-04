@@ -103,9 +103,14 @@ still works); the GitHub auth gate is the ingress, not the server.
 
 **1. Provision the dedicated EKS cluster + IRSA + ingress prereqs (Terraform).** The module
 creates Panoptes' OWN dedicated VPC + dedicated EKS cluster (SAME AWS account, never an
-observed cluster/VPC — failure-domain independence), a small managed spot node group, the
-IRSA role (SA-scoped to the collector + MCP service accounts), and the nginx-ingress +
-cert-manager prerequisites:
+observed cluster/VPC — failure-domain independence) with a public/private subnet pair (the
+internet-facing nginx LoadBalancer + a single cost-disciplined NAT gateway live in public;
+the managed spot node group runs in private, not internet-routable), the EBS CSI driver +
+gp3 default StorageClass (so the VictoriaMetrics PVC binds on k8s 1.30+), the IRSA role
+(SA-scoped to the collector + MCP service accounts), and the nginx-ingress + cert-manager
+prerequisites. The EKS API endpoint is hardened: private access on + public access
+restricted to a **required** `cluster_endpoint_public_access_cidrs` allowlist (validated
+fail-closed — an empty list or a `0.0.0.0/0` / `::/0` entry is rejected):
 
 ```hcl
 module "panoptes" {
@@ -115,6 +120,9 @@ module "panoptes" {
   hostname    = "panoptes.example.com"
   image_tag   = "v0.2.0"                              # an IMMUTABLE tag, never :latest
 
+  # REQUIRED, no default, fail-closed: who may reach the EKS API server.
+  cluster_endpoint_public_access_cidrs = ["203.0.113.10/32"]  # your operator IP(s), never 0.0.0.0/0
+
   github_oauth_client_id = var.github_oauth_client_id
   github_org             = "your-github-org"          # the access allowlist (in-account)
 
@@ -123,9 +131,14 @@ module "panoptes" {
 }
 ```
 
-The module's `irsa_role_arn` output is the value the chart annotates the SAs with. A worked
-root config is in [`deploy/terraform/example`](deploy/terraform/example); the module is
-runner-agnostic (Terraform **or** OpenTofu).
+The default node group is **2 small ARM spot nodes** (the full stack + ingress/cert-manager/
+ebs-csi controllers exceed one node's pod cap). The module wires the `kubernetes` provider
+(for the gp3 StorageClass) alongside `helm`, so it is a **two-phase apply** — the cluster is
+created first, then the providers reach it via `~/.kube/config`. The module's `irsa_role_arn`
+output is the value the chart annotates the SAs with. A worked root config is in
+[`deploy/terraform/example`](deploy/terraform/example); the module is runner-agnostic
+(Terraform **or** OpenTofu). The full operational playbook (apply → verify → destroy) is in
+[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 **2. Set up the GitHub OAuth app (the access gate).** Create a GitHub OAuth app, set its
 callback to `https://panoptes.<domain>/oauth2/callback`, and supply the client id/secret +
